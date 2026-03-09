@@ -44,14 +44,30 @@ const path = __importStar(require("path"));
 const index_js_1 = require("@modelcontextprotocol/sdk/server/index.js");
 const sse_js_1 = require("@modelcontextprotocol/sdk/server/sse.js");
 const types_js_1 = require("@modelcontextprotocol/sdk/types.js");
+const pg_1 = require("pg");
 const app = (0, express_1.default)();
 app.use(express_1.default.json());
 // Task log storage
 const taskLogs = new Map();
+// ─── postToFeed helper ─────────────────────────────────────────────────────
+async function postToFeed(sessionId, dbUrl, content) {
+    if (!sessionId || !dbUrl)
+        return;
+    const client = new pg_1.Client({ connectionString: dbUrl });
+    try {
+        await client.connect();
+        await client.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)", [sessionId, "dev_lead", content, "execution_update"]);
+    }
+    catch (e) {
+        console.error("postToFeed error:", e);
+    }
+    finally {
+        await client.end();
+    }
+}
 // ─── MCP Server Factory ────────────────────────────────────────────────────
 function createMcpServer() {
     const server = new index_js_1.Server({ name: "container-mcp", version: "2.0.0" }, { capabilities: { tools: {} } });
-    // ── Tool: list ───────────────────────────────────────────────────────────
     server.setRequestHandler(types_js_1.ListToolsRequestSchema, async () => ({
         tools: [
             {
@@ -75,6 +91,8 @@ function createMcpServer() {
                         task_rules: { type: "string", description: "Extra rules to append" },
                         base_rules_path: { type: "string", default: "/.rules/base.md" },
                         project_rules_path: { type: "string", default: "/.rules/project.md" },
+                        session_id: { type: "string", description: "ops-db session ID to post execution_update messages to" },
+                        ops_db_url: { type: "string", description: "PostgreSQL connection URL (falls back to OPS_DB_URL env)" },
                     },
                     required: ["instruction", "working_dir"],
                 },
@@ -140,16 +158,17 @@ function createMcpServer() {
             },
         ],
     }));
-    // ── Tool: call ───────────────────────────────────────────────────────────
     server.setRequestHandler(types_js_1.CallToolRequestSchema, async (req) => {
         const { name, arguments: args } = req.params;
         try {
             switch (name) {
                 case "code_task": {
-                    const { instruction, working_dir, driver = "claude", task_id, max_turns = 30, budget_usd = 5.0, timeout_seconds = 900, task_rules, base_rules_path = "/.rules/base.md", project_rules_path = "/.rules/project.md", } = args;
+                    const { instruction, working_dir, driver = "claude", task_id, max_turns = 30, budget_usd = 5.0, timeout_seconds = 900, task_rules, base_rules_path = "/.rules/base.md", project_rules_path = "/.rules/project.md", session_id, ops_db_url, } = args;
+                    const dbUrl = ops_db_url || process.env.OPS_DB_URL;
                     const taskId = task_id || (0, crypto_1.randomUUID)();
                     taskLogs.set(taskId, []);
                     const log = (line) => taskLogs.get(taskId).push(line);
+                    postToFeed(session_id, dbUrl, `🚀 Starting \`code_task\` (driver: ${driver}, task_id: ${taskId})\n\nInstruction: ${instruction.slice(0, 300)}`);
                     // Compose rules
                     let rules = "";
                     try {
@@ -187,8 +206,30 @@ function createMcpServer() {
                                     log(line);
                                     try {
                                         const parsed = JSON.parse(line);
-                                        if (parsed.type === "result")
+                                        if (parsed.type === "result") {
                                             output = parsed.result || parsed.output || JSON.stringify(parsed);
+                                            postToFeed(session_id, dbUrl, `✅ Task complete\n\n${output.slice(0, 2000)}`);
+                                        }
+                                        else if (parsed.type === "assistant") {
+                                            const content = parsed.message?.content || [];
+                                            for (const block of content) {
+                                                if (block.type === "tool_use") {
+                                                    const toolName = block.name;
+                                                    const toolInput = JSON.stringify(block.input || {}).slice(0, 200);
+                                                    postToFeed(session_id, dbUrl, `🔧 \`${toolName}\` ${toolInput}`);
+                                                }
+                                                else if (block.type === "text" && block.text?.trim() && !parsed.message?.usage) {
+                                                    const text = block.text.trim().slice(0, 500);
+                                                    if (text.length > 20)
+                                                        postToFeed(session_id, dbUrl, `💭 ${text}`);
+                                                }
+                                            }
+                                        }
+                                        else if (parsed.type === "tool_result") {
+                                            const resultText = (parsed.content?.[0]?.text || "").slice(0, 300);
+                                            if (resultText)
+                                                postToFeed(session_id, dbUrl, `📄 Result: ${resultText}`);
+                                        }
                                     }
                                     catch { }
                                 }
@@ -230,8 +271,18 @@ function createMcpServer() {
                                     log(line);
                                     try {
                                         const parsed = JSON.parse(line);
-                                        if (parsed.type === "say" && !parsed.partial)
+                                        if (parsed.type === "say" && !parsed.partial) {
                                             outputLines.push(parsed.text || "");
+                                            if (parsed.say === "text") {
+                                                postToFeed(session_id, dbUrl, `💭 ${(parsed.text || "").slice(0, 500)}`);
+                                            }
+                                            else if (parsed.say === "tool") {
+                                                postToFeed(session_id, dbUrl, `🔧 ${(parsed.text || "").slice(0, 300)}`);
+                                            }
+                                            else if (parsed.say === "completion_result") {
+                                                postToFeed(session_id, dbUrl, `✅ Done: ${(parsed.text || "").slice(0, 1000)}`);
+                                            }
+                                        }
                                     }
                                     catch { }
                                 }
@@ -339,7 +390,6 @@ app.post("/messages", async (req, res) => {
         res.status(404).json({ error: "Session not found" });
         return;
     }
-    // Pass req.body (already parsed by express.json()) as parsedBody to avoid double-read
     await transport.handlePostMessage(req, res, req.body);
 });
 // ─── Health ────────────────────────────────────────────────────────────────
