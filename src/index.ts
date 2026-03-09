@@ -340,7 +340,8 @@ app.post("/messages", async (req, res) => {
     res.status(404).json({ error: "Session not found" });
     return;
   }
-  await transport.handlePostMessage(req, res);
+  // Pass req.body (already parsed by express.json()) as parsedBody to avoid double-read
+  await transport.handlePostMessage(req, res, req.body);
 });
 
 // ─── Health ────────────────────────────────────────────────────────────────
