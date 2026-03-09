@@ -89,7 +89,7 @@ function createMcpServer() {
                         budget_usd: { type: "number", default: 5.0 },
                         timeout_seconds: { type: "number", default: 900 },
                         task_rules: { type: "string", description: "Extra rules to append" },
-                        base_rules_path: { type: "string", default: "/.rules/base.md" },
+                        base_rules_path: { type: "string", default: "/home/david/.rules/base.md" },
                         project_rules_path: { type: "string", default: "/.rules/project.md" },
                         session_id: { type: "string", description: "ops-db session ID to post execution_update messages to" },
                         ops_db_url: { type: "string", description: "PostgreSQL connection URL (falls back to OPS_DB_URL env)" },
@@ -163,7 +163,7 @@ function createMcpServer() {
         try {
             switch (name) {
                 case "code_task": {
-                    const { instruction, working_dir, driver = "claude", task_id, max_turns = 30, budget_usd = 5.0, timeout_seconds = 900, task_rules, base_rules_path = "/.rules/base.md", project_rules_path = "/.rules/project.md", session_id, ops_db_url, } = args;
+                    const { instruction, working_dir, driver = "claude", task_id, max_turns = 30, budget_usd = 5.0, timeout_seconds = 900, task_rules, base_rules_path = "/home/david/.rules/base.md", project_rules_path = "/.rules/project.md", session_id, ops_db_url, } = args;
                     const dbUrl = ops_db_url || process.env.OPS_DB_URL;
                     const taskId = task_id || (0, crypto_1.randomUUID)();
                     taskLogs.set(taskId, []);
