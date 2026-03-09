@@ -19,21 +19,28 @@ app.use(express.json());
 const taskLogs = new Map<string, string[]>();
 
 // ─── postToFeed helper ─────────────────────────────────────────────────────
+// Persistent client per session — avoids connect/disconnect overhead on every event
+const _feedClients = new Map<string, { client: InstanceType<typeof Client>; queue: Promise<void> }>();
 
 async function postToFeed(sessionId: string, dbUrl: string, content: string): Promise<void> {
   if (!sessionId || !dbUrl) return;
-  const client = new Client({ connectionString: dbUrl });
-  try {
+  const key = `${sessionId}::${dbUrl}`;
+  if (!_feedClients.has(key)) {
+    const client = new Client({ connectionString: dbUrl });
     await client.connect();
-    await client.query(
-      "INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)",
-      [sessionId, "dev_lead", content, "execution_update"]
-    );
-  } catch (e) {
-    console.error("postToFeed error:", e);
-  } finally {
-    await client.end();
+    _feedClients.set(key, { client, queue: Promise.resolve() });
   }
+  const entry = _feedClients.get(key)!;
+  entry.queue = entry.queue.then(async () => {
+    try {
+      await entry.client.query(
+        "INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)",
+        [sessionId, "dev_lead", content, "execution_update"]
+      );
+    } catch (e: any) {
+      console.error("postToFeed error:", e.message);
+    }
+  });
 }
 
 // ─── MCP Server Factory ────────────────────────────────────────────────────
@@ -181,6 +188,7 @@ function createMcpServer() {
                   [
                     "-p", instruction,
                     "--output-format", "stream-json",
+                    "--verbose",
                     "--include-partial-messages",
                     "--append-system-prompt-file", rulesFile,
                     "--permission-mode", "acceptEdits",
@@ -189,7 +197,7 @@ function createMcpServer() {
                     "--session-id", taskId,
                     "--dangerously-skip-permissions",
                   ],
-                  { cwd: working_dir, env: process.env }
+                  { cwd: working_dir, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] as const }
                 );
 
                 let output = "";
