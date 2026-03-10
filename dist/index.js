@@ -49,9 +49,10 @@ const app = (0, express_1.default)();
 app.use(express_1.default.json());
 // Task log storage
 const taskLogs = new Map();
+const cliSessions = new Map();
 // ─── postToFeed helper ─────────────────────────────────────────────────────
 const _feedClients = new Map();
-async function postToFeed(sessionId, dbUrl, content) {
+async function postToFeed(sessionId, dbUrl, content, messageType = "execution_update", role = "dev_lead") {
     if (!sessionId || !dbUrl)
         return;
     const key = `${sessionId}::${dbUrl}`;
@@ -63,7 +64,7 @@ async function postToFeed(sessionId, dbUrl, content) {
     const entry = _feedClients.get(key);
     entry.queue = entry.queue.then(async () => {
         try {
-            await entry.client.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)", [sessionId, "dev_lead", content, "execution_update"]);
+            await entry.client.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)", [sessionId, role, content, messageType]);
         }
         catch (e) {
             console.error("postToFeed error:", e.message);
@@ -234,6 +235,78 @@ function createMcpServer() {
                     },
                     required: ["repo", "branch"],
                 },
+            },
+            {
+                name: "start_session",
+                description: "Start a long-running Claude CLI session (ZI-18753/18754). Non-blocking — returns immediately, streams output to ops-db.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        job_id: { type: "string", description: "Unique ID for this session" },
+                        instruction: { type: "string", description: "Task instruction for Claude" },
+                        working_dir: { type: "string", description: "Working directory" },
+                        session_id: { type: "string", description: "ops-db session ID to stream messages to" },
+                        ops_db_url: { type: "string", description: "PostgreSQL connection URL (falls back to OPS_DB_URL env)" },
+                        base_rules_path: { type: "string", default: "/home/david/.rules/base.md" },
+                        project_rules_path: { type: "string", default: "/.rules/project.md" },
+                        max_turns: { type: "number", default: 30 },
+                        budget_usd: { type: "number", default: 5.0 },
+                    },
+                    required: ["job_id", "instruction", "working_dir"],
+                },
+            },
+            {
+                name: "pause_session",
+                description: "Pause a running CLI session (SIGSTOP)",
+                inputSchema: {
+                    type: "object",
+                    properties: { job_id: { type: "string" } },
+                    required: ["job_id"],
+                },
+            },
+            {
+                name: "resume_session",
+                description: "Resume a paused CLI session (SIGCONT)",
+                inputSchema: {
+                    type: "object",
+                    properties: { job_id: { type: "string" } },
+                    required: ["job_id"],
+                },
+            },
+            {
+                name: "cancel_session",
+                description: "Cancel a running CLI session (SIGTERM)",
+                inputSchema: {
+                    type: "object",
+                    properties: { job_id: { type: "string" } },
+                    required: ["job_id"],
+                },
+            },
+            {
+                name: "get_session_status",
+                description: "Get status, token usage, and context window % of a CLI session",
+                inputSchema: {
+                    type: "object",
+                    properties: { job_id: { type: "string" } },
+                    required: ["job_id"],
+                },
+            },
+            {
+                name: "send_message",
+                description: "Send a user message into a running CLI session via stdin (ZI-18755)",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        job_id: { type: "string" },
+                        message: { type: "string" },
+                    },
+                    required: ["job_id", "message"],
+                },
+            },
+            {
+                name: "list_sessions",
+                description: "List all active CLI sessions",
+                inputSchema: { type: "object", properties: {} },
             },
             {
                 name: "git_pull",
@@ -534,6 +607,230 @@ function createMcpServer() {
                     const r = (0, child_process_1.spawnSync)("git", gitArgs, { cwd: working_dir, encoding: "utf8" });
                     const output = (r.stdout || "") + (r.stderr || "");
                     return { content: [{ type: "text", text: JSON.stringify({ success: r.status === 0, output, exit_code: r.status ?? -1 }) }] };
+                }
+                case "start_session": {
+                    // ZI-18753, ZI-18754: Start a long-running Claude CLI session
+                    const { job_id, instruction, working_dir, session_id, ops_db_url, base_rules_path = "/home/david/.rules/base.md", project_rules_path = "/.rules/project.md", max_turns = 30, budget_usd = 5.0, } = args;
+                    if (cliSessions.has(job_id)) {
+                        return { content: [{ type: "text", text: JSON.stringify({ error: `Session ${job_id} already exists` }) }], isError: true };
+                    }
+                    const dbUrl = ops_db_url || process.env.OPS_DB_URL;
+                    // Compose rules
+                    let rules = "";
+                    try {
+                        rules += fs.readFileSync(base_rules_path, "utf8") + "\n";
+                    }
+                    catch { }
+                    try {
+                        rules += fs.readFileSync(path.join(working_dir, project_rules_path), "utf8") + "\n";
+                    }
+                    catch { }
+                    const rulesFile = `/tmp/cli-session-rules-${job_id}.md`;
+                    if (rules)
+                        fs.writeFileSync(rulesFile, rules);
+                    const claudeArgs = [
+                        "-p", instruction,
+                        "--output-format", "stream-json",
+                        "--input-format", "stream-json",
+                        "--verbose",
+                        "--include-partial-messages",
+                        "--permission-mode", "acceptEdits",
+                        "--max-turns", String(max_turns),
+                        "--max-budget-usd", String(budget_usd),
+                        "--dangerously-skip-permissions",
+                    ];
+                    if (rules)
+                        claudeArgs.push("--append-system-prompt-file", rulesFile);
+                    const proc = (0, child_process_1.spawn)("claude", claudeArgs, {
+                        cwd: working_dir,
+                        env: process.env,
+                        stdio: ["pipe", "pipe", "pipe"],
+                    });
+                    const session = {
+                        proc,
+                        sessionId: session_id || "",
+                        opsDbUrl: dbUrl || "",
+                        workingDir: working_dir,
+                        startedAt: new Date(),
+                        lastActivity: new Date(),
+                        status: "running",
+                        tokenInput: 0,
+                        tokenOutput: 0,
+                        tokenCache: 0,
+                        model: "claude",
+                        contextPct: 0,
+                    };
+                    cliSessions.set(job_id, session);
+                    // ZI-18754: Wire stdout listener — parse stream-json, post to ops-db
+                    proc.stdout?.on("data", (chunk) => {
+                        const lines = chunk.toString().split("\n");
+                        for (const line of lines) {
+                            if (!line.trim())
+                                continue;
+                            session.lastActivity = new Date();
+                            try {
+                                const evt = JSON.parse(line);
+                                // Accumulate token usage from any event
+                                const usage = evt.usage || evt.message?.usage;
+                                if (usage) {
+                                    if (usage.input_tokens)
+                                        session.tokenInput += usage.input_tokens;
+                                    if (usage.output_tokens)
+                                        session.tokenOutput += usage.output_tokens;
+                                    if (usage.cache_read_input_tokens)
+                                        session.tokenCache += usage.cache_read_input_tokens;
+                                    if (usage.cache_creation_input_tokens)
+                                        session.tokenCache += usage.cache_creation_input_tokens;
+                                }
+                                // Model name
+                                if (evt.message?.model)
+                                    session.model = evt.message.model;
+                                if (evt.type === "system" && evt.subtype === "context_window" && evt.context_window) {
+                                    const cw = evt.context_window;
+                                    if (cw.context_window && cw.current_context_window !== undefined) {
+                                        session.contextPct = Math.round((cw.current_context_window / cw.context_window) * 100);
+                                    }
+                                }
+                                if (evt.type === "assistant") {
+                                    const msgContent = evt.message?.content || [];
+                                    for (const block of msgContent) {
+                                        if (block.type === "text" && block.text?.trim()) {
+                                            postToFeed(session.sessionId, session.opsDbUrl, block.text.trim(), "console", "agent");
+                                        }
+                                        else if (block.type === "tool_use") {
+                                            const inputSnip = JSON.stringify(block.input || {}).slice(0, 200);
+                                            postToFeed(session.sessionId, session.opsDbUrl, `🔧 \`${block.name}\` ${inputSnip}`, "tool_call", "agent");
+                                        }
+                                    }
+                                }
+                                if (evt.type === "tool_result") {
+                                    const resultText = (evt.content?.[0]?.text || "").slice(0, 500);
+                                    if (resultText) {
+                                        postToFeed(session.sessionId, session.opsDbUrl, `📄 ${resultText}`, "tool_result", "agent");
+                                    }
+                                }
+                                if (evt.type === "result") {
+                                    const resultText = evt.result || evt.output || "";
+                                    postToFeed(session.sessionId, session.opsDbUrl, `✅ Session complete: ${resultText.slice(0, 1000)}`, "completion", "agent");
+                                    session.status = "completed";
+                                }
+                            }
+                            catch { }
+                        }
+                    });
+                    proc.stderr?.on("data", (chunk) => {
+                        const text = chunk.toString().trim();
+                        if (text)
+                            console.error(`[session:${job_id}] stderr:`, text);
+                    });
+                    proc.on("close", (code) => {
+                        const s = cliSessions.get(job_id);
+                        if (s) {
+                            if (s.status === "running" || s.status === "paused") {
+                                s.status = code === 0 ? "completed" : "cancelled";
+                            }
+                            postToFeed(s.sessionId, s.opsDbUrl, `🏁 Session ${job_id} exited with code ${code}. Status: ${s.status}`, "completion", "agent");
+                        }
+                        try {
+                            if (rules)
+                                fs.unlinkSync(rulesFile);
+                        }
+                        catch { }
+                    });
+                    proc.on("error", (err) => {
+                        const s = cliSessions.get(job_id);
+                        if (s) {
+                            s.status = "cancelled";
+                            postToFeed(s.sessionId, s.opsDbUrl, `❌ Session ${job_id} error: ${err.message}`, "completion", "agent");
+                        }
+                    });
+                    return { content: [{ type: "text", text: JSON.stringify({ job_id, status: "started", pid: proc.pid }) }] };
+                }
+                case "pause_session": {
+                    const { job_id } = args;
+                    const s = cliSessions.get(job_id);
+                    if (!s)
+                        throw new Error(`Session ${job_id} not found`);
+                    if (s.status !== "running")
+                        throw new Error(`Session ${job_id} is not running (status: ${s.status})`);
+                    s.proc.kill("SIGSTOP");
+                    s.status = "paused";
+                    return { content: [{ type: "text", text: JSON.stringify({ job_id, status: "paused" }) }] };
+                }
+                case "resume_session": {
+                    const { job_id } = args;
+                    const s = cliSessions.get(job_id);
+                    if (!s)
+                        throw new Error(`Session ${job_id} not found`);
+                    if (s.status !== "paused")
+                        throw new Error(`Session ${job_id} is not paused (status: ${s.status})`);
+                    s.proc.kill("SIGCONT");
+                    s.status = "running";
+                    return { content: [{ type: "text", text: JSON.stringify({ job_id, status: "running" }) }] };
+                }
+                case "cancel_session": {
+                    const { job_id } = args;
+                    const s = cliSessions.get(job_id);
+                    if (!s)
+                        throw new Error(`Session ${job_id} not found`);
+                    s.proc.kill("SIGTERM");
+                    s.status = "cancelled";
+                    return { content: [{ type: "text", text: JSON.stringify({ job_id, status: "cancelled" }) }] };
+                }
+                case "get_session_status": {
+                    const { job_id } = args;
+                    const s = cliSessions.get(job_id);
+                    if (!s)
+                        throw new Error(`Session ${job_id} not found`);
+                    const costUsd = (s.tokenInput * 3 + s.tokenOutput * 15) / 1_000_000;
+                    return {
+                        content: [{
+                                type: "text",
+                                text: JSON.stringify({
+                                    job_id,
+                                    status: s.status,
+                                    pid: s.proc.pid,
+                                    context_pct: s.contextPct,
+                                    model: s.model,
+                                    token_input: s.tokenInput,
+                                    token_output: s.tokenOutput,
+                                    token_cache: s.tokenCache,
+                                    estimated_cost_usd: Math.round(costUsd * 10000) / 10000,
+                                    started_at: s.startedAt.toISOString(),
+                                    last_activity: s.lastActivity.toISOString(),
+                                }),
+                            }],
+                    };
+                }
+                case "send_message": {
+                    // ZI-18755: Deliver user message to running CLI session via stdin
+                    const { job_id, message } = args;
+                    const s = cliSessions.get(job_id);
+                    if (!s)
+                        throw new Error(`Session ${job_id} not found`);
+                    if (s.status !== "running")
+                        throw new Error(`Session ${job_id} is not running (status: ${s.status})`);
+                    if (!s.proc.stdin)
+                        throw new Error(`Session ${job_id} stdin not available`);
+                    const payload = JSON.stringify({
+                        type: "user",
+                        message: { role: "user", content: [{ type: "text", text: message }] },
+                    });
+                    s.proc.stdin.write(payload + "\n");
+                    s.lastActivity = new Date();
+                    return { content: [{ type: "text", text: JSON.stringify({ job_id, sent: true, message_preview: message.slice(0, 100) }) }] };
+                }
+                case "list_sessions": {
+                    const result = Array.from(cliSessions.entries()).map(([id, s]) => ({
+                        job_id: id,
+                        status: s.status,
+                        pid: s.proc.pid,
+                        started_at: s.startedAt.toISOString(),
+                        last_activity: s.lastActivity.toISOString(),
+                        model: s.model,
+                        context_pct: s.contextPct,
+                    }));
+                    return { content: [{ type: "text", text: JSON.stringify(result) }] };
                 }
                 case "git_pull": {
                     const { repo } = args;
