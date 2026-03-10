@@ -50,20 +50,25 @@ app.use(express_1.default.json());
 // Task log storage
 const taskLogs = new Map();
 // ─── postToFeed helper ─────────────────────────────────────────────────────
+const _feedClients = new Map();
 async function postToFeed(sessionId, dbUrl, content) {
     if (!sessionId || !dbUrl)
         return;
-    const client = new pg_1.Client({ connectionString: dbUrl });
-    try {
+    const key = `${sessionId}::${dbUrl}`;
+    if (!_feedClients.has(key)) {
+        const client = new pg_1.Client({ connectionString: dbUrl });
         await client.connect();
-        await client.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)", [sessionId, "dev_lead", content, "execution_update"]);
+        _feedClients.set(key, { client, queue: Promise.resolve() });
     }
-    catch (e) {
-        console.error("postToFeed error:", e);
-    }
-    finally {
-        await client.end();
-    }
+    const entry = _feedClients.get(key);
+    entry.queue = entry.queue.then(async () => {
+        try {
+            await entry.client.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)", [sessionId, "dev_lead", content, "execution_update"]);
+        }
+        catch (e) {
+            console.error("postToFeed error:", e.message);
+        }
+    });
 }
 // ─── MCP Server Factory ────────────────────────────────────────────────────
 function createMcpServer() {
@@ -156,6 +161,91 @@ function createMcpServer() {
                     required: ["working_dir"],
                 },
             },
+            {
+                name: "git_status",
+                description: "Get git status for a repo (branch, staged, unstaged, untracked files)",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        repo: { type: "string", description: "Short repo name, resolved to /home/david/<repo>" },
+                    },
+                    required: ["repo"],
+                },
+            },
+            {
+                name: "git_checkout",
+                description: "Switch or create a git branch",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        repo: { type: "string", description: "Short repo name" },
+                        branch: { type: "string", description: "Branch name to checkout" },
+                        create: { type: "boolean", default: false, description: "Create branch if true (-b flag)" },
+                    },
+                    required: ["repo", "branch"],
+                },
+            },
+            {
+                name: "git_add",
+                description: "Stage files for commit",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        repo: { type: "string", description: "Short repo name" },
+                        files: { type: "array", items: { type: "string" }, description: "Files to stage, use ['.'] for all" },
+                    },
+                    required: ["repo", "files"],
+                },
+            },
+            {
+                name: "git_commit",
+                description: "Commit staged files. Always uses GIT_AUTHOR_NAME='Dev-Lead Agent' GIT_AUTHOR_EMAIL='dev-lead@zennya.app'",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        repo: { type: "string", description: "Short repo name" },
+                        message: { type: "string", description: "Commit message" },
+                    },
+                    required: ["repo", "message"],
+                },
+            },
+            {
+                name: "git_push",
+                description: "Push commits to origin",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        repo: { type: "string", description: "Short repo name" },
+                        branch: { type: "string", description: "Branch to push (default: current branch)" },
+                        force: { type: "boolean", default: false, description: "Force push with --force" },
+                    },
+                    required: ["repo"],
+                },
+            },
+            {
+                name: "git_merge",
+                description: "Merge a branch into the current branch",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        repo: { type: "string", description: "Short repo name" },
+                        branch: { type: "string", description: "Branch to merge in" },
+                        no_ff: { type: "boolean", default: true, description: "Use --no-ff flag (default true)" },
+                    },
+                    required: ["repo", "branch"],
+                },
+            },
+            {
+                name: "git_pull",
+                description: "Pull and rebase from origin",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        repo: { type: "string", description: "Short repo name" },
+                    },
+                    required: ["repo"],
+                },
+            },
         ],
     }));
     server.setRequestHandler(types_js_1.CallToolRequestSchema, async (req) => {
@@ -188,6 +278,7 @@ function createMcpServer() {
                             const proc = (0, child_process_1.spawn)("claude", [
                                 "-p", instruction,
                                 "--output-format", "stream-json",
+                                "--verbose",
                                 "--include-partial-messages",
                                 "--append-system-prompt-file", rulesFile,
                                 "--permission-mode", "acceptEdits",
@@ -195,7 +286,7 @@ function createMcpServer() {
                                 "--max-budget-usd", String(budget_usd),
                                 "--session-id", taskId,
                                 "--dangerously-skip-permissions",
-                            ], { cwd: working_dir, env: process.env });
+                            ], { cwd: working_dir, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
                             let output = "";
                             const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeout_seconds * 1000);
                             proc.stdout.on("data", (chunk) => {
@@ -363,6 +454,93 @@ function createMcpServer() {
                                 text: JSON.stringify({ branch, dirty, staged_files, recent_commits }),
                             }],
                     };
+                }
+                case "git_status": {
+                    const { repo } = args;
+                    const working_dir = `/home/david/${repo}`;
+                    const branchR = (0, child_process_1.spawnSync)("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: working_dir, encoding: "utf8" });
+                    const branch = branchR.stdout.trim();
+                    const statusR = (0, child_process_1.spawnSync)("git", ["status", "--short"], { cwd: working_dir, encoding: "utf8" });
+                    const staged = [];
+                    const unstaged = [];
+                    const untracked = [];
+                    for (const line of statusR.stdout.split("\n")) {
+                        if (!line)
+                            continue;
+                        const indexChar = line[0];
+                        const wtChar = line[1];
+                        const file = line.slice(3);
+                        if (indexChar === "?" && wtChar === "?") {
+                            untracked.push(file);
+                        }
+                        else {
+                            if (indexChar !== " " && indexChar !== "?")
+                                staged.push(file);
+                            if (wtChar !== " " && wtChar !== "?")
+                                unstaged.push(file);
+                        }
+                    }
+                    return { content: [{ type: "text", text: JSON.stringify({ branch, staged, unstaged, untracked, exit_code: branchR.status ?? -1 }) }] };
+                }
+                case "git_checkout": {
+                    const { repo, branch, create = false } = args;
+                    const working_dir = `/home/david/${repo}`;
+                    const gitArgs = create ? ["checkout", "-b", branch] : ["checkout", branch];
+                    const r = (0, child_process_1.spawnSync)("git", gitArgs, { cwd: working_dir, encoding: "utf8" });
+                    const output = (r.stdout || "") + (r.stderr || "");
+                    return { content: [{ type: "text", text: JSON.stringify({ success: r.status === 0, output, exit_code: r.status ?? -1 }) }] };
+                }
+                case "git_add": {
+                    const { repo, files } = args;
+                    const working_dir = `/home/david/${repo}`;
+                    const r = (0, child_process_1.spawnSync)("git", ["add", ...files], { cwd: working_dir, encoding: "utf8" });
+                    const output = (r.stdout || "") + (r.stderr || "");
+                    return { content: [{ type: "text", text: JSON.stringify({ success: r.status === 0, output, exit_code: r.status ?? -1 }) }] };
+                }
+                case "git_commit": {
+                    const { repo, message } = args;
+                    const working_dir = `/home/david/${repo}`;
+                    const gitEnv = {
+                        ...process.env,
+                        GIT_AUTHOR_NAME: "Dev-Lead Agent",
+                        GIT_AUTHOR_EMAIL: "dev-lead@zennya.app",
+                        GIT_COMMITTER_NAME: "Dev-Lead Agent",
+                        GIT_COMMITTER_EMAIL: "dev-lead@zennya.app",
+                    };
+                    const r = (0, child_process_1.spawnSync)("git", ["commit", "-m", message], { cwd: working_dir, encoding: "utf8", env: gitEnv });
+                    const output = (r.stdout || "") + (r.stderr || "");
+                    return { content: [{ type: "text", text: JSON.stringify({ success: r.status === 0, output, exit_code: r.status ?? -1 }) }] };
+                }
+                case "git_push": {
+                    const { repo, branch, force = false } = args;
+                    const working_dir = `/home/david/${repo}`;
+                    const gitArgs = ["push"];
+                    if (force)
+                        gitArgs.push("--force");
+                    gitArgs.push("origin");
+                    if (branch)
+                        gitArgs.push(branch);
+                    const r = (0, child_process_1.spawnSync)("git", gitArgs, { cwd: working_dir, encoding: "utf8" });
+                    const output = (r.stdout || "") + (r.stderr || "");
+                    return { content: [{ type: "text", text: JSON.stringify({ success: r.status === 0, output, exit_code: r.status ?? -1 }) }] };
+                }
+                case "git_merge": {
+                    const { repo, branch, no_ff = true } = args;
+                    const working_dir = `/home/david/${repo}`;
+                    const gitArgs = ["merge"];
+                    if (no_ff)
+                        gitArgs.push("--no-ff");
+                    gitArgs.push(branch);
+                    const r = (0, child_process_1.spawnSync)("git", gitArgs, { cwd: working_dir, encoding: "utf8" });
+                    const output = (r.stdout || "") + (r.stderr || "");
+                    return { content: [{ type: "text", text: JSON.stringify({ success: r.status === 0, output, exit_code: r.status ?? -1 }) }] };
+                }
+                case "git_pull": {
+                    const { repo } = args;
+                    const working_dir = `/home/david/${repo}`;
+                    const r = (0, child_process_1.spawnSync)("git", ["pull", "--rebase", "origin"], { cwd: working_dir, encoding: "utf8" });
+                    const output = (r.stdout || "") + (r.stderr || "");
+                    return { content: [{ type: "text", text: JSON.stringify({ success: r.status === 0, output, exit_code: r.status ?? -1 }) }] };
                 }
                 default:
                     throw new Error(`Unknown tool: ${name}`);

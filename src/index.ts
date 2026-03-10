@@ -19,7 +19,6 @@ app.use(express.json());
 const taskLogs = new Map<string, string[]>();
 
 // ─── postToFeed helper ─────────────────────────────────────────────────────
-// Persistent client per session — avoids connect/disconnect overhead on every event
 const _feedClients = new Map<string, { client: InstanceType<typeof Client>; queue: Promise<void> }>();
 
 async function postToFeed(sessionId: string, dbUrl: string, content: string): Promise<void> {
@@ -137,6 +136,91 @@ function createMcpServer() {
             working_dir: { type: "string" },
           },
           required: ["working_dir"],
+        },
+      },
+      {
+        name: "git_status",
+        description: "Get git status for a repo (branch, staged, unstaged, untracked files)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repo: { type: "string", description: "Short repo name, resolved to /home/david/<repo>" },
+          },
+          required: ["repo"],
+        },
+      },
+      {
+        name: "git_checkout",
+        description: "Switch or create a git branch",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repo: { type: "string", description: "Short repo name" },
+            branch: { type: "string", description: "Branch name to checkout" },
+            create: { type: "boolean", default: false, description: "Create branch if true (-b flag)" },
+          },
+          required: ["repo", "branch"],
+        },
+      },
+      {
+        name: "git_add",
+        description: "Stage files for commit",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repo: { type: "string", description: "Short repo name" },
+            files: { type: "array", items: { type: "string" }, description: "Files to stage, use ['.'] for all" },
+          },
+          required: ["repo", "files"],
+        },
+      },
+      {
+        name: "git_commit",
+        description: "Commit staged files. Always uses GIT_AUTHOR_NAME='Dev-Lead Agent' GIT_AUTHOR_EMAIL='dev-lead@zennya.app'",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repo: { type: "string", description: "Short repo name" },
+            message: { type: "string", description: "Commit message" },
+          },
+          required: ["repo", "message"],
+        },
+      },
+      {
+        name: "git_push",
+        description: "Push commits to origin",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repo: { type: "string", description: "Short repo name" },
+            branch: { type: "string", description: "Branch to push (default: current branch)" },
+            force: { type: "boolean", default: false, description: "Force push with --force" },
+          },
+          required: ["repo"],
+        },
+      },
+      {
+        name: "git_merge",
+        description: "Merge a branch into the current branch",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repo: { type: "string", description: "Short repo name" },
+            branch: { type: "string", description: "Branch to merge in" },
+            no_ff: { type: "boolean", default: true, description: "Use --no-ff flag (default true)" },
+          },
+          required: ["repo", "branch"],
+        },
+      },
+      {
+        name: "git_pull",
+        description: "Pull and rebase from origin",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repo: { type: "string", description: "Short repo name" },
+          },
+          required: ["repo"],
         },
       },
     ],
@@ -366,6 +450,93 @@ function createMcpServer() {
               text: JSON.stringify({ branch, dirty, staged_files, recent_commits }),
             }],
           };
+        }
+
+        case "git_status": {
+          const { repo } = args as any;
+          const working_dir = `/home/david/${repo}`;
+          const branchR = spawnSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: working_dir, encoding: "utf8" });
+          const branch = branchR.stdout.trim();
+          const statusR = spawnSync("git", ["status", "--short"], { cwd: working_dir, encoding: "utf8" });
+          const staged: string[] = [];
+          const unstaged: string[] = [];
+          const untracked: string[] = [];
+          for (const line of statusR.stdout.split("\n")) {
+            if (!line) continue;
+            const indexChar = line[0];
+            const wtChar = line[1];
+            const file = line.slice(3);
+            if (indexChar === "?" && wtChar === "?") {
+              untracked.push(file);
+            } else {
+              if (indexChar !== " " && indexChar !== "?") staged.push(file);
+              if (wtChar !== " " && wtChar !== "?") unstaged.push(file);
+            }
+          }
+          return { content: [{ type: "text", text: JSON.stringify({ branch, staged, unstaged, untracked, exit_code: branchR.status ?? -1 }) }] };
+        }
+
+        case "git_checkout": {
+          const { repo, branch, create = false } = args as any;
+          const working_dir = `/home/david/${repo}`;
+          const gitArgs = create ? ["checkout", "-b", branch] : ["checkout", branch];
+          const r = spawnSync("git", gitArgs, { cwd: working_dir, encoding: "utf8" });
+          const output = (r.stdout || "") + (r.stderr || "");
+          return { content: [{ type: "text", text: JSON.stringify({ success: r.status === 0, output, exit_code: r.status ?? -1 }) }] };
+        }
+
+        case "git_add": {
+          const { repo, files } = args as any;
+          const working_dir = `/home/david/${repo}`;
+          const r = spawnSync("git", ["add", ...files], { cwd: working_dir, encoding: "utf8" });
+          const output = (r.stdout || "") + (r.stderr || "");
+          return { content: [{ type: "text", text: JSON.stringify({ success: r.status === 0, output, exit_code: r.status ?? -1 }) }] };
+        }
+
+        case "git_commit": {
+          const { repo, message } = args as any;
+          const working_dir = `/home/david/${repo}`;
+          const gitEnv = {
+            ...process.env,
+            GIT_AUTHOR_NAME: "Dev-Lead Agent",
+            GIT_AUTHOR_EMAIL: "dev-lead@zennya.app",
+            GIT_COMMITTER_NAME: "Dev-Lead Agent",
+            GIT_COMMITTER_EMAIL: "dev-lead@zennya.app",
+          };
+          const r = spawnSync("git", ["commit", "-m", message], { cwd: working_dir, encoding: "utf8", env: gitEnv });
+          const output = (r.stdout || "") + (r.stderr || "");
+          return { content: [{ type: "text", text: JSON.stringify({ success: r.status === 0, output, exit_code: r.status ?? -1 }) }] };
+        }
+
+        case "git_push": {
+          const { repo, branch, force = false } = args as any;
+          const working_dir = `/home/david/${repo}`;
+          const gitArgs = ["push"];
+          if (force) gitArgs.push("--force");
+          gitArgs.push("origin");
+          if (branch) gitArgs.push(branch);
+          const r = spawnSync("git", gitArgs, { cwd: working_dir, encoding: "utf8" });
+          const output = (r.stdout || "") + (r.stderr || "");
+          return { content: [{ type: "text", text: JSON.stringify({ success: r.status === 0, output, exit_code: r.status ?? -1 }) }] };
+        }
+
+        case "git_merge": {
+          const { repo, branch, no_ff = true } = args as any;
+          const working_dir = `/home/david/${repo}`;
+          const gitArgs = ["merge"];
+          if (no_ff) gitArgs.push("--no-ff");
+          gitArgs.push(branch);
+          const r = spawnSync("git", gitArgs, { cwd: working_dir, encoding: "utf8" });
+          const output = (r.stdout || "") + (r.stderr || "");
+          return { content: [{ type: "text", text: JSON.stringify({ success: r.status === 0, output, exit_code: r.status ?? -1 }) }] };
+        }
+
+        case "git_pull": {
+          const { repo } = args as any;
+          const working_dir = `/home/david/${repo}`;
+          const r = spawnSync("git", ["pull", "--rebase", "origin"], { cwd: working_dir, encoding: "utf8" });
+          const output = (r.stdout || "") + (r.stderr || "");
+          return { content: [{ type: "text", text: JSON.stringify({ success: r.status === 0, output, exit_code: r.status ?? -1 }) }] };
         }
 
         default:
