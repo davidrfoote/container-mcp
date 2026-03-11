@@ -554,21 +554,22 @@ function createMcpServer() {
                     return { content: [{ type: "text", text: JSON.stringify({ success: r.status === 0, output, exit_code: r.status ?? -1 }) }] };
                 }
                 case "spawn_dev_lead": {
+                    // ZI-18776: POST to gateway /agent/message to spawn dev-lead
                     const { session_id: sessionId } = args;
                     const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
                     const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
                     const controller = new AbortController();
                     const timeout = setTimeout(() => controller.abort(), 15_000);
                     try {
-                        const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
+                        const resp = await fetch(`${gatewayUrl}/agent/message`, {
                             method: "POST",
                             headers: {
                                 "Content-Type": "application/json",
                                 "Authorization": `Bearer ${gatewayToken}`,
                             },
                             body: JSON.stringify({
-                                tool: "sessions_spawn",
-                                input: { session_id: sessionId },
+                                agent: "dev-lead",
+                                message: `SESSION_ID: ${sessionId}`,
                             }),
                             signal: controller.signal,
                         });
@@ -616,10 +617,117 @@ app.post("/messages", async (req, res) => {
 app.get("/health", (_req, res) => {
     res.json({ status: "ok", server: "container-mcp", version: "2.0.0" });
 });
+// ─── Background LISTEN chain (ZI-18776) ───────────────────────────────────
+// Active reconnect-safe Postgres LISTEN: task_brief insert → spawn dev-lead via gateway.
+// Replaces the passive instrumentation.ts chain that had zero reconnect logic.
+async function startListenChain() {
+    const dbUrl = process.env.OPS_DB_URL;
+    if (!dbUrl) {
+        console.warn("[listen-chain] OPS_DB_URL not set — background LISTEN chain disabled");
+        return;
+    }
+    const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
+    const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
+    const listenClient = new pg_1.Client({ connectionString: dbUrl });
+    try {
+        await listenClient.connect();
+        await listenClient.query("LISTEN session_messages");
+        console.log("[listen-chain] Postgres LISTEN session_messages started");
+        listenClient.on("notification", (msg) => {
+            void (async () => {
+                try {
+                    if (!msg.payload)
+                        return;
+                    const payload = JSON.parse(msg.payload);
+                    if (payload.message_type !== "task_brief" || payload.role !== "user")
+                        return;
+                    const sessionId = payload.session_id;
+                    if (!sessionId)
+                        return;
+                    console.log(`[listen-chain] task_brief for ${sessionId} — spawning dev-lead via gateway`);
+                    const resp = await fetch(`${gatewayUrl}/agent/message`, {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json",
+                            "Authorization": `Bearer ${gatewayToken}`,
+                        },
+                        body: JSON.stringify({ agent: "dev-lead", message: `SESSION_ID: ${sessionId}` }),
+                        signal: AbortSignal.timeout(15_000),
+                    });
+                    if (resp.ok) {
+                        console.log(`[listen-chain] dev-lead spawned for ${sessionId}`);
+                    }
+                    else {
+                        const text = await resp.text().catch(() => "");
+                        console.warn(`[listen-chain] gateway spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
+                    }
+                }
+                catch (err) {
+                    console.error("[listen-chain] notification handler error:", err.message);
+                }
+            })();
+        });
+        listenClient.on("error", (err) => {
+            console.error("[listen-chain] Postgres LISTEN client error:", err.message);
+            // Reconnect after 10s (fixes the zero-reconnect failure mode)
+            setTimeout(() => { void startListenChain(); }, 10_000);
+        });
+    }
+    catch (err) {
+        console.error("[listen-chain] failed to start LISTEN:", err.message);
+        setTimeout(() => { void startListenChain(); }, 10_000);
+        return;
+    }
+    // Backfill: find stuck pending sessions on startup
+    void (async () => {
+        const backfillClient = new pg_1.Client({ connectionString: dbUrl });
+        try {
+            await backfillClient.connect();
+            const res = await backfillClient.query(`SELECT DISTINCT s.session_id
+         FROM sessions s
+         JOIN session_messages sm ON sm.session_id = s.session_id
+         WHERE s.status = 'pending'
+           AND sm.message_type = 'task_brief'
+           AND sm.role = 'user'
+           AND NOT EXISTS (
+             SELECT 1 FROM session_messages sm2
+             WHERE sm2.session_id = s.session_id AND sm2.role = 'assistant'
+           )
+         ORDER BY s.session_id`);
+            if (res.rows.length > 0) {
+                console.log(`[listen-chain] backfill: ${res.rows.length} pending session(s) found`);
+                for (const row of res.rows) {
+                    try {
+                        const resp = await fetch(`${gatewayUrl}/agent/message`, {
+                            method: "POST",
+                            headers: {
+                                "Content-Type": "application/json",
+                                "Authorization": `Bearer ${gatewayToken}`,
+                            },
+                            body: JSON.stringify({ agent: "dev-lead", message: `SESSION_ID: ${row.session_id}` }),
+                            signal: AbortSignal.timeout(15_000),
+                        });
+                        console.log(`[listen-chain] backfill ${row.session_id}: ${resp.ok ? "spawned" : `failed (${resp.status})`}`);
+                    }
+                    catch (e) {
+                        console.error(`[listen-chain] backfill error for ${row.session_id}:`, e.message);
+                    }
+                }
+            }
+        }
+        catch (err) {
+            console.error("[listen-chain] backfill error:", err.message);
+        }
+        finally {
+            await backfillClient.end().catch(() => { });
+        }
+    })();
+}
 // ─── Start ─────────────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT || "9000", 10);
 app.listen(PORT, () => {
-    console.log(`container-mcp v2.0.0 running on port ${PORT}`);
+    console.log(`container-mcp v2.1.0 running on port ${PORT}`);
     console.log(`  SSE:    http://localhost:${PORT}/sse`);
     console.log(`  Health: http://localhost:${PORT}/health`);
 });
+void startListenChain();
