@@ -551,7 +551,7 @@ function createMcpServer() {
         }
 
         case "spawn_dev_lead": {
-          // ZI-18776: POST to gateway /agent/message to spawn dev-lead
+          // ZI-18776: POST to gateway /tools/invoke (sessions_spawn) to spawn dev-lead
           const { session_id: sessionId } = args as any;
           const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
           const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
@@ -560,15 +560,15 @@ function createMcpServer() {
           const timeout = setTimeout(() => controller.abort(), 15_000);
 
           try {
-            const resp = await fetch(`${gatewayUrl}/agent/message`, {
+            const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
                 "Authorization": `Bearer ${gatewayToken}`,
               },
               body: JSON.stringify({
-                agent: "dev-lead",
-                message: `SESSION_ID: ${sessionId}`,
+                tool: "sessions_spawn",
+                args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}` },
               }),
               signal: controller.signal,
             });
@@ -660,13 +660,13 @@ async function startListenChain(): Promise<void> {
           if (!sessionId) return;
 
           console.log(`[listen-chain] task_brief for ${sessionId} — spawning dev-lead via gateway`);
-          const resp = await fetch(`${gatewayUrl}/agent/message`, {
+          const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
               "Authorization": `Bearer ${gatewayToken}`,
             },
-            body: JSON.stringify({ agent: "dev-lead", message: `SESSION_ID: ${sessionId}` }),
+            body: JSON.stringify({ tool: "sessions_spawn", args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}` } }),
             signal: AbortSignal.timeout(15_000),
           });
 
@@ -715,13 +715,13 @@ async function startListenChain(): Promise<void> {
         console.log(`[listen-chain] backfill: ${res.rows.length} pending session(s) found`);
         for (const row of res.rows) {
           try {
-            const resp = await fetch(`${gatewayUrl}/agent/message`, {
+            const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
                 "Authorization": `Bearer ${gatewayToken}`,
               },
-              body: JSON.stringify({ agent: "dev-lead", message: `SESSION_ID: ${row.session_id}` }),
+              body: JSON.stringify({ tool: "sessions_spawn", args: { agentId: "dev-lead", task: `SESSION_ID: ${row.session_id}` } }),
               signal: AbortSignal.timeout(15_000),
             });
             console.log(`[listen-chain] backfill ${row.session_id}: ${resp.ok ? "spawned" : `failed (${resp.status})`}`);
