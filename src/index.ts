@@ -11,6 +11,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { Client } from "pg";
+import Redis from "ioredis";
 
 const app = express();
 app.use(express.json());
@@ -748,3 +749,70 @@ app.listen(PORT, () => {
 });
 
 void startListenChain();
+void startRedisSubscriber();
+
+// ─── Redis Subscriber (ZI-18783) ───────────────────────────────────────────
+// Subscribes to dev:session:spawn channel and calls spawn_dev_lead for each
+// session_id received. This handles sessions created via the new-task route
+// which publishes to Redis but does NOT insert a task_brief message.
+
+async function startRedisSubscriber(): Promise<void> {
+  const redisHost = process.env.REDIS_HOST ?? "redis-relay-devenv";
+  const redisPort = parseInt(process.env.REDIS_PORT ?? "6379", 10);
+  const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
+  const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
+
+  const subscribe = () => {
+    const sub = new Redis({ host: redisHost, port: redisPort, lazyConnect: false });
+
+    sub.on("error", (err: Error) => {
+      console.error("[redis-sub] error:", err.message);
+      // Reconnect after 10s
+      setTimeout(() => { sub.disconnect(); subscribe(); }, 10_000);
+    });
+
+    sub.on("connect", () => {
+      console.log(`[redis-sub] connected to ${redisHost}:${redisPort}, subscribing to dev:session:spawn`);
+    });
+
+    sub.subscribe("dev:session:spawn").then(() => {
+      console.log("[redis-sub] listening on dev:session:spawn");
+    }).catch((err: Error) => {
+      console.error("[redis-sub] subscribe error:", err.message);
+      setTimeout(() => { sub.disconnect(); subscribe(); }, 10_000);
+    });
+
+    sub.on("message", (_channel: string, message: string) => {
+      void (async () => {
+        try {
+          const payload = JSON.parse(message) as { session_id?: string; project_id?: string };
+          const sessionId = payload.session_id;
+          if (!sessionId) {
+            console.warn("[redis-sub] received message without session_id:", message.slice(0, 200));
+            return;
+          }
+          console.log(`[redis-sub] dev:session:spawn for ${sessionId} — spawning dev-lead via gateway`);
+          const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${gatewayToken}`,
+            },
+            body: JSON.stringify({ tool: "sessions_spawn", args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}` } }),
+            signal: AbortSignal.timeout(15_000),
+          });
+          if (resp.ok) {
+            console.log(`[redis-sub] dev-lead spawned for ${sessionId}`);
+          } else {
+            const text = await resp.text().catch(() => "");
+            console.warn(`[redis-sub] gateway spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
+          }
+        } catch (err: any) {
+          console.error("[redis-sub] message handler error:", err.message);
+        }
+      })();
+    });
+  };
+
+  subscribe();
+}
