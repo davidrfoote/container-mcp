@@ -1037,7 +1037,7 @@ function createMcpServer() {
               },
               body: JSON.stringify({
                 tool: "sessions_spawn",
-                args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}` },
+                args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}`, cwd: "/home/openclaw/agents/dev-lead" },
               }),
             });
 
@@ -1115,7 +1115,7 @@ function createMcpServer() {
                 },
                 body: JSON.stringify({
                   tool: "sessions_spawn",
-                  args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}` },
+                  args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}`, cwd: "/home/openclaw/agents/dev-lead" },
                 }),
               });
               if (!resp.ok) {
@@ -1260,7 +1260,7 @@ async function startListenChain(): Promise<void> {
             },
             body: JSON.stringify({
               tool: "sessions_spawn",
-              args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}` },
+              args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}`, cwd: "/home/openclaw/agents/dev-lead" },
             }),
           });
 
