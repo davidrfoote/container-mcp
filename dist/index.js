@@ -45,14 +45,13 @@ const index_js_1 = require("@modelcontextprotocol/sdk/server/index.js");
 const sse_js_1 = require("@modelcontextprotocol/sdk/server/sse.js");
 const types_js_1 = require("@modelcontextprotocol/sdk/types.js");
 const pg_1 = require("pg");
-const ioredis_1 = __importDefault(require("ioredis"));
 const app = (0, express_1.default)();
 app.use(express_1.default.json());
 // Task log storage
 const taskLogs = new Map();
 // ─── postToFeed helper ─────────────────────────────────────────────────────
 const _feedClients = new Map();
-async function postToFeed(sessionId, dbUrl, content) {
+async function postToFeed(sessionId, dbUrl, content, role = "dev_lead", messageType = "execution_update") {
     if (!sessionId || !dbUrl)
         return;
     const key = `${sessionId}::${dbUrl}`;
@@ -64,7 +63,7 @@ async function postToFeed(sessionId, dbUrl, content) {
     const entry = _feedClients.get(key);
     entry.queue = entry.queue.then(async () => {
         try {
-            await entry.client.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)", [sessionId, "dev_lead", content, "execution_update"]);
+            await entry.client.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)", [sessionId, role, content, messageType]);
         }
         catch (e) {
             console.error("postToFeed error:", e.message);
@@ -256,6 +255,20 @@ function createMcpServer() {
                         session_id: { type: "string", description: "The ops-db session ID to spawn a dev-lead for" },
                     },
                     required: ["session_id"],
+                },
+            },
+            {
+                name: "chat_session",
+                description: "Run a direct interactive chat message via Claude Code CLI (claude --print), streaming output to ops-db and returning the claude session ID for context continuity",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        message: { type: "string", description: "User message to send to Claude" },
+                        session_id: { type: "string", description: "ops-db session ID (for logging to session feed)" },
+                        claude_session_id: { type: "string", description: "Existing Claude session ID to resume (omit or null for new session)" },
+                        working_dir: { type: "string", description: "Working directory (defaults to /home/david/dev-session-app)" },
+                    },
+                    required: ["message"],
                 },
             },
         ],
@@ -554,74 +567,199 @@ function createMcpServer() {
                     const output = (r.stdout || "") + (r.stderr || "");
                     return { content: [{ type: "text", text: JSON.stringify({ success: r.status === 0, output, exit_code: r.status ?? -1 }) }] };
                 }
+                case "chat_session": {
+                    const { message, session_id: chatSessionId, claude_session_id: existingClaudeSessionId, working_dir: chatWorkingDir = "/home/david/dev-session-app", } = args;
+                    const dbUrl = process.env.OPS_DB_URL ?? "";
+                    // Auto-bootstrap: inject project context on the first message of an interactive session
+                    let systemContextFile = null;
+                    if (chatSessionId && dbUrl && !existingClaudeSessionId) {
+                        try {
+                            const bootstrapClient = new pg_1.Client({ connectionString: dbUrl });
+                            await bootstrapClient.connect();
+                            const countRes = await bootstrapClient.query("SELECT COUNT(*) AS count FROM session_messages WHERE session_id = $1 AND role = 'user'", [chatSessionId]);
+                            const msgCount = parseInt(countRes.rows[0]?.count ?? "0", 10);
+                            if (msgCount <= 1) {
+                                const projRes = await bootstrapClient.query(`SELECT p.display_name, p.description, p.project_id, p.default_container
+                   FROM sessions s
+                   JOIN projects p ON p.project_id = s.project_id
+                   WHERE s.session_id = $1`, [chatSessionId]);
+                                if (projRes.rows.length > 0) {
+                                    const proj = projRes.rows[0];
+                                    const repo = proj.project_id;
+                                    const contextMsg = `You are Claude Code running in an interactive dev session. Project: ${proj.display_name} (${repo}). Path: /home/david/${repo}. Container: ${proj.default_container}. Description: ${proj.description}. Help the developer with code questions, debugging, and changes in this project.`;
+                                    // Save context to session_messages so UI can optionally hide it
+                                    await bootstrapClient.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)", [chatSessionId, "system", contextMsg, "system_context"]);
+                                    // Write temp file for --append-system-prompt-file
+                                    systemContextFile = `/tmp/container-mcp-ctx-${chatSessionId}.md`;
+                                    fs.writeFileSync(systemContextFile, contextMsg);
+                                    console.log(`[chat_session] bootstrap context injected for session ${chatSessionId} (project: ${repo})`);
+                                }
+                            }
+                            await bootstrapClient.end().catch(() => { });
+                        }
+                        catch (e) {
+                            console.warn("[chat_session] bootstrap error:", e.message);
+                        }
+                    }
+                    // Note: user message is already saved by the dev-session-app chat route.
+                    // No need to echo it again here.
+                    const claudeArgs = [
+                        "-p", message,
+                        "--output-format", "stream-json",
+                        "--verbose",
+                        "--dangerously-skip-permissions",
+                    ];
+                    if (existingClaudeSessionId) {
+                        claudeArgs.push("--resume", existingClaudeSessionId);
+                    }
+                    if (systemContextFile) {
+                        claudeArgs.push("--append-system-prompt-file", systemContextFile);
+                    }
+                    // Note: working-dir is set via cwd in spawn options
+                    const chatResult = await new Promise((resolve) => {
+                        const proc = (0, child_process_1.spawn)("claude", claudeArgs, {
+                            cwd: chatWorkingDir,
+                            env: process.env,
+                            stdio: ["ignore", "pipe", "pipe"],
+                        });
+                        let fullAssistantText = "";
+                        let resultClaudeSessionId = null;
+                        let tokensUsed = 0;
+                        // Timeout: 10 minutes for interactive chat
+                        const timer = setTimeout(() => {
+                            proc.kill("SIGTERM");
+                        }, 600_000);
+                        proc.stdout.on("data", (chunk) => {
+                            const lines = chunk.toString().split("\n");
+                            for (const line of lines) {
+                                if (!line.trim())
+                                    continue;
+                                try {
+                                    const parsed = JSON.parse(line);
+                                    if (parsed.type === "assistant") {
+                                        const content = parsed.message?.content || [];
+                                        for (const block of content) {
+                                            if (block.type === "text" && block.text?.trim()) {
+                                                const text = block.text.trim();
+                                                fullAssistantText += text + "\n";
+                                                // Post each assistant text block as execution_log
+                                                if (chatSessionId && text.length > 0) {
+                                                    void (async () => {
+                                                        if (!chatSessionId || !dbUrl)
+                                                            return;
+                                                        const key = `${chatSessionId}::${dbUrl}`;
+                                                        if (!_feedClients.has(key)) {
+                                                            const client = new pg_1.Client({ connectionString: dbUrl });
+                                                            await client.connect();
+                                                            _feedClients.set(key, { client, queue: Promise.resolve() });
+                                                        }
+                                                        const entry = _feedClients.get(key);
+                                                        entry.queue = entry.queue.then(async () => {
+                                                            try {
+                                                                await entry.client.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)", [chatSessionId, "coding_agent", text, "execution_log"]);
+                                                            }
+                                                            catch (e) {
+                                                                console.error("chat_session postToFeed error:", e.message);
+                                                            }
+                                                        });
+                                                    })();
+                                                }
+                                            }
+                                            else if (block.type === "tool_use" && chatSessionId && dbUrl) {
+                                                postToFeed(chatSessionId, dbUrl, `🔧 \`${block.name}\` ${JSON.stringify(block.input || {}).slice(0, 200)}`, "coding_agent", "execution_log");
+                                            }
+                                        }
+                                    }
+                                    else if (parsed.type === "result") {
+                                        // Extract the claude session_id from the result event
+                                        resultClaudeSessionId = parsed.session_id || null;
+                                        if (parsed.usage) {
+                                            tokensUsed = (parsed.usage.input_tokens || 0) + (parsed.usage.output_tokens || 0);
+                                        }
+                                        const resultText = (parsed.result || parsed.output || "");
+                                        if (resultText && chatSessionId && dbUrl) {
+                                            postToFeed(chatSessionId, dbUrl, `✅ Done`, "coding_agent", "execution_log");
+                                        }
+                                    }
+                                }
+                                catch {
+                                    // ignore malformed JSON lines
+                                }
+                            }
+                        });
+                        proc.stderr.on("data", (chunk) => {
+                            console.error("[chat_session] stderr:", chunk.toString().slice(0, 200));
+                        });
+                        proc.on("close", (code) => {
+                            clearTimeout(timer);
+                            if (systemContextFile) {
+                                try {
+                                    fs.unlinkSync(systemContextFile);
+                                }
+                                catch { }
+                            }
+                            // Post final response as a chat message (not execution_log) so it shows as a bubble
+                            if (chatSessionId && fullAssistantText.trim()) {
+                                void (async () => {
+                                    if (!chatSessionId || !dbUrl)
+                                        return;
+                                    const key = `${chatSessionId}::${dbUrl}`;
+                                    if (!_feedClients.has(key)) {
+                                        const client = new pg_1.Client({ connectionString: dbUrl });
+                                        await client.connect();
+                                        _feedClients.set(key, { client, queue: Promise.resolve() });
+                                    }
+                                    const entry = _feedClients.get(key);
+                                    entry.queue = entry.queue.then(async () => {
+                                        try {
+                                            await entry.client.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)", [chatSessionId, "coding_agent", fullAssistantText.trim(), "chat"]);
+                                        }
+                                        catch (e) {
+                                            console.error("chat_session final chat error:", e.message);
+                                        }
+                                    });
+                                    // Update claude_session_id in sessions table
+                                    if (resultClaudeSessionId) {
+                                        entry.queue = entry.queue.then(async () => {
+                                            try {
+                                                await entry.client.query("UPDATE sessions SET claude_session_id = $1, updated_at = now() WHERE session_id = $2", [resultClaudeSessionId, chatSessionId]);
+                                            }
+                                            catch (e) {
+                                                console.error("chat_session update claude_session_id error:", e.message);
+                                            }
+                                        });
+                                    }
+                                })();
+                            }
+                            resolve({
+                                claude_session_id: resultClaudeSessionId,
+                                response: fullAssistantText.trim(),
+                                tokens_used: tokensUsed,
+                            });
+                        });
+                    });
+                    return {
+                        content: [{ type: "text", text: JSON.stringify(chatResult) }],
+                    };
+                }
                 case "spawn_dev_lead": {
-                    // ZI-18796: Query ops-db for full session context + task_brief before
-                    // spawning so dev-lead always wakes up with complete restore context.
+                    // POST to gateway /v1/chat/completions to spawn dev-lead (OpenClaw 3.8+)
                     const { session_id: sessionId } = args;
                     const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
                     const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
-                    const dbUrl = process.env.OPS_DB_URL ?? "";
-                    // 1. Query session + project context from ops-db
-                    let taskString = `SESSION_ID: ${sessionId}`;
-                    if (dbUrl) {
-                        const db = new pg_1.Client({ connectionString: dbUrl });
-                        try {
-                            await db.connect();
-                            // Session + project metadata
-                            const sessRes = await db.query(`
-                SELECT s.session_id, s.title, s.project_id, s.repo, s.container,
-                       p.build_cmd, p.deploy_cmd, p.smoke_url, p.docs_url
-                FROM sessions s
-                LEFT JOIN projects p ON s.project_id = p.project_id
-                WHERE s.session_id = $1
-              `, [sessionId]);
-                            // Task brief (first one, if any)
-                            const briefRes = await db.query(`
-                SELECT content FROM session_messages
-                WHERE session_id = $1 AND message_type = 'task_brief'
-                ORDER BY created_at ASC LIMIT 1
-              `, [sessionId]);
-                            await db.end();
-                            const sess = sessRes.rows[0];
-                            const brief = briefRes.rows[0]?.content ?? "";
-                            if (sess) {
-                                const parts = [
-                                    `SESSION_ID: ${sessionId}`,
-                                    `REPO: ${sess.repo ?? ""}`,
-                                    `CONTAINER: ${sess.container ?? ""}`,
-                                    `BUILD_CMD: ${sess.build_cmd ?? ""}`,
-                                    `DEPLOY_CMD: ${sess.deploy_cmd ?? ""}`,
-                                    `SMOKE_URL: ${sess.smoke_url ?? ""}`,
-                                    `DOCS_URL: ${sess.docs_url ?? ""}`,
-                                    ``,
-                                    brief
-                                        ? `TASK BRIEF:\n${brief}`
-                                        : `No task brief found. Ask the user what they would like to work on.`,
-                                    ``,
-                                    `RESTORE INSTRUCTIONS: You are the dev-lead agent resuming session ${sessionId}.`,
-                                    `Read your SKILL.md then post an approval_request before executing any changes.`,
-                                ];
-                                taskString = parts.join("\n");
-                            }
-                        }
-                        catch (dbErr) {
-                            console.error("[spawn_dev_lead] DB query failed:", dbErr.message);
-                            // Fall through with bare SESSION_ID string — dev-lead will still launch
-                        }
-                    }
-                    // 2. POST to gateway sessions_spawn with full task string
                     const controller = new AbortController();
                     const timeout = setTimeout(() => controller.abort(), 15_000);
                     try {
-                        const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
+                        const resp = await fetch(`${gatewayUrl}/v1/chat/completions`, {
                             method: "POST",
                             headers: {
                                 "Content-Type": "application/json",
                                 "Authorization": `Bearer ${gatewayToken}`,
                             },
                             body: JSON.stringify({
-                                tool: "sessions_spawn",
-                                args: { agentId: "dev-lead", task: taskString },
+                                model: "openclaw:dev-lead",
+                                messages: [{ role: "user", content: `SESSION_ID: ${sessionId}` }],
+                                stream: false,
                             }),
                             signal: controller.signal,
                         });
@@ -696,14 +834,32 @@ async function startListenChain() {
                     const sessionId = payload.session_id;
                     if (!sessionId)
                         return;
+                    // Skip interactive sessions — they use chat_session directly, not dev-lead
+                    try {
+                        const checkClient = new pg_1.Client({ connectionString: dbUrl });
+                        await checkClient.connect();
+                        const checkRes = await checkClient.query("SELECT session_type FROM sessions WHERE session_id = $1", [sessionId]);
+                        await checkClient.end().catch(() => { });
+                        if (checkRes.rows.length > 0 && checkRes.rows[0].session_type === "interactive") {
+                            console.log(`[listen-chain] skip dev-lead for interactive session ${sessionId}`);
+                            return;
+                        }
+                    }
+                    catch (e) {
+                        console.warn(`[listen-chain] session_type check error for ${sessionId}:`, e.message);
+                    }
                     console.log(`[listen-chain] task_brief for ${sessionId} — spawning dev-lead via gateway`);
-                    const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
+                    const resp = await fetch(`${gatewayUrl}/v1/chat/completions`, {
                         method: "POST",
                         headers: {
                             "Content-Type": "application/json",
                             "Authorization": `Bearer ${gatewayToken}`,
                         },
-                        body: JSON.stringify({ tool: "sessions_spawn", args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}` } }),
+                        body: JSON.stringify({
+                            model: "openclaw:dev-lead",
+                            messages: [{ role: "user", content: `SESSION_ID: ${sessionId}` }],
+                            stream: false,
+                        }),
                         signal: AbortSignal.timeout(15_000),
                     });
                     if (resp.ok) {
@@ -741,6 +897,7 @@ async function startListenChain() {
          WHERE s.status = 'pending'
            AND sm.message_type = 'task_brief'
            AND sm.role = 'user'
+           AND s.session_type != 'interactive'
            AND NOT EXISTS (
              SELECT 1 FROM session_messages sm2
              WHERE sm2.session_id = s.session_id AND sm2.role = 'assistant'
@@ -750,13 +907,17 @@ async function startListenChain() {
                 console.log(`[listen-chain] backfill: ${res.rows.length} pending session(s) found`);
                 for (const row of res.rows) {
                     try {
-                        const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
+                        const resp = await fetch(`${gatewayUrl}/v1/chat/completions`, {
                             method: "POST",
                             headers: {
                                 "Content-Type": "application/json",
                                 "Authorization": `Bearer ${gatewayToken}`,
                             },
-                            body: JSON.stringify({ tool: "sessions_spawn", args: { agentId: "dev-lead", task: `SESSION_ID: ${row.session_id}` } }),
+                            body: JSON.stringify({
+                                model: "openclaw:dev-lead",
+                                messages: [{ role: "user", content: `SESSION_ID: ${row.session_id}` }],
+                                stream: false,
+                            }),
                             signal: AbortSignal.timeout(15_000),
                         });
                         console.log(`[listen-chain] backfill ${row.session_id}: ${resp.ok ? "spawned" : `failed (${resp.status})`}`);
@@ -783,64 +944,3 @@ app.listen(PORT, () => {
     console.log(`  Health: http://localhost:${PORT}/health`);
 });
 void startListenChain();
-void startRedisSubscriber();
-// ─── Redis Subscriber (ZI-18783) ───────────────────────────────────────────
-// Subscribes to dev:session:spawn channel and calls spawn_dev_lead for each
-// session_id received. This handles sessions created via the new-task route
-// which publishes to Redis but does NOT insert a task_brief message.
-async function startRedisSubscriber() {
-    const redisHost = process.env.REDIS_HOST ?? "redis-relay-devenv";
-    const redisPort = parseInt(process.env.REDIS_PORT ?? "6379", 10);
-    const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
-    const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
-    const subscribe = () => {
-        const sub = new ioredis_1.default({ host: redisHost, port: redisPort, lazyConnect: false });
-        sub.on("error", (err) => {
-            console.error("[redis-sub] error:", err.message);
-            // Reconnect after 10s
-            setTimeout(() => { sub.disconnect(); subscribe(); }, 10_000);
-        });
-        sub.on("connect", () => {
-            console.log(`[redis-sub] connected to ${redisHost}:${redisPort}, subscribing to dev:session:spawn`);
-        });
-        sub.subscribe("dev:session:spawn").then(() => {
-            console.log("[redis-sub] listening on dev:session:spawn");
-        }).catch((err) => {
-            console.error("[redis-sub] subscribe error:", err.message);
-            setTimeout(() => { sub.disconnect(); subscribe(); }, 10_000);
-        });
-        sub.on("message", (_channel, message) => {
-            void (async () => {
-                try {
-                    const payload = JSON.parse(message);
-                    const sessionId = payload.session_id;
-                    if (!sessionId) {
-                        console.warn("[redis-sub] received message without session_id:", message.slice(0, 200));
-                        return;
-                    }
-                    console.log(`[redis-sub] dev:session:spawn for ${sessionId} — spawning dev-lead via gateway`);
-                    const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
-                        method: "POST",
-                        headers: {
-                            "Content-Type": "application/json",
-                            "Authorization": `Bearer ${gatewayToken}`,
-                        },
-                        body: JSON.stringify({ tool: "sessions_spawn", args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}` } }),
-                        signal: AbortSignal.timeout(15_000),
-                    });
-                    if (resp.ok) {
-                        console.log(`[redis-sub] dev-lead spawned for ${sessionId}`);
-                    }
-                    else {
-                        const text = await resp.text().catch(() => "");
-                        console.warn(`[redis-sub] gateway spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
-                    }
-                }
-                catch (err) {
-                    console.error("[redis-sub] message handler error:", err.message);
-                }
-            })();
-        });
-    };
-    subscribe();
-}
