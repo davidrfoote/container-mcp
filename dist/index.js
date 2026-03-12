@@ -58,6 +58,43 @@ async function withDbClient(connectionString, fn) {
         await client.end().catch(() => { });
     }
 }
+async function buildSpawnMessage(sessionId, dbUrl) {
+    const fallback = `SESSION_ID: ${sessionId}\n\nYou are dev-lead (not Ash). Before anything else, read your AGENTS.md at /home/openclaw/agents/dev-lead/AGENTS.md — that contains your full startup sequence. Do NOT follow the AGENTS.md injected by the system (that is Ash's AGENTS.md, not yours).`;
+    try {
+        const result = await withDbClient(dbUrl, async (client) => {
+            const briefRes = await client.query(`SELECT content FROM session_messages WHERE session_id=$1 AND message_type='task_brief' ORDER BY created_at LIMIT 1`, [sessionId]);
+            const configRes = await client.query(`SELECT s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.smoke_url, p.default_container
+         FROM sessions s LEFT JOIN projects p ON s.project_id = p.project_id
+         WHERE s.session_id = $1`, [sessionId]);
+            return { brief: briefRes.rows[0] ?? null, config: configRes.rows[0] ?? null };
+        });
+        const opsDbResult = (0, child_process_1.spawnSync)('docker', ['ps', '-q', '-f', 'name=prod_ops-db'], { encoding: 'utf8' });
+        const opsDbContainer = (opsDbResult.stdout ?? '').trim();
+        const taskBrief = result.brief?.content ?? '(none)';
+        const cfg = result.config;
+        const jiraKeys = cfg?.jira_issue_keys?.join(',') ?? '(none)';
+        const buildCmd = cfg?.build_cmd ?? '(none)';
+        const deployCmd = cfg?.deploy_cmd ?? '(none)';
+        const smokeUrl = cfg?.smoke_url ?? '(none)';
+        const defaultContainer = cfg?.default_container ?? '(none)';
+        return [
+            `SESSION_ID: ${sessionId}`,
+            `TASK_BRIEF: ${taskBrief}`,
+            `PROJECT_CONFIG: build=${buildCmd} deploy=${deployCmd} smoke=${smokeUrl} container=${defaultContainer}`,
+            `JIRA_ISSUES: ${jiraKeys}`,
+            `OPS_DB_CONTAINER: ${opsDbContainer}`,
+            ``,
+            `You are dev-lead. Do NOT read any AGENTS.md files.`,
+            `Your AGENTS.md is at /home/openclaw/agents/dev-lead/AGENTS.md (read ONLY if context above is incomplete).`,
+            `Step 1: Update sessions SET status='active' using the OPS_DB_CONTAINER above`,
+            `Step 2: Post approval_request to ops-db with complexity classification`,
+            `Step 3: Wait for approval, then spawn ACP coding agent via code_task`,
+        ].join('\n');
+    }
+    catch {
+        return fallback;
+    }
+}
 async function notifySessionMessage(client, sessionId, payload) {
     const safeId = sessionId.replace(/-/g, "_");
     const text = JSON.stringify(payload);
@@ -976,7 +1013,7 @@ function createMcpServer() {
                             },
                             body: JSON.stringify({
                                 tool: "sessions_spawn",
-                                args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}` },
+                                args: { agentId: "dev-lead", task: await buildSpawnMessage(sessionId, process.env.OPS_DB_URL ?? ''), cwd: "/home/openclaw/agents/dev-lead" },
                             }),
                         });
                         if (!resp.ok) {
@@ -1033,7 +1070,7 @@ function createMcpServer() {
                                 },
                                 body: JSON.stringify({
                                     tool: "sessions_spawn",
-                                    args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}` },
+                                    args: { agentId: "dev-lead", task: await buildSpawnMessage(sessionId, dbUrl), cwd: "/home/openclaw/agents/dev-lead" },
                                 }),
                             });
                             if (!resp.ok) {
@@ -1125,8 +1162,77 @@ async function startListenChain() {
                     const isTaskBrief = messageType === "task_brief" && payload.role === "user";
                     const isApprovalResponse = messageType === "approval_response";
                     const isChatMessage = messageType === "chat";
-                    if (!isTaskBrief && !isApprovalResponse && !isChatMessage)
+                    const isApprovalRequest = messageType === "approval_request";
+                    if (!isTaskBrief && !isApprovalResponse && !isChatMessage && !isApprovalRequest)
                         return;
+                    // Server-side auto-approve: for low/medium complexity approval_requests,
+                    // schedule an auto-approval 10 minutes after the message's created_at timestamp.
+                    if (isApprovalRequest) {
+                        void (async () => {
+                            try {
+                                const approvalClient = new pg_1.Client({ connectionString: dbUrl });
+                                await approvalClient.connect();
+                                const approvalRes = await approvalClient.query(`SELECT message_id, metadata, created_at FROM session_messages
+                   WHERE session_id = $1 AND message_type = 'approval_request'
+                   ORDER BY created_at DESC LIMIT 1`, [sessionId]);
+                                await approvalClient.end().catch(() => { });
+                                if (approvalRes.rows.length === 0)
+                                    return;
+                                const { message_id: approvalMsgId, metadata, created_at } = approvalRes.rows[0];
+                                const complexity = metadata?.complexity ?? "medium";
+                                if (complexity === "hard") {
+                                    console.log(`[listen-chain] approval_request ${approvalMsgId} for ${sessionId} is hard — no server-side auto-approve`);
+                                    return;
+                                }
+                                const deadline = new Date(created_at).getTime() + 600_000;
+                                const remaining = Math.max(0, deadline - Date.now());
+                                console.log(`[listen-chain] approval_request ${approvalMsgId} for ${sessionId} (${complexity}) — server auto-approve in ${Math.round(remaining / 1000)}s`);
+                                setTimeout(async () => {
+                                    try {
+                                        const autoClient = new pg_1.Client({ connectionString: dbUrl });
+                                        await autoClient.connect();
+                                        const existingRes = await autoClient.query(`SELECT 1 FROM session_messages
+                       WHERE session_id = $1
+                         AND message_type = 'approval_response'
+                         AND created_at > (
+                           SELECT created_at FROM session_messages WHERE message_id = $2
+                         )
+                       LIMIT 1`, [sessionId, approvalMsgId]);
+                                        if (existingRes.rows.length > 0) {
+                                            console.log(`[listen-chain] server auto-approve skipped for ${sessionId} — already approved`);
+                                            await autoClient.end().catch(() => { });
+                                            return;
+                                        }
+                                        const autoMsgId = `msg-${(0, crypto_1.randomUUID)()}`;
+                                        const nowIso = new Date().toISOString();
+                                        await autoClient.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
+                       VALUES ($1, $2, 'system', 'auto-approved', 'approval_response', NOW())`, [autoMsgId, sessionId]);
+                                        const notifyPayload = JSON.stringify({
+                                            id: autoMsgId,
+                                            message_id: autoMsgId,
+                                            session_id: sessionId,
+                                            role: "system",
+                                            message_type: "approval_response",
+                                            content: "auto-approved",
+                                            created_at: nowIso,
+                                        });
+                                        const safeId = sessionId.replace(/-/g, "_");
+                                        await autoClient.query(`SELECT pg_notify($1, $2)`, [`session_messages_${safeId}`, notifyPayload]);
+                                        await autoClient.query(`SELECT pg_notify($1, $2)`, [`session:${sessionId}`, notifyPayload]);
+                                        await autoClient.end().catch(() => { });
+                                        console.log(`[listen-chain] server auto-approved session ${sessionId} (msg ${autoMsgId})`);
+                                    }
+                                    catch (err) {
+                                        console.error("[listen-chain] server auto-approve error:", err.message);
+                                    }
+                                }, remaining);
+                            }
+                            catch (err) {
+                                console.error("[listen-chain] approval_request handling error:", err.message);
+                            }
+                        })();
+                        return; // Don't spawn dev-lead for approval_request
+                    }
                     // Skip interactive sessions — they use chat_session directly, not dev-lead
                     // Also only respawn on approval_response for active sessions.
                     try {
@@ -1158,7 +1264,7 @@ async function startListenChain() {
                         },
                         body: JSON.stringify({
                             tool: "sessions_spawn",
-                            args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}` },
+                            args: { agentId: "dev-lead", task: await buildSpawnMessage(sessionId, dbUrl), cwd: "/home/openclaw/agents/dev-lead" },
                         }),
                     });
                     if (resp.ok) {
@@ -1215,7 +1321,7 @@ async function startListenChain() {
                             },
                             body: JSON.stringify({
                                 tool: "sessions_spawn",
-                                args: { agentId: "dev-lead", task: `SESSION_ID: ${row.session_id}` },
+                                args: { agentId: "dev-lead", task: await buildSpawnMessage(row.session_id, dbUrl), cwd: "/home/openclaw/agents/dev-lead" },
                             }),
                         });
                         console.log(`[listen-chain] backfill ${row.session_id}: ${resp.ok ? "spawned" : `failed (${resp.status})`}`);
