@@ -98,6 +98,21 @@ async function postToFeed(sessionId, dbUrl, content, role = "dev_lead", messageT
                 catch {
                     // non-fatal
                 }
+                try {
+                    await entry.client.query("SELECT pg_notify($1, $2)", [
+                        `session_feed:${sessionId}`,
+                        JSON.stringify({
+                            message_id: inserted.message_id,
+                            message_type: messageType,
+                            content,
+                            role,
+                            created_at: inserted.created_at,
+                        }),
+                    ]);
+                }
+                catch {
+                    // non-fatal
+                }
             }
         }
         catch (e) {
@@ -1011,7 +1026,8 @@ async function startListenChain() {
     try {
         await listenClient.connect();
         await listenClient.query("LISTEN session_messages");
-        console.log("[listen-chain] Postgres LISTEN session_messages started");
+        await listenClient.query("LISTEN session_events");
+        console.log("[listen-chain] Postgres LISTEN session_messages + session_events started");
         listenClient.on("notification", (msg) => {
             void (async () => {
                 try {
