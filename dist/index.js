@@ -45,6 +45,24 @@ const index_js_1 = require("@modelcontextprotocol/sdk/server/index.js");
 const sse_js_1 = require("@modelcontextprotocol/sdk/server/sse.js");
 const types_js_1 = require("@modelcontextprotocol/sdk/types.js");
 const pg_1 = require("pg");
+async function withDbClient(connectionString, fn) {
+    if (!connectionString) {
+        throw new Error("OPS_DB_URL not set");
+    }
+    const client = new pg_1.Client({ connectionString });
+    await client.connect();
+    try {
+        return await fn(client);
+    }
+    finally {
+        await client.end().catch(() => { });
+    }
+}
+async function notifySessionMessage(client, sessionId, payload) {
+    const safeId = sessionId.replace(/-/g, "_");
+    const text = JSON.stringify(payload);
+    await client.query("SELECT pg_notify($1, $2)", [`session_messages_${safeId}`, text]);
+}
 const app = (0, express_1.default)();
 app.use(express_1.default.json());
 // Task log storage
@@ -63,7 +81,39 @@ async function postToFeed(sessionId, dbUrl, content, role = "dev_lead", messageT
     const entry = _feedClients.get(key);
     entry.queue = entry.queue.then(async () => {
         try {
-            await entry.client.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)", [sessionId, role, content, messageType]);
+            const insertRes = await entry.client.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4) RETURNING message_id, created_at", [sessionId, role, content, messageType]);
+            const inserted = insertRes.rows[0];
+            if (inserted) {
+                try {
+                    await notifySessionMessage(entry.client, sessionId, {
+                        id: inserted.message_id,
+                        message_id: inserted.message_id,
+                        session_id: sessionId,
+                        role,
+                        message_type: messageType,
+                        content,
+                        created_at: inserted.created_at,
+                    });
+                }
+                catch {
+                    // non-fatal
+                }
+                try {
+                    await entry.client.query("SELECT pg_notify($1, $2)", [
+                        `session_feed:${sessionId}`,
+                        JSON.stringify({
+                            message_id: inserted.message_id,
+                            message_type: messageType,
+                            content,
+                            role,
+                            created_at: inserted.created_at,
+                        }),
+                    ]);
+                }
+                catch {
+                    // non-fatal
+                }
+            }
         }
         catch (e) {
             console.error("postToFeed error:", e.message);
@@ -159,6 +209,44 @@ function createMcpServer() {
                         working_dir: { type: "string" },
                     },
                     required: ["working_dir"],
+                },
+            },
+            {
+                name: "cache_read",
+                description: "Read a cached project context summary from ops-db project_context_cache",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        cache_key: { type: "string", description: "Cache key such as confluence:4128178218 or jira:ZI-18807" },
+                    },
+                    required: ["cache_key"],
+                },
+            },
+            {
+                name: "cache_write",
+                description: "Upsert a cached project context summary into ops-db project_context_cache",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        cache_key: { type: "string" },
+                        source_type: { type: "string" },
+                        content_hash: { type: "string" },
+                        source_updated: { type: "string", description: "ISO timestamp or empty string/null" },
+                        summary: { type: "string" },
+                    },
+                    required: ["cache_key", "source_type", "content_hash", "summary"],
+                },
+            },
+            {
+                name: "listen_for_approval",
+                description: "Wait on Postgres LISTEN/NOTIFY for a session approval_response",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        session_id: { type: "string" },
+                        timeout_seconds: { type: "number", default: 1800 },
+                    },
+                    required: ["session_id"],
                 },
             },
             {
@@ -480,6 +568,89 @@ function createMcpServer() {
                             }],
                     };
                 }
+                case "cache_read": {
+                    const { cache_key } = args;
+                    const dbUrl = process.env.OPS_DB_URL;
+                    const result = await withDbClient(dbUrl, async (client) => {
+                        const rowRes = await client.query(`SELECT summary, content_hash, source_updated, cached_at
+               FROM project_context_cache
+               WHERE cache_key = $1`, [cache_key]);
+                        if (rowRes.rows.length === 0) {
+                            return { found: false };
+                        }
+                        await client.query(`UPDATE project_context_cache SET last_checked = now() WHERE cache_key = $1`, [cache_key]);
+                        const row = rowRes.rows[0];
+                        return {
+                            found: true,
+                            summary: row.summary,
+                            content_hash: row.content_hash,
+                            source_updated: row.source_updated,
+                            cached_at: row.cached_at,
+                        };
+                    });
+                    return { content: [{ type: "text", text: JSON.stringify(result) }] };
+                }
+                case "cache_write": {
+                    const { cache_key, source_type, content_hash, source_updated = null, summary } = args;
+                    const dbUrl = process.env.OPS_DB_URL;
+                    const result = await withDbClient(dbUrl, async (client) => {
+                        await client.query(`INSERT INTO project_context_cache
+                 (cache_key, source_type, content_hash, source_updated, summary, cached_at, last_checked)
+               VALUES ($1, $2, $3, $4, $5, now(), now())
+               ON CONFLICT (cache_key) DO UPDATE SET
+                 source_type = EXCLUDED.source_type,
+                 content_hash = EXCLUDED.content_hash,
+                 source_updated = EXCLUDED.source_updated,
+                 summary = EXCLUDED.summary,
+                 cached_at = now(),
+                 last_checked = now()`, [cache_key, source_type, content_hash, source_updated || null, summary]);
+                        return { ok: true };
+                    });
+                    return { content: [{ type: "text", text: JSON.stringify(result) }] };
+                }
+                case "listen_for_approval": {
+                    const { session_id, timeout_seconds = 1800 } = args;
+                    const dbUrl = process.env.OPS_DB_URL;
+                    const result = await withDbClient(dbUrl, async (client) => {
+                        const channel = `session:${session_id}`;
+                        const quotedChannel = `"${channel.replace(/"/g, '""')}"`;
+                        await client.query(`LISTEN ${quotedChannel}`);
+                        try {
+                            const notified = await new Promise((resolve) => {
+                                const timer = setTimeout(() => {
+                                    client.removeListener("notification", onNotification);
+                                    resolve(false);
+                                }, Math.max(1, Number(timeout_seconds)) * 1000);
+                                const onNotification = (msg) => {
+                                    if (msg.channel === channel) {
+                                        clearTimeout(timer);
+                                        client.removeListener("notification", onNotification);
+                                        resolve(true);
+                                    }
+                                };
+                                client.on("notification", onNotification);
+                            });
+                            if (!notified) {
+                                return { approved: false, timed_out: true };
+                            }
+                            const approvalRes = await client.query(`SELECT content
+                 FROM session_messages
+                 WHERE session_id = $1
+                   AND message_type = 'approval_response'
+                   AND role != 'dev_lead'
+                 ORDER BY created_at DESC
+                 LIMIT 1`, [session_id]);
+                            if (approvalRes.rows.length === 0) {
+                                return { approved: false };
+                            }
+                            return { approved: true, content: approvalRes.rows[0].content };
+                        }
+                        finally {
+                            await client.query(`UNLISTEN ${quotedChannel}`).catch(() => { });
+                        }
+                    });
+                    return { content: [{ type: "text", text: JSON.stringify(result) }] };
+                }
                 case "git_status": {
                     const { repo } = args;
                     const working_dir = `/home/david/${repo}`;
@@ -588,7 +759,18 @@ function createMcpServer() {
                                     const repo = proj.project_id;
                                     const contextMsg = `You are Claude Code running in an interactive dev session. Project: ${proj.display_name} (${repo}). Path: /home/david/${repo}. Container: ${proj.default_container}. Description: ${proj.description}. Help the developer with code questions, debugging, and changes in this project.`;
                                     // Save context to session_messages so UI can optionally hide it
-                                    await bootstrapClient.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)", [chatSessionId, "system", contextMsg, "system_context"]);
+                                    const bootstrapInsert = await bootstrapClient.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4) RETURNING message_id, created_at", [chatSessionId, "system", contextMsg, "system_context"]);
+                                    if (bootstrapInsert.rows[0]) {
+                                        await notifySessionMessage(bootstrapClient, chatSessionId, {
+                                            id: bootstrapInsert.rows[0].message_id,
+                                            message_id: bootstrapInsert.rows[0].message_id,
+                                            session_id: chatSessionId,
+                                            role: "system",
+                                            message_type: "system_context",
+                                            content: contextMsg,
+                                            created_at: bootstrapInsert.rows[0].created_at,
+                                        }).catch(() => { });
+                                    }
                                     // Write temp file for --append-system-prompt-file
                                     systemContextFile = `/tmp/container-mcp-ctx-${chatSessionId}.md`;
                                     fs.writeFileSync(systemContextFile, contextMsg);
@@ -656,7 +838,18 @@ function createMcpServer() {
                                                         const entry = _feedClients.get(key);
                                                         entry.queue = entry.queue.then(async () => {
                                                             try {
-                                                                await entry.client.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)", [chatSessionId, "coding_agent", text, "execution_log"]);
+                                                                const insertRes = await entry.client.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4) RETURNING message_id, created_at", [chatSessionId, "coding_agent", text, "execution_log"]);
+                                                                if (insertRes.rows[0]) {
+                                                                    await notifySessionMessage(entry.client, chatSessionId, {
+                                                                        id: insertRes.rows[0].message_id,
+                                                                        message_id: insertRes.rows[0].message_id,
+                                                                        session_id: chatSessionId,
+                                                                        role: "coding_agent",
+                                                                        message_type: "execution_log",
+                                                                        content: text,
+                                                                        created_at: insertRes.rows[0].created_at,
+                                                                    }).catch(() => { });
+                                                                }
                                                             }
                                                             catch (e) {
                                                                 console.error("chat_session postToFeed error:", e.message);
@@ -712,7 +905,18 @@ function createMcpServer() {
                                     const entry = _feedClients.get(key);
                                     entry.queue = entry.queue.then(async () => {
                                         try {
-                                            await entry.client.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)", [chatSessionId, "coding_agent", fullAssistantText.trim(), "chat"]);
+                                            const insertRes = await entry.client.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4) RETURNING message_id, created_at", [chatSessionId, "coding_agent", fullAssistantText.trim(), "chat"]);
+                                            if (insertRes.rows[0]) {
+                                                await notifySessionMessage(entry.client, chatSessionId, {
+                                                    id: insertRes.rows[0].message_id,
+                                                    message_id: insertRes.rows[0].message_id,
+                                                    session_id: chatSessionId,
+                                                    role: "coding_agent",
+                                                    message_type: "chat",
+                                                    content: fullAssistantText.trim(),
+                                                    created_at: insertRes.rows[0].created_at,
+                                                }).catch(() => { });
+                                            }
                                         }
                                         catch (e) {
                                             console.error("chat_session final chat error:", e.message);
@@ -822,33 +1026,45 @@ async function startListenChain() {
     try {
         await listenClient.connect();
         await listenClient.query("LISTEN session_messages");
-        console.log("[listen-chain] Postgres LISTEN session_messages started");
+        await listenClient.query("LISTEN session_events");
+        console.log("[listen-chain] Postgres LISTEN session_messages + session_events started");
         listenClient.on("notification", (msg) => {
             void (async () => {
                 try {
                     if (!msg.payload)
                         return;
                     const payload = JSON.parse(msg.payload);
-                    if (payload.message_type !== "task_brief" || payload.role !== "user")
-                        return;
                     const sessionId = payload.session_id;
-                    if (!sessionId)
+                    const messageType = payload.message_type;
+                    if (!sessionId || !messageType)
+                        return;
+                    const isTaskBrief = messageType === "task_brief" && payload.role === "user";
+                    const isApprovalResponse = messageType === "approval_response";
+                    if (!isTaskBrief && !isApprovalResponse)
                         return;
                     // Skip interactive sessions — they use chat_session directly, not dev-lead
+                    // Also only respawn on approval_response for active sessions.
                     try {
                         const checkClient = new pg_1.Client({ connectionString: dbUrl });
                         await checkClient.connect();
-                        const checkRes = await checkClient.query("SELECT session_type FROM sessions WHERE session_id = $1", [sessionId]);
+                        const checkRes = await checkClient.query("SELECT session_type, status FROM sessions WHERE session_id = $1", [sessionId]);
                         await checkClient.end().catch(() => { });
-                        if (checkRes.rows.length > 0 && checkRes.rows[0].session_type === "interactive") {
-                            console.log(`[listen-chain] skip dev-lead for interactive session ${sessionId}`);
-                            return;
+                        if (checkRes.rows.length > 0) {
+                            const session = checkRes.rows[0];
+                            if (session.session_type === "interactive") {
+                                console.log(`[listen-chain] skip dev-lead for interactive session ${sessionId}`);
+                                return;
+                            }
+                            if (isApprovalResponse && session.status !== "active") {
+                                console.log(`[listen-chain] skip approval wake for non-active session ${sessionId} (${session.status})`);
+                                return;
+                            }
                         }
                     }
                     catch (e) {
-                        console.warn(`[listen-chain] session_type check error for ${sessionId}:`, e.message);
+                        console.warn(`[listen-chain] session check error for ${sessionId}:`, e.message);
                     }
-                    console.log(`[listen-chain] task_brief for ${sessionId} — spawning dev-lead via gateway`);
+                    console.log(`[listen-chain] ${messageType} for ${sessionId} — spawning dev-lead via gateway`);
                     const resp = await fetch(`${gatewayUrl}/v1/chat/completions`, {
                         method: "POST",
                         headers: {
