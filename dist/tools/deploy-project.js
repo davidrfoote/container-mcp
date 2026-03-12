@@ -42,6 +42,62 @@ const path = __importStar(require("path"));
 const https = __importStar(require("https"));
 const http = __importStar(require("http"));
 const execPromise = (0, util_1.promisify)(child_process_1.exec);
+// --- Deploy-agent HTTP API helper ---
+// Calls the host-side deploy-agent service (http://172.17.0.1:18790) instead of running
+// docker commands directly. This fixes phantom deploys when container-mcp runs inside
+// a dev container that has no docker CLI.
+async function callDeployAgent(projectId, sessionId) {
+    const deployAgentUrl = (process.env.DEPLOY_AGENT_URL || '').trim();
+    const deployAgentToken = (process.env.DEPLOY_AGENT_TOKEN || '').trim();
+    if (!deployAgentUrl)
+        return null; // Not configured — fall back to legacy behavior
+    const url = `${deployAgentUrl}/deploy`;
+    const body = JSON.stringify({ project_id: projectId, session_id: sessionId ?? null });
+    return new Promise((resolve) => {
+        const isHttps = url.startsWith('https');
+        const mod = isHttps ? https : http;
+        const parsedUrl = new URL(url);
+        const options = {
+            method: 'POST',
+            hostname: parsedUrl.hostname,
+            port: parsedUrl.port || (isHttps ? 443 : 80),
+            path: parsedUrl.pathname,
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(body),
+                ...(deployAgentToken ? { 'Authorization': `Bearer ${deployAgentToken}` } : {}),
+            },
+            timeout: 300000,
+        };
+        const req = mod.request(options, (res) => {
+            let data = '';
+            res.on('data', (chunk) => { data += chunk; });
+            res.on('end', () => {
+                try {
+                    const parsed = JSON.parse(data);
+                    resolve({
+                        success: parsed.ok ?? false,
+                        output: parsed.output ?? parsed.error ?? data,
+                        smoke_status: parsed.smoke_status != null ? String(parsed.smoke_status) : 'unknown',
+                    });
+                }
+                catch {
+                    resolve({ success: false, output: `deploy-agent parse error: ${data}`, smoke_status: 'error' });
+                }
+            });
+        });
+        req.on('error', (err) => {
+            console.error('[deploy_project] deploy-agent call failed:', err.message, '— falling back to local execution');
+            resolve(null); // null = fall back
+        });
+        req.on('timeout', () => {
+            req.destroy();
+            resolve({ success: false, output: 'deploy-agent request timed out', smoke_status: 'timeout' });
+        });
+        req.write(body);
+        req.end();
+    });
+}
 // --- DB helpers ---
 async function withDeployClient(dbUrl, fn) {
     const client = new pg_1.Client({ connectionString: dbUrl });
@@ -202,6 +258,20 @@ async function deployProject(projectId, sessionId) {
         }
         const { build_cmd, deploy_cmd, smoke_url, default_container } = project;
         const container = default_container ?? null;
+        // --- Delegate to deploy-agent HTTP API (preferred — avoids docker CLI issues in containers) ---
+        await postSessionMessage(dbUrl, sessionId ?? '', `🔧 Attempting deploy via deploy-agent HTTP API...`, 'console');
+        const agentResult = await callDeployAgent(projectId, sessionId);
+        if (agentResult !== null) {
+            output.push(`[deploy_project] Delegated to deploy-agent HTTP API`);
+            output.push(agentResult.output);
+            const resultMsg = agentResult.success
+                ? `✅ deploy_project('${projectId}') complete via deploy-agent. Smoke: ${agentResult.smoke_status}`
+                : `❌ deploy_project('${projectId}') failed via deploy-agent. Smoke: ${agentResult.smoke_status}`;
+            await postSessionMessage(dbUrl, sessionId ?? '', resultMsg, 'checkpoint');
+            return { ...agentResult, output: output.join('\n') };
+        }
+        // deploy-agent not configured or returned null — fall through to legacy local execution
+        await postSessionMessage(dbUrl, sessionId ?? '', `⚠️ deploy-agent not available — falling back to local execution`, 'console');
         // Build phase
         if (build_cmd) {
             output.push(`[deploy_project] Running build: ${build_cmd}`);
