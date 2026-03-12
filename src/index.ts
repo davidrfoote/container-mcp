@@ -1023,39 +1023,33 @@ function createMcpServer() {
         }
 
         case "spawn_dev_lead": {
-          // POST to gateway /v1/chat/completions to spawn dev-lead (OpenClaw 3.8+)
+          // POST to gateway /tools/invoke (async — returns immediately with childSessionKey)
           const { session_id: sessionId } = args as any;
           const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
           const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
 
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 15_000);
-
           try {
-            const resp = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+            const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
                 "Authorization": `Bearer ${gatewayToken}`,
               },
               body: JSON.stringify({
-                model: "openclaw:dev-lead",
-                messages: [{ role: "user", content: `SESSION_ID: ${sessionId}` }],
-                stream: false,
+                tool: "sessions_spawn",
+                args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}` },
               }),
-              signal: controller.signal,
             });
-
-            clearTimeout(timeout);
 
             if (!resp.ok) {
               const text = await resp.text();
               return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: `Gateway ${resp.status}: ${text}` }) }] };
             }
 
-            return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: sessionId }) }] };
+            const parsed = await resp.json().catch(() => ({})) as any;
+            const childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
+            return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: sessionId, childSessionKey }) }] };
           } catch (fetchErr: any) {
-            clearTimeout(timeout);
             return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: fetchErr.message }) }] };
           }
         }
@@ -1106,36 +1100,33 @@ function createMcpServer() {
               );
             });
 
-            // Step 3: Spawn dev-lead via gateway
+            // Step 3: Spawn dev-lead via gateway /tools/invoke (async — returns immediately)
             const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
             const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
-            const spawnController = new AbortController();
-            const spawnTimeout = setTimeout(() => spawnController.abort(), 15_000);
             let spawnOk = false;
             let spawnError = "";
+            let childSessionKey: string | null = null;
             try {
-              const resp = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+              const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
                 method: "POST",
                 headers: {
                   "Content-Type": "application/json",
                   "Authorization": `Bearer ${gatewayToken}`,
                 },
                 body: JSON.stringify({
-                  model: "openclaw:dev-lead",
-                  messages: [{ role: "user", content: `SESSION_ID: ${sessionId}` }],
-                  stream: false,
+                  tool: "sessions_spawn",
+                  args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}` },
                 }),
-                signal: spawnController.signal,
               });
-              clearTimeout(spawnTimeout);
               if (!resp.ok) {
                 const text = await resp.text();
                 spawnError = `Gateway ${resp.status}: ${text}`;
               } else {
+                const parsed = await resp.json().catch(() => ({})) as any;
+                childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
                 spawnOk = true;
               }
             } catch (fetchErr: any) {
-              clearTimeout(spawnTimeout);
               spawnError = fetchErr.message;
             }
 
@@ -1151,7 +1142,7 @@ function createMcpServer() {
               return { content: [{ type: "text", text: JSON.stringify({ ok: false, session_id: sessionId, session_url: sessionUrl, error: `spawn failed: ${spawnError}` }) }] };
             }
 
-            return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: sessionId, session_url: sessionUrl }) }] };
+            return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: sessionId, session_url: sessionUrl, childSessionKey }) }] };
           } catch (err: any) {
             return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: (err as Error).message }) }], isError: true };
           }
@@ -1232,7 +1223,8 @@ async function startListenChain(): Promise<void> {
 
           const isTaskBrief = messageType === "task_brief" && payload.role === "user";
           const isApprovalResponse = messageType === "approval_response";
-          if (!isTaskBrief && !isApprovalResponse) return;
+          const isChatMessage = messageType === "chat";
+          if (!isTaskBrief && !isApprovalResponse && !isChatMessage) return;
 
           // Skip interactive sessions — they use chat_session directly, not dev-lead
           // Also only respawn on approval_response for active sessions.
@@ -1259,23 +1251,22 @@ async function startListenChain(): Promise<void> {
             console.warn(`[listen-chain] session check error for ${sessionId}:`, e.message);
           }
 
-          console.log(`[listen-chain] ${messageType} for ${sessionId} — spawning dev-lead via gateway`);
-          const resp = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+          console.log(`[listen-chain] ${messageType} for ${sessionId} — spawning dev-lead via /tools/invoke`);
+          const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
               "Authorization": `Bearer ${gatewayToken}`,
             },
             body: JSON.stringify({
-              model: "openclaw:dev-lead",
-              messages: [{ role: "user", content: `SESSION_ID: ${sessionId}` }],
-              stream: false,
+              tool: "sessions_spawn",
+              args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}` },
             }),
-            signal: AbortSignal.timeout(15_000),
           });
 
           if (resp.ok) {
-            console.log(`[listen-chain] dev-lead spawned for ${sessionId}`);
+            const parsed = await resp.json().catch(() => ({})) as any;
+            console.log(`[listen-chain] dev-lead spawned for ${sessionId}, childSessionKey=${parsed?.childSessionKey ?? "n/a"}`);
           } else {
             const text = await resp.text().catch(() => "");
             console.warn(`[listen-chain] gateway spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
@@ -1320,18 +1311,16 @@ async function startListenChain(): Promise<void> {
         console.log(`[listen-chain] backfill: ${res.rows.length} pending session(s) found`);
         for (const row of res.rows) {
           try {
-            const resp = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+            const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
                 "Authorization": `Bearer ${gatewayToken}`,
               },
               body: JSON.stringify({
-                model: "openclaw:dev-lead",
-                messages: [{ role: "user", content: `SESSION_ID: ${row.session_id}` }],
-                stream: false,
+                tool: "sessions_spawn",
+                args: { agentId: "dev-lead", task: `SESSION_ID: ${row.session_id}` },
               }),
-              signal: AbortSignal.timeout(15_000),
             });
             console.log(`[listen-chain] backfill ${row.session_id}: ${resp.ok ? "spawned" : `failed (${resp.status})`}`);
           } catch (e: any) {
