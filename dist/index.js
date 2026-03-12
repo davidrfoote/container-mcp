@@ -346,6 +346,22 @@ function createMcpServer() {
                 },
             },
             {
+                name: "create_session",
+                description: "Atomically create a dev session: INSERT into sessions table, INSERT task_brief into session_messages, and spawn dev-lead. Returns { ok, session_id, session_url }.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        title: { type: "string", description: "Short title for the session" },
+                        repo: { type: "string", description: "Repository name (must match projects table project_id)" },
+                        container: { type: "string", description: "Dev container name (default: dev-david)" },
+                        task_brief: { type: "string", description: "Full task brief content to post as task_brief message" },
+                        slack_thread_url: { type: "string", description: "Slack thread URL for notifications (optional)" },
+                        jira_keys: { type: "string", description: "Comma-separated Jira issue keys (optional, e.g. ZI-18820)" },
+                    },
+                    required: ["title", "repo", "task_brief"],
+                },
+            },
+            {
                 name: "chat_session",
                 description: "Run a direct interactive chat message via Claude Code CLI (claude --print), streaming output to ops-db and returning the claude session ID for context continuity",
                 inputSchema: {
@@ -947,36 +963,104 @@ function createMcpServer() {
                     };
                 }
                 case "spawn_dev_lead": {
-                    // POST to gateway /v1/chat/completions to spawn dev-lead (OpenClaw 3.8+)
+                    // POST to gateway /tools/invoke (async — returns immediately with childSessionKey)
                     const { session_id: sessionId } = args;
                     const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
                     const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
-                    const controller = new AbortController();
-                    const timeout = setTimeout(() => controller.abort(), 15_000);
                     try {
-                        const resp = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+                        const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
                             method: "POST",
                             headers: {
                                 "Content-Type": "application/json",
                                 "Authorization": `Bearer ${gatewayToken}`,
                             },
                             body: JSON.stringify({
-                                model: "openclaw:dev-lead",
-                                messages: [{ role: "user", content: `SESSION_ID: ${sessionId}` }],
-                                stream: false,
+                                tool: "sessions_spawn",
+                                args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}` },
                             }),
-                            signal: controller.signal,
                         });
-                        clearTimeout(timeout);
                         if (!resp.ok) {
                             const text = await resp.text();
                             return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: `Gateway ${resp.status}: ${text}` }) }] };
                         }
-                        return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: sessionId }) }] };
+                        const parsed = await resp.json().catch(() => ({}));
+                        const childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
+                        return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: sessionId, childSessionKey }) }] };
                     }
                     catch (fetchErr) {
-                        clearTimeout(timeout);
                         return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: fetchErr.message }) }] };
+                    }
+                }
+                case "create_session": {
+                    const { title, repo, container: sessionContainer = "dev-david", task_brief, slack_thread_url, jira_keys, } = args;
+                    const dbUrl = process.env.OPS_DB_URL;
+                    if (!dbUrl) {
+                        return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "OPS_DB_URL not set" }) }] };
+                    }
+                    // Generate session_id: sess-{jirakey_no_dash}-{timestamp}
+                    const firstKey = jira_keys?.split(",")[0]?.trim().toLowerCase().replace(/-/g, "") ?? "";
+                    const ts = Date.now();
+                    const sessionId = firstKey
+                        ? `sess-${firstKey}-${ts}`
+                        : `sess-${(0, crypto_1.randomUUID)().slice(0, 8)}-${ts}`;
+                    const sessionUrl = `https://dev-sessions.ash.zennya.app/sessions/${sessionId}`;
+                    // Parse jira keys into Postgres array literal e.g. {ZI-18820,ZI-18821}
+                    const jiraKeysArr = jira_keys
+                        ? `{${jira_keys.split(",").map((k) => k.trim()).join(",")}}`
+                        : null;
+                    try {
+                        await withDbClient(dbUrl, async (client) => {
+                            // Step 1: INSERT session row
+                            await client.query(`INSERT INTO sessions (session_id, project_id, container, repo, status, title, prompt_preview, jira_issue_keys, slack_thread_url, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, 'active', $5, $6, $7::text[], $8, now(), now())`, [sessionId, repo, sessionContainer, repo, title, task_brief.slice(0, 500), jiraKeysArr, slack_thread_url || null]);
+                            // Step 2: INSERT task_brief message
+                            const msgId = `msg-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+                            await client.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
+                 VALUES ($1, $2, 'user', $3, 'task_brief', now())`, [msgId, sessionId, task_brief]);
+                        });
+                        // Step 3: Spawn dev-lead via gateway /tools/invoke (async — returns immediately)
+                        const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
+                        const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
+                        let spawnOk = false;
+                        let spawnError = "";
+                        let childSessionKey = null;
+                        try {
+                            const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
+                                method: "POST",
+                                headers: {
+                                    "Content-Type": "application/json",
+                                    "Authorization": `Bearer ${gatewayToken}`,
+                                },
+                                body: JSON.stringify({
+                                    tool: "sessions_spawn",
+                                    args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}` },
+                                }),
+                            });
+                            if (!resp.ok) {
+                                const text = await resp.text();
+                                spawnError = `Gateway ${resp.status}: ${text}`;
+                            }
+                            else {
+                                const parsed = await resp.json().catch(() => ({}));
+                                childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
+                                spawnOk = true;
+                            }
+                        }
+                        catch (fetchErr) {
+                            spawnError = fetchErr.message;
+                        }
+                        if (!spawnOk) {
+                            // Session was created but spawn failed — log it to the session feed
+                            await withDbClient(dbUrl, async (client) => {
+                                await client.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
+                   VALUES (gen_random_uuid(), $1, 'dev_lead', $2, 'console', now())`, [sessionId, `⚠️ Session created but spawn_dev_lead failed: ${spawnError}`]);
+                            }).catch(() => { });
+                            return { content: [{ type: "text", text: JSON.stringify({ ok: false, session_id: sessionId, session_url: sessionUrl, error: `spawn failed: ${spawnError}` }) }] };
+                        }
+                        return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: sessionId, session_url: sessionUrl, childSessionKey }) }] };
+                    }
+                    catch (err) {
+                        return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: err.message }) }], isError: true };
                     }
                 }
                 default:
@@ -1040,7 +1124,8 @@ async function startListenChain() {
                         return;
                     const isTaskBrief = messageType === "task_brief" && payload.role === "user";
                     const isApprovalResponse = messageType === "approval_response";
-                    if (!isTaskBrief && !isApprovalResponse)
+                    const isChatMessage = messageType === "chat";
+                    if (!isTaskBrief && !isApprovalResponse && !isChatMessage)
                         return;
                     // Skip interactive sessions — they use chat_session directly, not dev-lead
                     // Also only respawn on approval_response for active sessions.
@@ -1064,22 +1149,21 @@ async function startListenChain() {
                     catch (e) {
                         console.warn(`[listen-chain] session check error for ${sessionId}:`, e.message);
                     }
-                    console.log(`[listen-chain] ${messageType} for ${sessionId} — spawning dev-lead via gateway`);
-                    const resp = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+                    console.log(`[listen-chain] ${messageType} for ${sessionId} — spawning dev-lead via /tools/invoke`);
+                    const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
                         method: "POST",
                         headers: {
                             "Content-Type": "application/json",
                             "Authorization": `Bearer ${gatewayToken}`,
                         },
                         body: JSON.stringify({
-                            model: "openclaw:dev-lead",
-                            messages: [{ role: "user", content: `SESSION_ID: ${sessionId}` }],
-                            stream: false,
+                            tool: "sessions_spawn",
+                            args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}` },
                         }),
-                        signal: AbortSignal.timeout(15_000),
                     });
                     if (resp.ok) {
-                        console.log(`[listen-chain] dev-lead spawned for ${sessionId}`);
+                        const parsed = await resp.json().catch(() => ({}));
+                        console.log(`[listen-chain] dev-lead spawned for ${sessionId}, childSessionKey=${parsed?.childSessionKey ?? "n/a"}`);
                     }
                     else {
                         const text = await resp.text().catch(() => "");
@@ -1123,18 +1207,16 @@ async function startListenChain() {
                 console.log(`[listen-chain] backfill: ${res.rows.length} pending session(s) found`);
                 for (const row of res.rows) {
                     try {
-                        const resp = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+                        const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
                             method: "POST",
                             headers: {
                                 "Content-Type": "application/json",
                                 "Authorization": `Bearer ${gatewayToken}`,
                             },
                             body: JSON.stringify({
-                                model: "openclaw:dev-lead",
-                                messages: [{ role: "user", content: `SESSION_ID: ${row.session_id}` }],
-                                stream: false,
+                                tool: "sessions_spawn",
+                                args: { agentId: "dev-lead", task: `SESSION_ID: ${row.session_id}` },
                             }),
-                            signal: AbortSignal.timeout(15_000),
                         });
                         console.log(`[listen-chain] backfill ${row.session_id}: ${resp.ok ? "spawned" : `failed (${resp.status})`}`);
                     }
