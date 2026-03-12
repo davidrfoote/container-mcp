@@ -1224,7 +1224,95 @@ async function startListenChain(): Promise<void> {
           const isTaskBrief = messageType === "task_brief" && payload.role === "user";
           const isApprovalResponse = messageType === "approval_response";
           const isChatMessage = messageType === "chat";
-          if (!isTaskBrief && !isApprovalResponse && !isChatMessage) return;
+          const isApprovalRequest = messageType === "approval_request";
+          if (!isTaskBrief && !isApprovalResponse && !isChatMessage && !isApprovalRequest) return;
+
+          // Server-side auto-approve: for low/medium complexity approval_requests,
+          // schedule an auto-approval 10 minutes after the message's created_at timestamp.
+          if (isApprovalRequest) {
+            void (async () => {
+              try {
+                const approvalClient = new Client({ connectionString: dbUrl });
+                await approvalClient.connect();
+                const approvalRes = await approvalClient.query<{
+                  message_id: string;
+                  metadata: Record<string, unknown> | null;
+                  created_at: Date;
+                }>(
+                  `SELECT message_id, metadata, created_at FROM session_messages
+                   WHERE session_id = $1 AND message_type = 'approval_request'
+                   ORDER BY created_at DESC LIMIT 1`,
+                  [sessionId]
+                );
+                await approvalClient.end().catch(() => {});
+
+                if (approvalRes.rows.length === 0) return;
+                const { message_id: approvalMsgId, metadata, created_at } = approvalRes.rows[0];
+                const complexity = (metadata?.complexity as string | undefined) ?? "medium";
+
+                if (complexity === "hard") {
+                  console.log(`[listen-chain] approval_request ${approvalMsgId} for ${sessionId} is hard — no server-side auto-approve`);
+                  return;
+                }
+
+                const deadline = new Date(created_at).getTime() + 600_000;
+                const remaining = Math.max(0, deadline - Date.now());
+                console.log(`[listen-chain] approval_request ${approvalMsgId} for ${sessionId} (${complexity}) — server auto-approve in ${Math.round(remaining / 1000)}s`);
+
+                setTimeout(async () => {
+                  try {
+                    const autoClient = new Client({ connectionString: dbUrl });
+                    await autoClient.connect();
+
+                    const existingRes = await autoClient.query(
+                      `SELECT 1 FROM session_messages
+                       WHERE session_id = $1
+                         AND message_type = 'approval_response'
+                         AND created_at > (
+                           SELECT created_at FROM session_messages WHERE message_id = $2
+                         )
+                       LIMIT 1`,
+                      [sessionId, approvalMsgId]
+                    );
+
+                    if (existingRes.rows.length > 0) {
+                      console.log(`[listen-chain] server auto-approve skipped for ${sessionId} — already approved`);
+                      await autoClient.end().catch(() => {});
+                      return;
+                    }
+
+                    const autoMsgId = `msg-${randomUUID()}`;
+                    const nowIso = new Date().toISOString();
+                    await autoClient.query(
+                      `INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
+                       VALUES ($1, $2, 'system', 'auto-approved', 'approval_response', NOW())`,
+                      [autoMsgId, sessionId]
+                    );
+
+                    const notifyPayload = JSON.stringify({
+                      id: autoMsgId,
+                      message_id: autoMsgId,
+                      session_id: sessionId,
+                      role: "system",
+                      message_type: "approval_response",
+                      content: "auto-approved",
+                      created_at: nowIso,
+                    });
+                    const safeId = sessionId.replace(/-/g, "_");
+                    await autoClient.query(`SELECT pg_notify($1, $2)`, [`session_messages_${safeId}`, notifyPayload]);
+                    await autoClient.query(`SELECT pg_notify($1, $2)`, [`session:${sessionId}`, notifyPayload]);
+                    await autoClient.end().catch(() => {});
+                    console.log(`[listen-chain] server auto-approved session ${sessionId} (msg ${autoMsgId})`);
+                  } catch (err: any) {
+                    console.error("[listen-chain] server auto-approve error:", err.message);
+                  }
+                }, remaining);
+              } catch (err: any) {
+                console.error("[listen-chain] approval_request handling error:", err.message);
+              }
+            })();
+            return; // Don't spawn dev-lead for approval_request
+          }
 
           // Skip interactive sessions — they use chat_session directly, not dev-lead
           // Also only respawn on approval_response for active sessions.
