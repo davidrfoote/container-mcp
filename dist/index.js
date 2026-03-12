@@ -572,6 +572,16 @@ function createMcpServer() {
                                         if (parsed.type === "result") {
                                             output = parsed.result || parsed.output || JSON.stringify(parsed);
                                             postToFeed(session_id, dbUrl, `✅ Task complete\n\n${output.slice(0, 2000)}`);
+                                            const usage = parsed.usage;
+                                            if (usage && (usage.input_tokens || usage.output_tokens) && session_id && dbUrl) {
+                                                const inputTokens = usage.input_tokens || 0;
+                                                const outputTokens = usage.output_tokens || 0;
+                                                const totalTokens = inputTokens + outputTokens;
+                                                const costUsd = (inputTokens / 1_000_000 * 3) + (outputTokens / 1_000_000 * 15);
+                                                void withDbClient(dbUrl, async (client) => {
+                                                    await client.query(`UPDATE sessions SET token_usage = COALESCE(token_usage, 0) + $1, cost_usd = COALESCE(cost_usd, 0) + $2 WHERE session_id = $3`, [totalTokens, costUsd, session_id]);
+                                                }).catch((err) => console.error('[token-usage] Failed to update token usage:', err));
+                                            }
                                         }
                                         else if (parsed.type === "assistant") {
                                             const content = parsed.message?.content || [];
@@ -966,6 +976,7 @@ function createMcpServer() {
                         let fullAssistantText = "";
                         let resultClaudeSessionId = null;
                         let tokensUsed = 0;
+                        let costUsd = 0;
                         // Timeout: 10 minutes for interactive chat
                         const timer = setTimeout(() => {
                             proc.kill("SIGTERM");
@@ -1026,7 +1037,10 @@ function createMcpServer() {
                                         // Extract the claude session_id from the result event
                                         resultClaudeSessionId = parsed.session_id || null;
                                         if (parsed.usage) {
-                                            tokensUsed = (parsed.usage.input_tokens || 0) + (parsed.usage.output_tokens || 0);
+                                            const inputTokens = parsed.usage.input_tokens || 0;
+                                            const outputTokens = parsed.usage.output_tokens || 0;
+                                            tokensUsed = inputTokens + outputTokens;
+                                            costUsd = (inputTokens / 1_000_000 * 3) + (outputTokens / 1_000_000 * 15);
                                         }
                                         const resultText = (parsed.result || parsed.output || "");
                                         if (resultText && chatSessionId && dbUrl) {
@@ -1093,6 +1107,11 @@ function createMcpServer() {
                                         });
                                     }
                                 })();
+                            }
+                            if (tokensUsed > 0 && chatSessionId && dbUrl) {
+                                void withDbClient(dbUrl, async (client) => {
+                                    await client.query(`UPDATE sessions SET token_usage = COALESCE(token_usage, 0) + $1, cost_usd = COALESCE(cost_usd, 0) + $2 WHERE session_id = $3`, [tokensUsed, costUsd, chatSessionId]);
+                                }).catch((err) => console.error('[token-usage] Failed to update token usage:', err));
                             }
                             resolve({
                                 claude_session_id: resultClaudeSessionId,
