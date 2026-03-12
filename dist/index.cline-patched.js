@@ -257,20 +257,6 @@ function createMcpServer() {
                     required: ["session_id"],
                 },
             },
-            {
-                name: "chat_session",
-                description: "Run a direct interactive chat message via Claude Code CLI (claude --print), streaming output to ops-db and returning the claude session ID for context continuity",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        message: { type: "string", description: "User message to send to Claude" },
-                        session_id: { type: "string", description: "ops-db session ID (for logging to session feed)" },
-                        claude_session_id: { type: "string", description: "Existing Claude session ID to resume (omit or null for new session)" },
-                        working_dir: { type: "string", description: "Working directory (defaults to /home/david/dev-session-app)" },
-                    },
-                    required: ["message"],
-                },
-            },
         ],
     }));
     server.setRequestHandler(types_js_1.CallToolRequestSchema, async (req) => {
@@ -367,7 +353,7 @@ function createMcpServer() {
                         const clinerules = path.join(working_dir, ".clinerules");
                         fs.writeFileSync(clinerules, rules);
                         const result = await new Promise((resolve) => {
-                            const proc = (0, child_process_1.spawn)("/home/david/.npm-local/bin/cline", ["-y", "--json", "--timeout", String(timeout_seconds), instruction], {
+                            const proc = (0, child_process_1.spawn)("/home/openclaw/.npm-global/bin/cline", ["-y", "--json", "--timeout", String(timeout_seconds), instruction], {
                                 cwd: working_dir,
                                 env: {
                                     ...process.env,
@@ -567,145 +553,6 @@ function createMcpServer() {
                     const output = (r.stdout || "") + (r.stderr || "");
                     return { content: [{ type: "text", text: JSON.stringify({ success: r.status === 0, output, exit_code: r.status ?? -1 }) }] };
                 }
-                case "chat_session": {
-                    const { message, session_id: chatSessionId, claude_session_id: existingClaudeSessionId, working_dir: chatWorkingDir = "/home/david/dev-session-app", } = args;
-                    const dbUrl = process.env.OPS_DB_URL ?? "";
-                    // Post user message echo to feed
-                    if (chatSessionId) {
-                        postToFeed(chatSessionId, dbUrl, `💬 **User:** ${message.slice(0, 500)}`);
-                    }
-                    const claudeArgs = [
-                        "-p", message,
-                        "--output-format", "stream-json",
-                        "--dangerously-skip-permissions",
-                    ];
-                    if (existingClaudeSessionId) {
-                        claudeArgs.push("--resume", existingClaudeSessionId);
-                    }
-                    else {
-                        claudeArgs.push("--working-dir", chatWorkingDir);
-                    }
-                    const chatResult = await new Promise((resolve) => {
-                        const proc = (0, child_process_1.spawn)("claude", claudeArgs, {
-                            cwd: chatWorkingDir,
-                            env: process.env,
-                            stdio: ["ignore", "pipe", "pipe"],
-                        });
-                        let fullAssistantText = "";
-                        let resultClaudeSessionId = null;
-                        let tokensUsed = 0;
-                        // Timeout: 10 minutes for interactive chat
-                        const timer = setTimeout(() => {
-                            proc.kill("SIGTERM");
-                        }, 600_000);
-                        proc.stdout.on("data", (chunk) => {
-                            const lines = chunk.toString().split("\n");
-                            for (const line of lines) {
-                                if (!line.trim())
-                                    continue;
-                                try {
-                                    const parsed = JSON.parse(line);
-                                    if (parsed.type === "assistant") {
-                                        const content = parsed.message?.content || [];
-                                        for (const block of content) {
-                                            if (block.type === "text" && block.text?.trim()) {
-                                                const text = block.text.trim();
-                                                fullAssistantText += text + "\n";
-                                                // Post each assistant text block as execution_log
-                                                if (chatSessionId && text.length > 0) {
-                                                    void (async () => {
-                                                        if (!chatSessionId || !dbUrl)
-                                                            return;
-                                                        const key = `${chatSessionId}::${dbUrl}`;
-                                                        if (!_feedClients.has(key)) {
-                                                            const client = new pg_1.Client({ connectionString: dbUrl });
-                                                            await client.connect();
-                                                            _feedClients.set(key, { client, queue: Promise.resolve() });
-                                                        }
-                                                        const entry = _feedClients.get(key);
-                                                        entry.queue = entry.queue.then(async () => {
-                                                            try {
-                                                                await entry.client.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)", [chatSessionId, "coding_agent", text, "execution_log"]);
-                                                            }
-                                                            catch (e) {
-                                                                console.error("chat_session postToFeed error:", e.message);
-                                                            }
-                                                        });
-                                                    })();
-                                                }
-                                            }
-                                            else if (block.type === "tool_use" && chatSessionId && dbUrl) {
-                                                postToFeed(chatSessionId, dbUrl, `🔧 \`${block.name}\` ${JSON.stringify(block.input || {}).slice(0, 200)}`);
-                                            }
-                                        }
-                                    }
-                                    else if (parsed.type === "result") {
-                                        // Extract the claude session_id from the result event
-                                        resultClaudeSessionId = parsed.session_id || null;
-                                        tokensUsed = parsed.usage?.output_tokens || parsed.total_cost_usd ? 0 : 0;
-                                        if (parsed.usage) {
-                                            tokensUsed = (parsed.usage.input_tokens || 0) + (parsed.usage.output_tokens || 0);
-                                        }
-                                        const resultText = parsed.result || parsed.output || "";
-                                        if (resultText && chatSessionId) {
-                                            postToFeed(chatSessionId, dbUrl, `✅ Done`);
-                                        }
-                                    }
-                                }
-                                catch {
-                                    // ignore malformed JSON lines
-                                }
-                            }
-                        });
-                        proc.stderr.on("data", (chunk) => {
-                            console.error("[chat_session] stderr:", chunk.toString().slice(0, 200));
-                        });
-                        proc.on("close", (code) => {
-                            clearTimeout(timer);
-                            // Post final response as a chat message (not execution_log) so it shows as a bubble
-                            if (chatSessionId && fullAssistantText.trim()) {
-                                void (async () => {
-                                    if (!chatSessionId || !dbUrl)
-                                        return;
-                                    const key = `${chatSessionId}::${dbUrl}`;
-                                    if (!_feedClients.has(key)) {
-                                        const client = new pg_1.Client({ connectionString: dbUrl });
-                                        await client.connect();
-                                        _feedClients.set(key, { client, queue: Promise.resolve() });
-                                    }
-                                    const entry = _feedClients.get(key);
-                                    entry.queue = entry.queue.then(async () => {
-                                        try {
-                                            await entry.client.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)", [chatSessionId, "coding_agent", fullAssistantText.trim(), "chat"]);
-                                        }
-                                        catch (e) {
-                                            console.error("chat_session final chat error:", e.message);
-                                        }
-                                    });
-                                    // Update claude_session_id in sessions table
-                                    if (resultClaudeSessionId) {
-                                        entry.queue = entry.queue.then(async () => {
-                                            try {
-                                                await entry.client.query("UPDATE sessions SET claude_session_id = $1, updated_at = now() WHERE session_id = $2", [resultClaudeSessionId, chatSessionId]);
-                                            }
-                                            catch (e) {
-                                                console.error("chat_session update claude_session_id error:", e.message);
-                                            }
-                                        });
-                                    }
-                                })();
-                            }
-                            resolve({
-                                claude_session_id: resultClaudeSessionId,
-                                response: fullAssistantText.trim(),
-                                tokens_used: tokensUsed,
-                            });
-                        });
-                    });
-                    return {
-                        content: [{ type: "text", text: JSON.stringify(chatResult) }],
-                    };
-                }
                 case "spawn_dev_lead": {
                     // POST to gateway /v1/chat/completions to spawn dev-lead (OpenClaw 3.8+)
                     const { session_id: sessionId } = args;
@@ -798,20 +645,6 @@ async function startListenChain() {
                     const sessionId = payload.session_id;
                     if (!sessionId)
                         return;
-                    // Skip interactive sessions — they use chat_session directly, not dev-lead
-                    try {
-                        const checkClient = new pg_1.Client({ connectionString: dbUrl });
-                        await checkClient.connect();
-                        const checkRes = await checkClient.query("SELECT session_type FROM sessions WHERE session_id = $1", [sessionId]);
-                        await checkClient.end().catch(() => { });
-                        if (checkRes.rows.length > 0 && checkRes.rows[0].session_type === "interactive") {
-                            console.log(`[listen-chain] skip dev-lead for interactive session ${sessionId}`);
-                            return;
-                        }
-                    }
-                    catch (e) {
-                        console.warn(`[listen-chain] session_type check error for ${sessionId}:`, e.message);
-                    }
                     console.log(`[listen-chain] task_brief for ${sessionId} — spawning dev-lead via gateway`);
                     const resp = await fetch(`${gatewayUrl}/v1/chat/completions`, {
                         method: "POST",
