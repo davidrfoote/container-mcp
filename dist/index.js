@@ -47,6 +47,7 @@ const index_js_1 = require("@modelcontextprotocol/sdk/server/index.js");
 const sse_js_1 = require("@modelcontextprotocol/sdk/server/sse.js");
 const types_js_1 = require("@modelcontextprotocol/sdk/types.js");
 const pg_1 = require("pg");
+const deploy_project_js_1 = require("./tools/deploy-project.js");
 async function withDbClient(connectionString, fn) {
     if (!connectionString) {
         throw new Error("OPS_DB_URL not set");
@@ -516,6 +517,24 @@ function createMcpServer() {
                         working_dir: { type: "string", description: "Working directory (defaults to /home/david/dev-session-app)" },
                     },
                     required: ["message"],
+                },
+            },
+            {
+                name: "deploy_project",
+                description: "Deploy a project by ID. Reads build_cmd/deploy_cmd/smoke_url from projects table. Auto-detects deploy type for new projects. Runs build, deploy, smoke test with 12 retries. Posts result to session feed.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        project_id: {
+                            type: "string",
+                            description: "Project ID (matches projects table project_id)",
+                        },
+                        session_id: {
+                            type: "string",
+                            description: "Optional session ID to post progress messages to",
+                        },
+                    },
+                    required: ["project_id"],
                 },
             },
         ],
@@ -1271,6 +1290,11 @@ function createMcpServer() {
                         }
                     }
                     return { content: [{ type: "text", text: JSON.stringify({ ok: true, results }) }] };
+                }
+                case "deploy_project": {
+                    const { project_id, session_id: deploySessionId } = args;
+                    const result = await (0, deploy_project_js_1.deployProject)(project_id, deploySessionId);
+                    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
                 }
                 default:
                     throw new Error(`Unknown tool: ${name}`);
