@@ -41,6 +41,8 @@ const crypto_1 = require("crypto");
 const child_process_1 = require("child_process");
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
+const https = __importStar(require("https"));
+const http = __importStar(require("http"));
 const index_js_1 = require("@modelcontextprotocol/sdk/server/index.js");
 const sse_js_1 = require("@modelcontextprotocol/sdk/server/sse.js");
 const types_js_1 = require("@modelcontextprotocol/sdk/types.js");
@@ -99,6 +101,95 @@ async function notifySessionMessage(client, sessionId, payload) {
     const safeId = sessionId.replace(/-/g, "_");
     const text = JSON.stringify(payload);
     await client.query("SELECT pg_notify($1, $2)", [`session_messages_${safeId}`, text]);
+}
+// ─── Jira/Confluence fetch helpers ─────────────────────────────────────────
+function httpGet(url, headers) {
+    return new Promise((resolve, reject) => {
+        const parsed = new URL(url);
+        const lib = parsed.protocol === "https:" ? https : http;
+        const req = lib.get(url, { headers }, (res) => {
+            let data = "";
+            res.on("data", (chunk) => { data += chunk; });
+            res.on("end", () => {
+                if (res.statusCode && res.statusCode >= 400) {
+                    reject(new Error(`HTTP ${res.statusCode}: ${data.slice(0, 200)}`));
+                }
+                else {
+                    resolve(data);
+                }
+            });
+        });
+        req.on("error", reject);
+        req.setTimeout(15000, () => { req.destroy(new Error("Request timed out")); });
+    });
+}
+function jiraAuthHeaders() {
+    const user = process.env.JIRA_USERNAME ?? "";
+    const token = process.env.JIRA_API_TOKEN ?? "";
+    const encoded = Buffer.from(`${user}:${token}`).toString("base64");
+    return { Authorization: `Basic ${encoded}`, Accept: "application/json" };
+}
+async function fetchJiraIssue(issueKey) {
+    const baseUrl = (process.env.JIRA_URL ?? "").replace(/\/$/, "");
+    const url = `${baseUrl}/rest/api/2/issue/${encodeURIComponent(issueKey)}`;
+    const body = await httpGet(url, jiraAuthHeaders());
+    const data = JSON.parse(body);
+    return {
+        updated: data.fields?.updated ?? "",
+        description: data.fields?.description ?? "",
+        summary: data.fields?.summary ?? "",
+    };
+}
+async function fetchConfluencePage(pageId) {
+    const baseUrl = (process.env.JIRA_URL ?? "").replace(/\/$/, "");
+    const url = `${baseUrl}/wiki/rest/api/content/${encodeURIComponent(pageId)}?expand=body.storage,version`;
+    const body = await httpGet(url, jiraAuthHeaders());
+    const data = JSON.parse(body);
+    return {
+        versionNumber: data.version?.number ?? 0,
+        versionWhen: data.version?.when ?? "",
+        bodyHtml: data.body?.storage?.value ?? "",
+    };
+}
+function stripHtml(html) {
+    return html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+}
+async function writeCacheEntry(dbUrl, cacheKey, sourceType, contentHash, sourceUpdated, summary) {
+    await withDbClient(dbUrl, async (client) => {
+        const existing = await client.query(`SELECT content_hash FROM project_context_cache WHERE cache_key = $1`, [cacheKey]);
+        if (existing.rows.length > 0 && existing.rows[0].content_hash === contentHash) {
+            return;
+        }
+        await client.query(`INSERT INTO project_context_cache
+         (cache_key, source_type, content_hash, source_updated, summary, cached_at, last_checked)
+       VALUES ($1, $2, $3, $4, $5, now(), now())
+       ON CONFLICT (cache_key) DO UPDATE SET
+         source_type = EXCLUDED.source_type,
+         content_hash = EXCLUDED.content_hash,
+         source_updated = EXCLUDED.source_updated,
+         summary = EXCLUDED.summary,
+         cached_at = now(),
+         last_checked = now()`, [cacheKey, sourceType, contentHash, sourceUpdated || null, summary]);
+    });
+}
+async function populateCacheForProject(dbUrl, jiraKeys, confluenceRootId) {
+    const tasks = [];
+    for (const key of jiraKeys) {
+        tasks.push((async () => {
+            const issue = await fetchJiraIssue(key);
+            const raw = issue.description || issue.summary || "";
+            const summary = raw.slice(0, 2000);
+            await writeCacheEntry(dbUrl, `jira:${key}`, "jira", issue.updated, null, summary);
+        })());
+    }
+    if (confluenceRootId) {
+        tasks.push((async () => {
+            const page = await fetchConfluencePage(confluenceRootId);
+            const summary = stripHtml(page.bodyHtml).slice(0, 2000);
+            await writeCacheEntry(dbUrl, `confluence:${confluenceRootId}`, "confluence", String(page.versionNumber), page.versionWhen || null, summary);
+        })());
+    }
+    await Promise.all(tasks);
 }
 const app = (0, express_1.default)();
 app.use(express_1.default.json());
@@ -396,6 +487,21 @@ function createMcpServer() {
                         jira_keys: { type: "string", description: "Comma-separated Jira issue keys (optional, e.g. ZI-18820)" },
                     },
                     required: ["title", "repo", "task_brief"],
+                },
+            },
+            {
+                name: "warm_cache_for_repos",
+                description: "Pre-populate project_context_cache for one or more repos by fetching their Jira issues and Confluence root page from the projects table",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        repos: {
+                            type: "array",
+                            items: { type: "string" },
+                            description: "List of project_id values from the projects table (e.g. ['dev-session-app', 'container-mcp', 'ash-dashboard']). Defaults to all three if omitted.",
+                        },
+                    },
+                    required: [],
                 },
             },
             {
@@ -1055,7 +1161,23 @@ function createMcpServer() {
                             await client.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
                  VALUES ($1, $2, 'user', $3, 'task_brief', now())`, [msgId, sessionId, task_brief]);
                         });
-                        // Step 3: Spawn dev-lead via gateway /tools/invoke (async — returns immediately)
+                        // Step 3: Pre-populate project_context_cache (non-blocking, don't fail session on error)
+                        try {
+                            const parsedJiraKeys = jira_keys
+                                ? jira_keys.split(",").map((k) => k.trim()).filter(Boolean)
+                                : [];
+                            const projRow = await withDbClient(dbUrl, async (client) => {
+                                const r = await client.query(`SELECT confluence_root_id FROM projects WHERE project_id = $1`, [repo]);
+                                return r.rows[0] ?? null;
+                            });
+                            const confluenceRootId = projRow?.confluence_root_id ?? null;
+                            await populateCacheForProject(dbUrl, parsedJiraKeys, confluenceRootId);
+                            console.log(`[create_session] cache warmed: jira=${parsedJiraKeys.join(",") || "none"} confluence=${confluenceRootId ?? "none"}`);
+                        }
+                        catch (cacheErr) {
+                            console.warn(`[create_session] cache warm failed (non-fatal): ${cacheErr.message}`);
+                        }
+                        // Step 4: Spawn dev-lead via gateway /tools/invoke (async — returns immediately)
                         const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
                         const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
                         let spawnOk = false;
@@ -1099,6 +1221,37 @@ function createMcpServer() {
                     catch (err) {
                         return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: err.message }) }], isError: true };
                     }
+                }
+                case "warm_cache_for_repos": {
+                    const { repos: targetRepos } = args;
+                    const repoList = Array.isArray(targetRepos) && targetRepos.length > 0
+                        ? targetRepos
+                        : ["dev-session-app", "container-mcp", "ash-dashboard"];
+                    const dbUrl = process.env.OPS_DB_URL;
+                    if (!dbUrl) {
+                        return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "OPS_DB_URL not set" }) }] };
+                    }
+                    const results = {};
+                    for (const repoId of repoList) {
+                        try {
+                            const projRow = await withDbClient(dbUrl, async (client) => {
+                                const r = await client.query(`SELECT confluence_root_id, jira_issue_keys FROM projects WHERE project_id = $1`, [repoId]);
+                                return r.rows[0] ?? null;
+                            });
+                            if (!projRow) {
+                                results[repoId] = "not found in projects table";
+                                continue;
+                            }
+                            const jiraKeys = projRow.jira_issue_keys ?? [];
+                            const confluenceRootId = projRow.confluence_root_id ?? null;
+                            await populateCacheForProject(dbUrl, jiraKeys, confluenceRootId);
+                            results[repoId] = `ok (jira: ${jiraKeys.join(",") || "none"}, confluence: ${confluenceRootId ?? "none"})`;
+                        }
+                        catch (e) {
+                            results[repoId] = `error: ${e.message}`;
+                        }
+                    }
+                    return { content: [{ type: "text", text: JSON.stringify({ ok: true, results }) }] };
                 }
                 default:
                     throw new Error(`Unknown tool: ${name}`);
