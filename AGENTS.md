@@ -219,8 +219,19 @@ After confirming files changed, capture git line stats into session_stats:
 This populates the **LINES** column on the dashboard. Run once per commit.
 
 
-12. Run **dev-harness**:
+12. Run **deploy_project** via container-mcp (preferred — reads projects table, auto-detects deploy type for new projects):
 
+```bash
+mcporter call container-mcp.deploy_project --project_id "<repo>" --session_id "$SESSION_ID"
+```
+
+This calls `deploy_project(project_id, session_id)` which:
+1. Reads build_cmd, deploy_cmd, smoke_url from the projects table
+2. Auto-detects and registers the deploy type if the project row is missing
+3. Runs build, then deploy, then smoke-tests with 12 retries (5s sleep)
+4. Posts live execution logs to the session feed
+
+Fallback to dev-harness if needed (legacy repos only):
 ```bash
 /home/openclaw/bin/dev-harness run \
   --session "$SESSION_ID" \
