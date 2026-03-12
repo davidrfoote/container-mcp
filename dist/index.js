@@ -45,6 +45,7 @@ const index_js_1 = require("@modelcontextprotocol/sdk/server/index.js");
 const sse_js_1 = require("@modelcontextprotocol/sdk/server/sse.js");
 const types_js_1 = require("@modelcontextprotocol/sdk/types.js");
 const pg_1 = require("pg");
+const ioredis_1 = __importDefault(require("ioredis"));
 const app = (0, express_1.default)();
 app.use(express_1.default.json());
 // Task log storage
@@ -554,10 +555,61 @@ function createMcpServer() {
                     return { content: [{ type: "text", text: JSON.stringify({ success: r.status === 0, output, exit_code: r.status ?? -1 }) }] };
                 }
                 case "spawn_dev_lead": {
-                    // ZI-18776: POST to gateway /tools/invoke (sessions_spawn) to spawn dev-lead
+                    // ZI-18796: Query ops-db for full session context + task_brief before
+                    // spawning so dev-lead always wakes up with complete restore context.
                     const { session_id: sessionId } = args;
                     const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
                     const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
+                    const dbUrl = process.env.OPS_DB_URL ?? "";
+                    // 1. Query session + project context from ops-db
+                    let taskString = `SESSION_ID: ${sessionId}`;
+                    if (dbUrl) {
+                        const db = new pg_1.Client({ connectionString: dbUrl });
+                        try {
+                            await db.connect();
+                            // Session + project metadata
+                            const sessRes = await db.query(`
+                SELECT s.session_id, s.title, s.project_id, s.repo, s.container,
+                       p.build_cmd, p.deploy_cmd, p.smoke_url, p.docs_url
+                FROM sessions s
+                LEFT JOIN projects p ON s.project_id = p.project_id
+                WHERE s.session_id = $1
+              `, [sessionId]);
+                            // Task brief (first one, if any)
+                            const briefRes = await db.query(`
+                SELECT content FROM session_messages
+                WHERE session_id = $1 AND message_type = 'task_brief'
+                ORDER BY created_at ASC LIMIT 1
+              `, [sessionId]);
+                            await db.end();
+                            const sess = sessRes.rows[0];
+                            const brief = briefRes.rows[0]?.content ?? "";
+                            if (sess) {
+                                const parts = [
+                                    `SESSION_ID: ${sessionId}`,
+                                    `REPO: ${sess.repo ?? ""}`,
+                                    `CONTAINER: ${sess.container ?? ""}`,
+                                    `BUILD_CMD: ${sess.build_cmd ?? ""}`,
+                                    `DEPLOY_CMD: ${sess.deploy_cmd ?? ""}`,
+                                    `SMOKE_URL: ${sess.smoke_url ?? ""}`,
+                                    `DOCS_URL: ${sess.docs_url ?? ""}`,
+                                    ``,
+                                    brief
+                                        ? `TASK BRIEF:\n${brief}`
+                                        : `No task brief found. Ask the user what they would like to work on.`,
+                                    ``,
+                                    `RESTORE INSTRUCTIONS: You are the dev-lead agent resuming session ${sessionId}.`,
+                                    `Read your SKILL.md then post an approval_request before executing any changes.`,
+                                ];
+                                taskString = parts.join("\n");
+                            }
+                        }
+                        catch (dbErr) {
+                            console.error("[spawn_dev_lead] DB query failed:", dbErr.message);
+                            // Fall through with bare SESSION_ID string — dev-lead will still launch
+                        }
+                    }
+                    // 2. POST to gateway sessions_spawn with full task string
                     const controller = new AbortController();
                     const timeout = setTimeout(() => controller.abort(), 15_000);
                     try {
@@ -569,7 +621,7 @@ function createMcpServer() {
                             },
                             body: JSON.stringify({
                                 tool: "sessions_spawn",
-                                args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}` },
+                                args: { agentId: "dev-lead", task: taskString },
                             }),
                             signal: controller.signal,
                         });
@@ -731,3 +783,64 @@ app.listen(PORT, () => {
     console.log(`  Health: http://localhost:${PORT}/health`);
 });
 void startListenChain();
+void startRedisSubscriber();
+// ─── Redis Subscriber (ZI-18783) ───────────────────────────────────────────
+// Subscribes to dev:session:spawn channel and calls spawn_dev_lead for each
+// session_id received. This handles sessions created via the new-task route
+// which publishes to Redis but does NOT insert a task_brief message.
+async function startRedisSubscriber() {
+    const redisHost = process.env.REDIS_HOST ?? "redis-relay-devenv";
+    const redisPort = parseInt(process.env.REDIS_PORT ?? "6379", 10);
+    const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
+    const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
+    const subscribe = () => {
+        const sub = new ioredis_1.default({ host: redisHost, port: redisPort, lazyConnect: false });
+        sub.on("error", (err) => {
+            console.error("[redis-sub] error:", err.message);
+            // Reconnect after 10s
+            setTimeout(() => { sub.disconnect(); subscribe(); }, 10_000);
+        });
+        sub.on("connect", () => {
+            console.log(`[redis-sub] connected to ${redisHost}:${redisPort}, subscribing to dev:session:spawn`);
+        });
+        sub.subscribe("dev:session:spawn").then(() => {
+            console.log("[redis-sub] listening on dev:session:spawn");
+        }).catch((err) => {
+            console.error("[redis-sub] subscribe error:", err.message);
+            setTimeout(() => { sub.disconnect(); subscribe(); }, 10_000);
+        });
+        sub.on("message", (_channel, message) => {
+            void (async () => {
+                try {
+                    const payload = JSON.parse(message);
+                    const sessionId = payload.session_id;
+                    if (!sessionId) {
+                        console.warn("[redis-sub] received message without session_id:", message.slice(0, 200));
+                        return;
+                    }
+                    console.log(`[redis-sub] dev:session:spawn for ${sessionId} — spawning dev-lead via gateway`);
+                    const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json",
+                            "Authorization": `Bearer ${gatewayToken}`,
+                        },
+                        body: JSON.stringify({ tool: "sessions_spawn", args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}` } }),
+                        signal: AbortSignal.timeout(15_000),
+                    });
+                    if (resp.ok) {
+                        console.log(`[redis-sub] dev-lead spawned for ${sessionId}`);
+                    }
+                    else {
+                        const text = await resp.text().catch(() => "");
+                        console.warn(`[redis-sub] gateway spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
+                    }
+                }
+                catch (err) {
+                    console.error("[redis-sub] message handler error:", err.message);
+                }
+            })();
+        });
+    };
+    subscribe();
+}
