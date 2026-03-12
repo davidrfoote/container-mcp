@@ -51,7 +51,7 @@ app.use(express_1.default.json());
 const taskLogs = new Map();
 // ─── postToFeed helper ─────────────────────────────────────────────────────
 const _feedClients = new Map();
-async function postToFeed(sessionId, dbUrl, content) {
+async function postToFeed(sessionId, dbUrl, content, role = "dev_lead", messageType = "execution_update") {
     if (!sessionId || !dbUrl)
         return;
     const key = `${sessionId}::${dbUrl}`;
@@ -63,7 +63,7 @@ async function postToFeed(sessionId, dbUrl, content) {
     const entry = _feedClients.get(key);
     entry.queue = entry.queue.then(async () => {
         try {
-            await entry.client.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)", [sessionId, "dev_lead", content, "execution_update"]);
+            await entry.client.query("INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)", [sessionId, role, content, messageType]);
         }
         catch (e) {
             console.error("postToFeed error:", e.message);
@@ -570,21 +570,20 @@ function createMcpServer() {
                 case "chat_session": {
                     const { message, session_id: chatSessionId, claude_session_id: existingClaudeSessionId, working_dir: chatWorkingDir = "/home/david/dev-session-app", } = args;
                     const dbUrl = process.env.OPS_DB_URL ?? "";
-                    // Post user message echo to feed
-                    if (chatSessionId) {
-                        postToFeed(chatSessionId, dbUrl, `💬 **User:** ${message.slice(0, 500)}`);
+                    // Note: user message is already saved by the dev-session-app chat route.
+                    // No need to echo it again here.
+                    if (chatSessionId && dbUrl && false) { // disabled - prevents duplicate user messages
                     }
                     const claudeArgs = [
                         "-p", message,
                         "--output-format", "stream-json",
+                        "--verbose",
                         "--dangerously-skip-permissions",
                     ];
                     if (existingClaudeSessionId) {
                         claudeArgs.push("--resume", existingClaudeSessionId);
                     }
-                    else {
-                        claudeArgs.push("--working-dir", chatWorkingDir);
-                    }
+                    // Note: working-dir is set via cwd in spawn options
                     const chatResult = await new Promise((resolve) => {
                         const proc = (0, child_process_1.spawn)("claude", claudeArgs, {
                             cwd: chatWorkingDir,
@@ -635,20 +634,19 @@ function createMcpServer() {
                                                 }
                                             }
                                             else if (block.type === "tool_use" && chatSessionId && dbUrl) {
-                                                postToFeed(chatSessionId, dbUrl, `🔧 \`${block.name}\` ${JSON.stringify(block.input || {}).slice(0, 200)}`);
+                                                postToFeed(chatSessionId, dbUrl, `🔧 \`${block.name}\` ${JSON.stringify(block.input || {}).slice(0, 200)}`, "coding_agent", "execution_log");
                                             }
                                         }
                                     }
                                     else if (parsed.type === "result") {
                                         // Extract the claude session_id from the result event
                                         resultClaudeSessionId = parsed.session_id || null;
-                                        tokensUsed = parsed.usage?.output_tokens || parsed.total_cost_usd ? 0 : 0;
                                         if (parsed.usage) {
                                             tokensUsed = (parsed.usage.input_tokens || 0) + (parsed.usage.output_tokens || 0);
                                         }
-                                        const resultText = parsed.result || parsed.output || "";
-                                        if (resultText && chatSessionId) {
-                                            postToFeed(chatSessionId, dbUrl, `✅ Done`);
+                                        const resultText = (parsed.result || parsed.output || "");
+                                        if (resultText && chatSessionId && dbUrl) {
+                                            postToFeed(chatSessionId, dbUrl, `✅ Done`, "coding_agent", "execution_log");
                                         }
                                     }
                                 }
