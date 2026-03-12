@@ -13,6 +13,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { Client } from "pg";
+import { deployProject } from './tools/deploy-project.js';
 
 async function withDbClient<T>(connectionString: string | undefined, fn: (client: Client) => Promise<T>): Promise<T> {
   if (!connectionString) {
@@ -541,6 +542,24 @@ function createMcpServer() {
             working_dir: { type: "string", description: "Working directory (defaults to /home/david/dev-session-app)" },
           },
           required: ["message"],
+        },
+      },
+      {
+        name: "deploy_project",
+        description: "Deploy a project by ID. Reads build_cmd/deploy_cmd/smoke_url from projects table. Auto-detects deploy type for new projects. Runs build, deploy, smoke test with 12 retries. Posts result to session feed.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            project_id: {
+              type: "string",
+              description: "Project ID (matches projects table project_id)",
+            },
+            session_id: {
+              type: "string",
+              description: "Optional session ID to post progress messages to",
+            },
+          },
+          required: ["project_id"],
         },
       },
     ],
@@ -1419,6 +1438,12 @@ function createMcpServer() {
             }
           }
           return { content: [{ type: "text", text: JSON.stringify({ ok: true, results }) }] };
+        }
+
+        case "deploy_project": {
+          const { project_id, session_id: deploySessionId } = args as { project_id: string; session_id?: string };
+          const result = await deployProject(project_id, deploySessionId);
+          return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
         }
 
         default:
