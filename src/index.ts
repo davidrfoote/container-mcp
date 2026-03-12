@@ -552,11 +552,67 @@ function createMcpServer() {
         }
 
         case "spawn_dev_lead": {
-          // ZI-18776: POST to gateway /tools/invoke (sessions_spawn) to spawn dev-lead
+          // ZI-18796: Query ops-db for full session context + task_brief before
+          // spawning so dev-lead always wakes up with complete restore context.
           const { session_id: sessionId } = args as any;
           const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
           const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
+          const dbUrl = process.env.OPS_DB_URL ?? "";
 
+          // 1. Query session + project context from ops-db
+          let taskString = `SESSION_ID: ${sessionId}`;
+          if (dbUrl) {
+            const db = new Client({ connectionString: dbUrl });
+            try {
+              await db.connect();
+
+              // Session + project metadata
+              const sessRes = await db.query(`
+                SELECT s.session_id, s.title, s.project_id, s.repo, s.container,
+                       p.build_cmd, p.deploy_cmd, p.smoke_url, p.docs_url
+                FROM sessions s
+                LEFT JOIN projects p ON s.project_id = p.project_id
+                WHERE s.session_id = $1
+              `, [sessionId]);
+
+              // Task brief (first one, if any)
+              const briefRes = await db.query(`
+                SELECT content FROM session_messages
+                WHERE session_id = $1 AND message_type = 'task_brief'
+                ORDER BY created_at ASC LIMIT 1
+              `, [sessionId]);
+
+              await db.end();
+
+              const sess = sessRes.rows[0];
+              const brief: string = briefRes.rows[0]?.content ?? "";
+
+              if (sess) {
+                const parts: string[] = [
+                  `SESSION_ID: ${sessionId}`,
+                  `REPO: ${sess.repo ?? ""}`,
+                  `CONTAINER: ${sess.container ?? ""}`,
+                  `BUILD_CMD: ${sess.build_cmd ?? ""}`,
+                  `DEPLOY_CMD: ${sess.deploy_cmd ?? ""}`,
+                  `SMOKE_URL: ${sess.smoke_url ?? ""}`,
+                  `DOCS_URL: ${sess.docs_url ?? ""}`,
+                  ``,
+                  brief
+                    ? `TASK BRIEF:\n${brief}`
+                    : `No task brief found. Ask the user what they would like to work on.`,
+                  ``,
+                  `RESTORE INSTRUCTIONS: You are the dev-lead agent resuming session ${sessionId}.`,
+                  `Read your SKILL.md then post an approval_request before executing any changes.`,
+                ];
+                taskString = parts.join("\n");
+              }
+            } catch (dbErr: any) {
+              console.error("[spawn_dev_lead] DB query failed:", dbErr.message);
+              // Fall through with bare SESSION_ID string — dev-lead will still launch
+            }
+          }
+
+          // 2. POST to gateway sessions_spawn with full task string
           const controller = new AbortController();
           const timeout = setTimeout(() => controller.abort(), 15_000);
 
@@ -569,7 +625,7 @@ function createMcpServer() {
               },
               body: JSON.stringify({
                 tool: "sessions_spawn",
-                args: { agentId: "dev-lead", task: `SESSION_ID: ${sessionId}` },
+                args: { agentId: "dev-lead", task: taskString },
               }),
               signal: controller.signal,
             });
