@@ -1418,9 +1418,8 @@ function createMcpServer() {
               const projRow = await withDbClient(dbUrl, async (client) => {
                 const r = await client.query<{
                   confluence_root_id: string | null;
-                  jira_issue_keys: string[] | null;
                 }>(
-                  `SELECT confluence_root_id, jira_issue_keys FROM projects WHERE project_id = $1`,
+                  `SELECT confluence_root_id FROM projects WHERE project_id = $1`,
                   [repoId]
                 );
                 return r.rows[0] ?? null;
@@ -1429,10 +1428,9 @@ function createMcpServer() {
                 results[repoId] = "not found in projects table";
                 continue;
               }
-              const jiraKeys = projRow.jira_issue_keys ?? [];
               const confluenceRootId = projRow.confluence_root_id ?? null;
-              await populateCacheForProject(dbUrl, jiraKeys, confluenceRootId);
-              results[repoId] = `ok (jira: ${jiraKeys.join(",") || "none"}, confluence: ${confluenceRootId ?? "none"})`;
+              await populateCacheForProject(dbUrl, [], confluenceRootId);
+              results[repoId] = `ok (confluence: ${confluenceRootId ?? "none"})`;
             } catch (e: any) {
               results[repoId] = `error: ${e.message}`;
             }
