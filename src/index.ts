@@ -527,14 +527,6 @@ export async function bootstrapSession(params: {
   }
   if (!projConfig) return { ok: false, error: `Project not found: ${projectId}` };
 
-  // Step 5: Warm cache (non-blocking on failure)
-  try {
-    await populateCacheForProject(dbUrl, projConfig.jira_issue_keys ?? [], projConfig.confluence_root_id ?? null);
-    console.log(`[bootstrapSession] cache warmed for ${projectId}`);
-  } catch (e: any) {
-    console.warn(`[bootstrapSession] cache warm failed (non-fatal): ${e.message}`);
-  }
-
   // Step 6: Search Jira for parent issue or create task issue
   const existingKeys = projConfig.jira_issue_keys ?? [];
   let jiraIssueKey: string | null = null;
@@ -584,6 +576,27 @@ export async function bootstrapSession(params: {
     });
   } catch (e: any) {
     return { ok: false, error: `Session creation failed: ${e.message}` };
+  }
+
+  // Step 5: Warm cache (non-fatal on failure)
+  try {
+    console.log(`[bootstrapSession] Starting cache warm for projectId=${projectId}, confluenceRootId=${projConfig.confluence_root_id}`);
+    await populateCacheForProject(dbUrl, projConfig.jira_issue_keys ?? [], projConfig.confluence_root_id ?? null);
+    console.log(`[bootstrapSession] cache warmed successfully for ${projectId}`);
+    await withDbClient(dbUrl, async (client) => {
+      await client.query(
+        'INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)',
+        [sessionId, 'dev_lead', '[CACHE-SUCCESS] Warmup complete for ' + projectId, 'console']
+      );
+    }).catch(() => {});
+  } catch (e: any) {
+    console.warn(`[bootstrapSession] cache warm failed (non-fatal): ${e.message}`);
+    await withDbClient(dbUrl, async (client) => {
+      await client.query(
+        'INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)',
+        [sessionId, 'dev_lead', '[CACHE-FAILED] ' + e.message, 'console']
+      );
+    }).catch(() => {});
   }
 
   // Spawn dev-lead (non-fatal on failure)
