@@ -565,7 +565,8 @@ function createMcpServer() {
                     if (driver === "claude") {
                         const rulesFile = `/tmp/container-mcp-rules-${taskId}.md`;
                         fs.writeFileSync(rulesFile, rules);
-                        const result = await new Promise((resolve) => {
+                        // Spawn ASYNC - return immediately
+                        (async () => {
                             const proc = (0, child_process_1.spawn)("claude", [
                                 "-p", instruction,
                                 "--output-format", "stream-json",
@@ -633,16 +634,28 @@ function createMcpServer() {
                                     fs.unlinkSync(rulesFile);
                                 }
                                 catch { }
-                                resolve({ success: code === 0, output, task_id: taskId, exit_code: code ?? -1 });
+                                postToFeed(session_id, dbUrl, `✅ Process ${taskId} exited with code ${code}`);
                             });
-                        });
-                        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+                        })(); // Fire and forget
+                        // Return IMMEDIATELY with task_id
+                        return {
+                            content: [{
+                                    type: "text",
+                                    text: JSON.stringify({
+                                        ok: true,
+                                        task_id: taskId,
+                                        status: "spawned",
+                                        message: `Process spawned. Poll get_task_log('${taskId}') for output.`
+                                    })
+                                }]
+                        };
                     }
                     else {
                         // cline driver
                         const clinerules = path.join(working_dir, ".clinerules");
                         fs.writeFileSync(clinerules, rules);
-                        const result = await new Promise((resolve) => {
+                        // Spawn ASYNC - return immediately
+                        (async () => {
                             const proc = (0, child_process_1.spawn)("/home/david/.npm-local/bin/cline", ["-y", "--json", "--timeout", String(timeout_seconds), instruction], {
                                 cwd: working_dir,
                                 env: {
@@ -686,10 +699,21 @@ function createMcpServer() {
                                     fs.unlinkSync(clinerules);
                                 }
                                 catch { }
-                                resolve({ success: code === 0, output: outputLines.join("\n"), task_id: taskId, exit_code: code ?? -1 });
+                                postToFeed(session_id, dbUrl, `✅ Process ${taskId} exited with code ${code}`);
                             });
-                        });
-                        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+                        })(); // Fire and forget
+                        // Return IMMEDIATELY with task_id
+                        return {
+                            content: [{
+                                    type: "text",
+                                    text: JSON.stringify({
+                                        ok: true,
+                                        task_id: taskId,
+                                        status: "spawned",
+                                        message: `Process spawned. Poll get_task_log('${taskId}') for output.`
+                                    })
+                                }]
+                        };
                     }
                 }
                 case "get_task_log": {

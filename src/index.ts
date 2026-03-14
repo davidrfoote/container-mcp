@@ -604,133 +604,151 @@ function createMcpServer() {
             const rulesFile = `/tmp/container-mcp-rules-${taskId}.md`;
             fs.writeFileSync(rulesFile, rules);
 
-            const result = await new Promise<{ success: boolean; output: string; task_id: string; exit_code: number }>(
-              (resolve) => {
-                const proc = spawn(
-                  "claude",
-                  [
-                    "-p", instruction,
-                    "--output-format", "stream-json",
-                    "--verbose",
-                    "--include-partial-messages",
-                    "--append-system-prompt-file", rulesFile,
-                    "--permission-mode", "acceptEdits",
-                    "--max-turns", String(max_turns),
-                    "--max-budget-usd", String(budget_usd),
-                    "--session-id", taskId,
-                    "--dangerously-skip-permissions",
-                  ],
-                  { cwd: working_dir, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] as const }
-                );
+            // Spawn ASYNC - return immediately
+            (async () => {
+              const proc = spawn("claude", [
+                "-p", instruction,
+                "--output-format", "stream-json",
+                "--verbose",
+                "--include-partial-messages",
+                "--append-system-prompt-file", rulesFile,
+                "--permission-mode", "acceptEdits",
+                "--max-turns", String(max_turns),
+                "--max-budget-usd", String(budget_usd),
+                "--session-id", taskId,
+                "--dangerously-skip-permissions",
+              ], { cwd: working_dir, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] as const });
 
-                let output = "";
-                const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeout_seconds * 1000);
+              let output = "";
+              const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeout_seconds * 1000);
 
-                proc.stdout.on("data", (chunk: Buffer) => {
-                  const lines = chunk.toString().split("\n");
-                  for (const line of lines) {
-                    if (!line.trim()) continue;
-                    log(line);
-                    try {
-                      const parsed = JSON.parse(line);
-                      if (parsed.type === "result") {
-                        output = parsed.result || parsed.output || JSON.stringify(parsed);
-                        postToFeed(session_id, dbUrl, `✅ Task complete\n\n${output.slice(0, 2000)}`);
-                        const usage = parsed.usage as { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } | undefined;
-                        if (usage && (usage.input_tokens || usage.output_tokens) && session_id && dbUrl) {
-                          const inputTokens = usage.input_tokens || 0;
-                          const outputTokens = usage.output_tokens || 0;
-                          const totalTokens = inputTokens + outputTokens;
-                          const costUsd = (inputTokens / 1_000_000 * 3) + (outputTokens / 1_000_000 * 15);
-                          void withDbClient(dbUrl, async (client) => {
-                            await client.query(
-                              `UPDATE sessions SET token_usage = COALESCE(token_usage, 0) + $1, cost_usd = COALESCE(cost_usd, 0) + $2 WHERE session_id = $3`,
-                              [totalTokens, costUsd, session_id]
-                            );
-                          }).catch((err) => console.error('[token-usage] Failed to update token usage:', err));
-                        }
-                      } else if (parsed.type === "assistant") {
-                        const content = parsed.message?.content || [];
-                        for (const block of content) {
-                          if (block.type === "tool_use") {
-                            const toolName = block.name;
-                            const toolInput = JSON.stringify(block.input || {}).slice(0, 200);
-                            postToFeed(session_id, dbUrl, `🔧 \`${toolName}\` ${toolInput}`);
-                          } else if (block.type === "text" && block.text?.trim() && !parsed.message?.usage) {
-                            const text = block.text.trim().slice(0, 500);
-                            if (text.length > 20) postToFeed(session_id, dbUrl, `💭 ${text}`);
-                          }
-                        }
-                      } else if (parsed.type === "tool_result") {
-                        const resultText = (parsed.content?.[0]?.text || "").slice(0, 300);
-                        if (resultText) postToFeed(session_id, dbUrl, `📄 Result: ${resultText}`);
+              proc.stdout.on("data", (chunk: Buffer) => {
+                const lines = chunk.toString().split("\n");
+                for (const line of lines) {
+                  if (!line.trim()) continue;
+                  log(line);
+                  try {
+                    const parsed = JSON.parse(line);
+                    if (parsed.type === "result") {
+                      output = parsed.result || parsed.output || JSON.stringify(parsed);
+                      postToFeed(session_id, dbUrl, `✅ Task complete\n\n${output.slice(0, 2000)}`);
+                      const usage = parsed.usage as { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } | undefined;
+                      if (usage && (usage.input_tokens || usage.output_tokens) && session_id && dbUrl) {
+                        const inputTokens = usage.input_tokens || 0;
+                        const outputTokens = usage.output_tokens || 0;
+                        const totalTokens = inputTokens + outputTokens;
+                        const costUsd = (inputTokens / 1_000_000 * 3) + (outputTokens / 1_000_000 * 15);
+                        void withDbClient(dbUrl, async (client) => {
+                          await client.query(
+                            `UPDATE sessions SET token_usage = COALESCE(token_usage, 0) + $1, cost_usd = COALESCE(cost_usd, 0) + $2 WHERE session_id = $3`,
+                            [totalTokens, costUsd, session_id]
+                          );
+                        }).catch((err) => console.error('[token-usage] Failed to update token usage:', err));
                       }
-                    } catch {}
-                  }
-                });
-                proc.stderr.on("data", (chunk: Buffer) => log("[stderr] " + chunk.toString()));
-                proc.on("close", (code) => {
-                  clearTimeout(timer);
-                  try { fs.unlinkSync(rulesFile); } catch {}
-                  resolve({ success: code === 0, output, task_id: taskId, exit_code: code ?? -1 });
-                });
-              }
-            );
-            return { content: [{ type: "text", text: JSON.stringify(result) }] };
+                    } else if (parsed.type === "assistant") {
+                      const content = parsed.message?.content || [];
+                      for (const block of content) {
+                        if (block.type === "tool_use") {
+                          const toolName = block.name;
+                          const toolInput = JSON.stringify(block.input || {}).slice(0, 200);
+                          postToFeed(session_id, dbUrl, `🔧 \`${toolName}\` ${toolInput}`);
+                        } else if (block.type === "text" && block.text?.trim() && !parsed.message?.usage) {
+                          const text = block.text.trim().slice(0, 500);
+                          if (text.length > 20) postToFeed(session_id, dbUrl, `💭 ${text}`);
+                        }
+                      }
+                    } else if (parsed.type === "tool_result") {
+                      const resultText = (parsed.content?.[0]?.text || "").slice(0, 300);
+                      if (resultText) postToFeed(session_id, dbUrl, `📄 Result: ${resultText}`);
+                    }
+                  } catch {}
+                }
+              });
+              proc.stderr.on("data", (chunk: Buffer) => log("[stderr] " + chunk.toString()));
+              proc.on("close", (code) => {
+                clearTimeout(timer);
+                try { fs.unlinkSync(rulesFile); } catch {}
+                postToFeed(session_id, dbUrl, `✅ Process ${taskId} exited with code ${code}`);
+              });
+            })(); // Fire and forget
+
+            // Return IMMEDIATELY with task_id
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  ok: true,
+                  task_id: taskId,
+                  status: "spawned",
+                  message: `Process spawned. Poll get_task_log('${taskId}') for output.`
+                })
+              }]
+            };
           } else {
             // cline driver
             const clinerules = path.join(working_dir, ".clinerules");
             fs.writeFileSync(clinerules, rules);
 
-            const result = await new Promise<{ success: boolean; output: string; task_id: string; exit_code: number }>(
-              (resolve) => {
-                const proc = spawn(
-                  "/home/david/.npm-local/bin/cline",
-                  ["-y", "--json", "--timeout", String(timeout_seconds), instruction],
-                  {
-                    cwd: working_dir,
-                    env: {
-                      ...process.env,
-                      CLINE_COMMAND_PERMISSIONS: JSON.stringify({
-                        allow: ["npm *", "git *", "node *", "npx *", "yarn *", "pnpm *"],
-                        deny: ["rm -rf /", "sudo *"],
-                      }),
-                    },
-                  }
-                );
+            // Spawn ASYNC - return immediately
+            (async () => {
+              const proc = spawn(
+                "/home/david/.npm-local/bin/cline",
+                ["-y", "--json", "--timeout", String(timeout_seconds), instruction],
+                {
+                  cwd: working_dir,
+                  env: {
+                    ...process.env,
+                    CLINE_COMMAND_PERMISSIONS: JSON.stringify({
+                      allow: ["npm *", "git *", "node *", "npx *", "yarn *", "pnpm *"],
+                      deny: ["rm -rf /", "sudo *"],
+                    }),
+                  },
+                }
+              );
 
-                const outputLines: string[] = [];
-                const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeout_seconds * 1000);
+              const outputLines: string[] = [];
+              const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeout_seconds * 1000);
 
-                proc.stdout.on("data", (chunk: Buffer) => {
-                  const lines = chunk.toString().split("\n");
-                  for (const line of lines) {
-                    if (!line.trim()) continue;
-                    log(line);
-                    try {
-                      const parsed = JSON.parse(line);
-                      if (parsed.type === "say" && !parsed.partial) {
-                        outputLines.push(parsed.text || "");
-                        if (parsed.say === "text") {
-                          postToFeed(session_id, dbUrl, `💭 ${(parsed.text || "").slice(0, 500)}`);
-                        } else if (parsed.say === "tool") {
-                          postToFeed(session_id, dbUrl, `🔧 ${(parsed.text || "").slice(0, 300)}`);
-                        } else if (parsed.say === "completion_result") {
-                          postToFeed(session_id, dbUrl, `✅ Done: ${(parsed.text || "").slice(0, 1000)}`);
-                        }
+              proc.stdout.on("data", (chunk: Buffer) => {
+                const lines = chunk.toString().split("\n");
+                for (const line of lines) {
+                  if (!line.trim()) continue;
+                  log(line);
+                  try {
+                    const parsed = JSON.parse(line);
+                    if (parsed.type === "say" && !parsed.partial) {
+                      outputLines.push(parsed.text || "");
+                      if (parsed.say === "text") {
+                        postToFeed(session_id, dbUrl, `💭 ${(parsed.text || "").slice(0, 500)}`);
+                      } else if (parsed.say === "tool") {
+                        postToFeed(session_id, dbUrl, `🔧 ${(parsed.text || "").slice(0, 300)}`);
+                      } else if (parsed.say === "completion_result") {
+                        postToFeed(session_id, dbUrl, `✅ Done: ${(parsed.text || "").slice(0, 1000)}`);
                       }
-                    } catch {}
-                  }
-                });
-                proc.stderr.on("data", (chunk: Buffer) => log("[stderr] " + chunk.toString()));
-                proc.on("close", (code) => {
-                  clearTimeout(timer);
-                  try { fs.unlinkSync(clinerules); } catch {}
-                  resolve({ success: code === 0, output: outputLines.join("\n"), task_id: taskId, exit_code: code ?? -1 });
-                });
-              }
-            );
-            return { content: [{ type: "text", text: JSON.stringify(result) }] };
+                    }
+                  } catch {}
+                }
+              });
+              proc.stderr.on("data", (chunk: Buffer) => log("[stderr] " + chunk.toString()));
+              proc.on("close", (code) => {
+                clearTimeout(timer);
+                try { fs.unlinkSync(clinerules); } catch {}
+                postToFeed(session_id, dbUrl, `✅ Process ${taskId} exited with code ${code}`);
+              });
+            })(); // Fire and forget
+
+            // Return IMMEDIATELY with task_id
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  ok: true,
+                  task_id: taskId,
+                  status: "spawned",
+                  message: `Process spawned. Poll get_task_log('${taskId}') for output.`
+                })
+              }]
+            };
           }
         }
 
