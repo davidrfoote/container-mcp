@@ -177,6 +177,7 @@ async function jiraAuthHeaders() {
     return { Authorization: `Basic ${encoded}`, Accept: "application/json" };
 }
 async function fetchJiraIssue(issueKey) {
+    console.log(`[fetchJiraIssue] Fetching issueKey=${issueKey}`);
     const baseUrl = (process.env.JIRA_URL ?? "").replace(/\/$/, "");
     const url = `${baseUrl}/rest/api/2/issue/${encodeURIComponent(issueKey)}`;
     const body = await httpGet(url, await jiraAuthHeaders());
@@ -188,55 +189,91 @@ async function fetchJiraIssue(issueKey) {
     };
 }
 async function fetchConfluencePage(pageId) {
+    console.log(`[fetchConfluencePage] Fetching pageId=${pageId}`);
     const baseUrl = (process.env.JIRA_URL ?? "").replace(/\/$/, "");
     const url = `${baseUrl}/wiki/rest/api/content/${encodeURIComponent(pageId)}?expand=body.storage,version`;
-    const body = await httpGet(url, await jiraAuthHeaders());
+    console.log(`[fetchConfluencePage] baseUrl=${baseUrl}, url=${url}`);
+    const headers = await jiraAuthHeaders();
+    console.log(`[fetchConfluencePage] Auth headers obtained`);
+    let body;
+    try {
+        body = await httpGet(url, headers);
+    }
+    catch (err) {
+        console.log(`[fetchConfluencePage] ERROR during httpGet: ${err}`);
+        throw err;
+    }
+    console.log(`[fetchConfluencePage] Received response, bodyLength=${body.length}`);
     const data = JSON.parse(body);
+    const versionNumber = data.version?.number ?? 0;
+    const bodyHtml = data.body?.storage?.value ?? "";
+    console.log(`[fetchConfluencePage] Parsed version=${versionNumber}, bodyLength=${bodyHtml.length}`);
     return {
-        versionNumber: data.version?.number ?? 0,
+        versionNumber,
         versionWhen: data.version?.when ?? "",
-        bodyHtml: data.body?.storage?.value ?? "",
+        bodyHtml,
     };
 }
 function stripHtml(html) {
     return html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 }
 async function writeCacheEntry(dbUrl, cacheKey, sourceType, contentHash, sourceUpdated, summary) {
-    await withDbClient(dbUrl, async (client) => {
-        const existing = await client.query(`SELECT content_hash FROM project_context_cache WHERE cache_key = $1`, [cacheKey]);
-        if (existing.rows.length > 0 && existing.rows[0].content_hash === contentHash) {
-            return;
-        }
-        await client.query(`INSERT INTO project_context_cache
-         (cache_key, source_type, content_hash, source_updated, summary, cached_at, last_checked)
-       VALUES ($1, $2, $3, $4, $5, now(), now())
-       ON CONFLICT (cache_key) DO UPDATE SET
-         source_type = EXCLUDED.source_type,
-         content_hash = EXCLUDED.content_hash,
-         source_updated = EXCLUDED.source_updated,
-         summary = EXCLUDED.summary,
-         cached_at = now(),
-         last_checked = now()`, [cacheKey, sourceType, contentHash, sourceUpdated || null, summary]);
-    });
+    console.log(`[writeCacheEntry] Writing cache_key=${cacheKey}, source_type=${sourceType}`);
+    try {
+        await withDbClient(dbUrl, async (client) => {
+            const existing = await client.query(`SELECT content_hash FROM project_context_cache WHERE cache_key = $1`, [cacheKey]);
+            if (existing.rows.length > 0 && existing.rows[0].content_hash === contentHash) {
+                console.log(`[writeCacheEntry] cache_key=${cacheKey} unchanged, skipping`);
+                return;
+            }
+            const isUpdate = existing.rows.length > 0;
+            await client.query(`INSERT INTO project_context_cache
+           (cache_key, source_type, content_hash, source_updated, summary, cached_at, last_checked)
+         VALUES ($1, $2, $3, $4, $5, now(), now())
+         ON CONFLICT (cache_key) DO UPDATE SET
+           source_type = EXCLUDED.source_type,
+           content_hash = EXCLUDED.content_hash,
+           source_updated = EXCLUDED.source_updated,
+           summary = EXCLUDED.summary,
+           cached_at = now(),
+           last_checked = now()`, [cacheKey, sourceType, contentHash, sourceUpdated || null, summary]);
+            console.log(`[writeCacheEntry] cache_key=${cacheKey} ${isUpdate ? "updated" : "inserted"} OK`);
+        });
+    }
+    catch (err) {
+        console.log(`[writeCacheEntry] DB ERROR for cache_key=${cacheKey}: ${err}`);
+        throw err;
+    }
 }
 async function populateCacheForProject(dbUrl, jiraKeys, confluenceRootId) {
-    const tasks = [];
-    for (const key of jiraKeys) {
-        tasks.push((async () => {
-            const issue = await fetchJiraIssue(key);
-            const raw = issue.description || issue.summary || "";
-            const summary = raw.slice(0, 2000);
-            await writeCacheEntry(dbUrl, `jira:${key}`, "jira", issue.updated, null, summary);
-        })());
+    console.log(`[populateCacheForProject] Starting with confluenceRootId=${confluenceRootId}, jiraKeys=[${jiraKeys.join(", ")}]`);
+    try {
+        const tasks = [];
+        for (const key of jiraKeys) {
+            console.log(`[populateCacheForProject] Pushing task: fetchJiraIssue(${key})`);
+            tasks.push((async () => {
+                const issue = await fetchJiraIssue(key);
+                const raw = issue.description || issue.summary || "";
+                const summary = raw.slice(0, 2000);
+                await writeCacheEntry(dbUrl, `jira:${key}`, "jira", issue.updated, null, summary);
+            })());
+        }
+        if (confluenceRootId) {
+            console.log(`[populateCacheForProject] Pushing task: fetchConfluencePage(${confluenceRootId})`);
+            tasks.push((async () => {
+                const page = await fetchConfluencePage(confluenceRootId);
+                const summary = stripHtml(page.bodyHtml).slice(0, 2000);
+                await writeCacheEntry(dbUrl, `confluence:${confluenceRootId}`, "confluence", String(page.versionNumber), page.versionWhen || null, summary);
+            })());
+        }
+        console.log(`[populateCacheForProject] Awaiting ${tasks.length} tasks`);
+        await Promise.all(tasks);
+        console.log(`[populateCacheForProject] All tasks complete`);
     }
-    if (confluenceRootId) {
-        tasks.push((async () => {
-            const page = await fetchConfluencePage(confluenceRootId);
-            const summary = stripHtml(page.bodyHtml).slice(0, 2000);
-            await writeCacheEntry(dbUrl, `confluence:${confluenceRootId}`, "confluence", String(page.versionNumber), page.versionWhen || null, summary);
-        })());
+    catch (err) {
+        console.log(`[populateCacheForProject] ERROR: ${err}`);
+        throw err;
     }
-    await Promise.all(tasks);
 }
 // ─── bootstrapSession helpers ───────────────────────────────────────────────
 async function fuzzyMatchProject(dbUrl, userRequest, projectHint) {
