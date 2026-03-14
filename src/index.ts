@@ -292,11 +292,12 @@ async function populateCacheForProject(
         try {
           const page = await fetchConfluencePage(confluenceRootId);
           const summary = stripHtml(page.bodyHtml).slice(0, 2000);
+          const contentHash = String(page.versionNumber || 'unknown');
           await writeCacheEntry(
             dbUrl,
             `confluence:${confluenceRootId}`,
             "confluence",
-            String(page.versionNumber),
+            contentHash,
             page.versionWhen || null,
             summary
           );

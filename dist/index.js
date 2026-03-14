@@ -282,7 +282,8 @@ async function populateCacheForProject(dbUrl, jiraKeys, confluenceRootId) {
                 try {
                     const page = await fetchConfluencePage(confluenceRootId);
                     const summary = stripHtml(page.bodyHtml).slice(0, 2000);
-                    await writeCacheEntry(dbUrl, `confluence:${confluenceRootId}`, "confluence", String(page.versionNumber), page.versionWhen || null, summary);
+                    const contentHash = String(page.versionNumber || 'unknown');
+                    await writeCacheEntry(dbUrl, `confluence:${confluenceRootId}`, "confluence", contentHash, page.versionWhen || null, summary);
                 }
                 catch (err) {
                     const msg = 'Confluence cache failed for pageId=' + confluenceRootId + ': ' + (err instanceof Error ? err.message : String(err));
