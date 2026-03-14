@@ -151,7 +151,26 @@ function httpPost(url, headers, body) {
         req.end();
     });
 }
-function jiraAuthHeaders() {
+let _jiraAuthHeadersCache = null;
+async function jiraAuthHeaders() {
+    if (_jiraAuthHeadersCache)
+        return _jiraAuthHeadersCache;
+    try {
+        const dbUrl = process.env.OPS_DB_URL;
+        const token = await withDbClient(dbUrl, async (client) => {
+            const res = await client.query(`SELECT value FROM secrets WHERE key = 'atlassian_token'`);
+            return res.rows[0]?.value ?? null;
+        });
+        if (token) {
+            const user = "david@zennya.com";
+            const encoded = Buffer.from(`${user}:${token}`).toString("base64");
+            _jiraAuthHeadersCache = { Authorization: `Basic ${encoded}`, Accept: "application/json" };
+            return _jiraAuthHeadersCache;
+        }
+    }
+    catch {
+        // fall through to env var fallback
+    }
     const user = process.env.JIRA_USERNAME ?? "";
     const token = process.env.JIRA_API_TOKEN ?? "";
     const encoded = Buffer.from(`${user}:${token}`).toString("base64");
@@ -160,7 +179,7 @@ function jiraAuthHeaders() {
 async function fetchJiraIssue(issueKey) {
     const baseUrl = (process.env.JIRA_URL ?? "").replace(/\/$/, "");
     const url = `${baseUrl}/rest/api/2/issue/${encodeURIComponent(issueKey)}`;
-    const body = await httpGet(url, jiraAuthHeaders());
+    const body = await httpGet(url, await jiraAuthHeaders());
     const data = JSON.parse(body);
     return {
         updated: data.fields?.updated ?? "",
@@ -171,7 +190,7 @@ async function fetchJiraIssue(issueKey) {
 async function fetchConfluencePage(pageId) {
     const baseUrl = (process.env.JIRA_URL ?? "").replace(/\/$/, "");
     const url = `${baseUrl}/wiki/rest/api/content/${encodeURIComponent(pageId)}?expand=body.storage,version`;
-    const body = await httpGet(url, jiraAuthHeaders());
+    const body = await httpGet(url, await jiraAuthHeaders());
     const data = JSON.parse(body);
     return {
         versionNumber: data.version?.number ?? 0,
@@ -258,7 +277,7 @@ async function searchJiraForIssue(projectKey, keywords) {
         const safe = keywords.replace(/['"\\]/g, "").slice(0, 80);
         const jql = encodeURIComponent(`project = ${projectKey} AND summary ~ "${safe}" ORDER BY updated DESC`);
         const url = `${baseUrl}/rest/api/2/search?jql=${jql}&maxResults=1&fields=summary,key`;
-        const body = await httpGet(url, jiraAuthHeaders());
+        const body = await httpGet(url, await jiraAuthHeaders());
         const data = JSON.parse(body);
         return data.issues?.[0]?.key ?? null;
     }
@@ -280,7 +299,7 @@ async function createJiraTaskIssue(projectKey, summary, description) {
                 issuetype: { name: "Task" },
             },
         });
-        const body = await httpPost(url, jiraAuthHeaders(), payload);
+        const body = await httpPost(url, await jiraAuthHeaders(), payload);
         const data = JSON.parse(body);
         return data.key ?? null;
     }
