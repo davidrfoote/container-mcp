@@ -36,6 +36,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.bootstrapSession = bootstrapSession;
 const express_1 = __importDefault(require("express"));
 const crypto_1 = require("crypto");
 const child_process_1 = require("child_process");
@@ -124,6 +125,32 @@ function httpGet(url, headers) {
         req.setTimeout(15000, () => { req.destroy(new Error("Request timed out")); });
     });
 }
+function httpPost(url, headers, body) {
+    return new Promise((resolve, reject) => {
+        const parsed = new URL(url);
+        const lib = parsed.protocol === "https:" ? https : http;
+        const bodyBuf = Buffer.from(body, "utf8");
+        const req = lib.request(url, {
+            method: "POST",
+            headers: { ...headers, "Content-Type": "application/json", "Content-Length": String(bodyBuf.length) },
+        }, (res) => {
+            let data = "";
+            res.on("data", (chunk) => { data += chunk; });
+            res.on("end", () => {
+                if (res.statusCode && res.statusCode >= 400) {
+                    reject(new Error(`HTTP ${res.statusCode}: ${data.slice(0, 200)}`));
+                }
+                else {
+                    resolve(data);
+                }
+            });
+        });
+        req.on("error", reject);
+        req.setTimeout(15000, () => { req.destroy(new Error("Request timed out")); });
+        req.write(bodyBuf);
+        req.end();
+    });
+}
 function jiraAuthHeaders() {
     const user = process.env.JIRA_USERNAME ?? "";
     const token = process.env.JIRA_API_TOKEN ?? "";
@@ -192,6 +219,76 @@ async function populateCacheForProject(dbUrl, jiraKeys, confluenceRootId) {
     }
     await Promise.all(tasks);
 }
+// ─── bootstrapSession helpers ───────────────────────────────────────────────
+async function fuzzyMatchProject(dbUrl, userRequest, projectHint) {
+    return withDbClient(dbUrl, async (client) => {
+        const res = await client.query(`SELECT project_id, display_name, description FROM projects`);
+        const words = userRequest.toLowerCase().split(/\W+/).filter((w) => w.length > 2);
+        const hint = projectHint?.toLowerCase();
+        let bestMatch = null;
+        let bestScore = 0;
+        for (const row of res.rows) {
+            const id = row.project_id.toLowerCase();
+            const name = (row.display_name ?? "").toLowerCase();
+            const desc = (row.description ?? "").toLowerCase();
+            let score = 0;
+            if (hint && (id.includes(hint) || name.includes(hint)))
+                score += 10;
+            for (const word of words) {
+                if (id.includes(word))
+                    score += 3;
+                if (name.includes(word))
+                    score += 2;
+                if (desc.includes(word))
+                    score += 1;
+            }
+            if (score > bestScore) {
+                bestScore = score;
+                bestMatch = row.project_id;
+            }
+        }
+        return bestScore > 0 ? bestMatch : null;
+    });
+}
+async function searchJiraForIssue(projectKey, keywords) {
+    const baseUrl = (process.env.JIRA_URL ?? "").replace(/\/$/, "");
+    if (!baseUrl)
+        return null;
+    try {
+        const safe = keywords.replace(/['"\\]/g, "").slice(0, 80);
+        const jql = encodeURIComponent(`project = ${projectKey} AND summary ~ "${safe}" ORDER BY updated DESC`);
+        const url = `${baseUrl}/rest/api/2/search?jql=${jql}&maxResults=1&fields=summary,key`;
+        const body = await httpGet(url, jiraAuthHeaders());
+        const data = JSON.parse(body);
+        return data.issues?.[0]?.key ?? null;
+    }
+    catch {
+        return null;
+    }
+}
+async function createJiraTaskIssue(projectKey, summary, description) {
+    const baseUrl = (process.env.JIRA_URL ?? "").replace(/\/$/, "");
+    if (!baseUrl)
+        return null;
+    try {
+        const url = `${baseUrl}/rest/api/2/issue`;
+        const payload = JSON.stringify({
+            fields: {
+                project: { key: projectKey },
+                summary: summary.slice(0, 255),
+                description,
+                issuetype: { name: "Task" },
+            },
+        });
+        const body = await httpPost(url, jiraAuthHeaders(), payload);
+        const data = JSON.parse(body);
+        return data.key ?? null;
+    }
+    catch (e) {
+        console.warn(`[bootstrapSession] Jira create failed: ${e.message}`);
+        return null;
+    }
+}
 const app = (0, express_1.default)();
 app.use(express_1.default.json());
 // Task log storage
@@ -248,6 +345,128 @@ async function postToFeed(sessionId, dbUrl, content, role = "dev_lead", messageT
             console.error("postToFeed error:", e.message);
         }
     });
+}
+// ─── bootstrapSession ───────────────────────────────────────────────────────
+async function bootstrapSession(params) {
+    const { user_request, user_id, project_hint } = params;
+    const dbUrl = process.env.OPS_DB_URL;
+    if (!dbUrl)
+        return { ok: false, error: "OPS_DB_URL not set" };
+    // Step 1: Fuzzy match project_id
+    let projectId = null;
+    try {
+        projectId = await fuzzyMatchProject(dbUrl, user_request, project_hint);
+    }
+    catch (e) {
+        return { ok: false, error: `Project lookup failed: ${e.message}` };
+    }
+    if (!projectId)
+        return { ok: false, error: "Could not match any project from request" };
+    // Steps 2-3: Check for existing active session
+    try {
+        const existing = await withDbClient(dbUrl, async (client) => {
+            const r = await client.query(`SELECT session_id FROM sessions WHERE user_id = $1 AND project_id = $2 AND status = 'active' ORDER BY created_at DESC LIMIT 1`, [user_id, projectId]);
+            return r.rows[0] ?? null;
+        });
+        if (existing) {
+            const sessionUrl = `https://dev-sessions.ash.zennya.app/sessions/${existing.session_id}`;
+            console.log(`[bootstrapSession] returning existing session ${existing.session_id}`);
+            return { ok: true, session_id: existing.session_id, session_url: sessionUrl };
+        }
+    }
+    catch (e) {
+        return { ok: false, error: `Session check failed: ${e.message}` };
+    }
+    // Step 4: Fetch project config
+    let projConfig = null;
+    try {
+        projConfig = await withDbClient(dbUrl, async (client) => {
+            const r = await client.query(`SELECT display_name, description, default_container, jira_issue_keys, confluence_root_id FROM projects WHERE project_id = $1`, [projectId]);
+            return r.rows[0] ?? null;
+        });
+    }
+    catch (e) {
+        return { ok: false, error: `Project config fetch failed: ${e.message}` };
+    }
+    if (!projConfig)
+        return { ok: false, error: `Project not found: ${projectId}` };
+    // Step 5: Warm cache (non-blocking on failure)
+    try {
+        await populateCacheForProject(dbUrl, projConfig.jira_issue_keys ?? [], projConfig.confluence_root_id ?? null);
+        console.log(`[bootstrapSession] cache warmed for ${projectId}`);
+    }
+    catch (e) {
+        console.warn(`[bootstrapSession] cache warm failed (non-fatal): ${e.message}`);
+    }
+    // Step 6: Search Jira for parent issue or create task issue
+    const existingKeys = projConfig.jira_issue_keys ?? [];
+    let jiraIssueKey = null;
+    if (existingKeys.length > 0) {
+        const projectKey = existingKeys[0].split("-")[0];
+        const keywords = user_request.replace(/['"\\]/g, "").slice(0, 80);
+        jiraIssueKey = await searchJiraForIssue(projectKey, keywords);
+        if (!jiraIssueKey) {
+            jiraIssueKey = await createJiraTaskIssue(projectKey, user_request.slice(0, 100), user_request);
+        }
+        if (jiraIssueKey)
+            console.log(`[bootstrapSession] Jira issue: ${jiraIssueKey}`);
+    }
+    // Step 7: Compose task brief
+    const taskBrief = [
+        `Project: ${projConfig.display_name ?? projectId} (${projectId})`,
+        `User request: ${user_request}`,
+        projConfig.description ? `Context: ${projConfig.description}` : null,
+        jiraIssueKey ? `Jira: ${jiraIssueKey}` : null,
+        existingKeys.length > 0 ? `Parent issues: ${existingKeys.join(", ")}` : null,
+    ].filter(Boolean).join("\n");
+    // Step 8: Create session + spawn dev-lead
+    const allJiraKeys = [...new Set([...(jiraIssueKey ? [jiraIssueKey] : []), ...existingKeys])];
+    const firstKeyNorm = (allJiraKeys[0] ?? "").toLowerCase().replace(/-/g, "");
+    const ts = Date.now();
+    const sessionId = firstKeyNorm
+        ? `sess-${firstKeyNorm}-${ts}`
+        : `sess-${(0, crypto_1.randomUUID)().slice(0, 8)}-${ts}`;
+    const sessionUrl = `https://dev-sessions.ash.zennya.app/sessions/${sessionId}`;
+    const jiraKeysArr = allJiraKeys.length > 0 ? `{${allJiraKeys.join(",")}}` : null;
+    try {
+        await withDbClient(dbUrl, async (client) => {
+            await client.query(`INSERT INTO sessions (session_id, project_id, container, repo, status, title, prompt_preview, jira_issue_keys, user_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7::text[], $8, now(), now())`, [sessionId, projectId, projConfig.default_container ?? "dev-david", projectId,
+                user_request.slice(0, 100), taskBrief.slice(0, 500), jiraKeysArr, user_id]);
+            const msgId = `msg-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+            await client.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
+         VALUES ($1, $2, 'user', $3, 'task_brief', now())`, [msgId, sessionId, taskBrief]);
+        });
+    }
+    catch (e) {
+        return { ok: false, error: `Session creation failed: ${e.message}` };
+    }
+    // Spawn dev-lead (non-fatal on failure)
+    const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
+    const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
+    try {
+        const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${gatewayToken}` },
+            body: JSON.stringify({
+                tool: "sessions_spawn",
+                args: { agentId: "dev-lead", task: await buildSpawnMessage(sessionId, dbUrl), cwd: "/home/openclaw/agents/dev-lead" },
+            }),
+        });
+        if (!resp.ok) {
+            const text = await resp.text();
+            console.warn(`[bootstrapSession] spawn failed: ${resp.status} ${text.slice(0, 200)}`);
+            await withDbClient(dbUrl, async (client) => {
+                await client.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
+           VALUES (gen_random_uuid(), $1, 'dev_lead', $2, 'console', now())`, [sessionId, `⚠️ Session created but spawn_dev_lead failed: Gateway ${resp.status}`]);
+            }).catch(() => { });
+        }
+    }
+    catch (e) {
+        console.warn(`[bootstrapSession] spawn error (non-fatal): ${e.message}`);
+    }
+    console.log(`[bootstrapSession] created session ${sessionId} for user ${user_id} / project ${projectId}`);
+    return { ok: true, session_id: sessionId, session_url: sessionUrl };
 }
 // ─── MCP Server Factory ────────────────────────────────────────────────────
 function createMcpServer() {
@@ -537,6 +756,28 @@ function createMcpServer() {
                     required: ["project_id"],
                 },
             },
+            {
+                name: "bootstrap_session",
+                description: "Orchestrate a new dev session end-to-end: fuzzy-match project from request text, check for existing active session, warm Jira/Confluence cache, create/find Jira issue, compose task brief, create session record, and spawn dev-lead agent.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        user_request: {
+                            type: "string",
+                            description: "Natural-language description of what the user wants to do",
+                        },
+                        user_id: {
+                            type: "string",
+                            description: "User identifier (e.g. Slack user ID or email)",
+                        },
+                        project_hint: {
+                            type: "string",
+                            description: "Optional project_id hint to bias fuzzy matching",
+                        },
+                    },
+                    required: ["user_request", "user_id"],
+                },
+            },
         ],
     }));
     server.setRequestHandler(types_js_1.CallToolRequestSchema, async (req) => {
@@ -567,76 +808,86 @@ function createMcpServer() {
                         fs.writeFileSync(rulesFile, rules);
                         // Spawn ASYNC - return immediately
                         (async () => {
-                            const proc = (0, child_process_1.spawn)("claude", [
-                                "-p", instruction,
-                                "--output-format", "stream-json",
-                                "--verbose",
-                                "--include-partial-messages",
-                                "--append-system-prompt-file", rulesFile,
-                                "--permission-mode", "acceptEdits",
-                                "--max-turns", String(max_turns),
-                                "--max-budget-usd", String(budget_usd),
-                                "--session-id", taskId,
-                                "--dangerously-skip-permissions",
-                            ], { cwd: working_dir, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
-                            let output = "";
-                            const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeout_seconds * 1000);
-                            proc.stdout.on("data", (chunk) => {
-                                const lines = chunk.toString().split("\n");
-                                for (const line of lines) {
-                                    if (!line.trim())
-                                        continue;
-                                    log(line);
+                            try {
+                                const memUsage = process.memoryUsage();
+                                console.log(`[code_task] Starting task ${taskId}. Memory: ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB`);
+                                const proc = (0, child_process_1.spawn)("claude", [
+                                    "-p", instruction,
+                                    "--output-format", "stream-json",
+                                    "--verbose",
+                                    "--include-partial-messages",
+                                    "--append-system-prompt-file", rulesFile,
+                                    "--permission-mode", "acceptEdits",
+                                    "--max-turns", String(max_turns),
+                                    "--max-budget-usd", String(budget_usd),
+                                    "--session-id", taskId,
+                                    "--dangerously-skip-permissions",
+                                ], { cwd: working_dir, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
+                                let output = "";
+                                const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeout_seconds * 1000);
+                                proc.stdout.on("data", (chunk) => {
+                                    const lines = chunk.toString().split("\n");
+                                    for (const line of lines) {
+                                        if (!line.trim())
+                                            continue;
+                                        log(line);
+                                        try {
+                                            const parsed = JSON.parse(line);
+                                            if (parsed.type === "result") {
+                                                output = parsed.result || parsed.output || JSON.stringify(parsed);
+                                                postToFeed(session_id, dbUrl, `✅ Task complete\n\n${output.slice(0, 2000)}`);
+                                                const usage = parsed.usage;
+                                                if (usage && (usage.input_tokens || usage.output_tokens) && session_id && dbUrl) {
+                                                    const inputTokens = usage.input_tokens || 0;
+                                                    const outputTokens = usage.output_tokens || 0;
+                                                    const totalTokens = inputTokens + outputTokens;
+                                                    const costUsd = (inputTokens / 1_000_000 * 3) + (outputTokens / 1_000_000 * 15);
+                                                    void withDbClient(dbUrl, async (client) => {
+                                                        await client.query(`UPDATE sessions SET token_usage = COALESCE(token_usage, 0) + $1, cost_usd = COALESCE(cost_usd, 0) + $2 WHERE session_id = $3`, [totalTokens, costUsd, session_id]);
+                                                    }).catch((err) => console.error('[token-usage] Failed to update token usage:', err));
+                                                }
+                                            }
+                                            else if (parsed.type === "assistant") {
+                                                const content = parsed.message?.content || [];
+                                                for (const block of content) {
+                                                    if (block.type === "tool_use") {
+                                                        const toolName = block.name;
+                                                        const toolInput = JSON.stringify(block.input || {}).slice(0, 200);
+                                                        postToFeed(session_id, dbUrl, `🔧 \`${toolName}\` ${toolInput}`);
+                                                    }
+                                                    else if (block.type === "text" && block.text?.trim() && !parsed.message?.usage) {
+                                                        const text = block.text.trim().slice(0, 500);
+                                                        if (text.length > 20)
+                                                            postToFeed(session_id, dbUrl, `💭 ${text}`);
+                                                    }
+                                                }
+                                            }
+                                            else if (parsed.type === "tool_result") {
+                                                const resultText = (parsed.content?.[0]?.text || "").slice(0, 300);
+                                                if (resultText)
+                                                    postToFeed(session_id, dbUrl, `📄 Result: ${resultText}`);
+                                            }
+                                        }
+                                        catch { }
+                                    }
+                                });
+                                proc.stderr.on("data", (chunk) => log("[stderr] " + chunk.toString()));
+                                proc.on("close", (code) => {
+                                    clearTimeout(timer);
                                     try {
-                                        const parsed = JSON.parse(line);
-                                        if (parsed.type === "result") {
-                                            output = parsed.result || parsed.output || JSON.stringify(parsed);
-                                            postToFeed(session_id, dbUrl, `✅ Task complete\n\n${output.slice(0, 2000)}`);
-                                            const usage = parsed.usage;
-                                            if (usage && (usage.input_tokens || usage.output_tokens) && session_id && dbUrl) {
-                                                const inputTokens = usage.input_tokens || 0;
-                                                const outputTokens = usage.output_tokens || 0;
-                                                const totalTokens = inputTokens + outputTokens;
-                                                const costUsd = (inputTokens / 1_000_000 * 3) + (outputTokens / 1_000_000 * 15);
-                                                void withDbClient(dbUrl, async (client) => {
-                                                    await client.query(`UPDATE sessions SET token_usage = COALESCE(token_usage, 0) + $1, cost_usd = COALESCE(cost_usd, 0) + $2 WHERE session_id = $3`, [totalTokens, costUsd, session_id]);
-                                                }).catch((err) => console.error('[token-usage] Failed to update token usage:', err));
-                                            }
-                                        }
-                                        else if (parsed.type === "assistant") {
-                                            const content = parsed.message?.content || [];
-                                            for (const block of content) {
-                                                if (block.type === "tool_use") {
-                                                    const toolName = block.name;
-                                                    const toolInput = JSON.stringify(block.input || {}).slice(0, 200);
-                                                    postToFeed(session_id, dbUrl, `🔧 \`${toolName}\` ${toolInput}`);
-                                                }
-                                                else if (block.type === "text" && block.text?.trim() && !parsed.message?.usage) {
-                                                    const text = block.text.trim().slice(0, 500);
-                                                    if (text.length > 20)
-                                                        postToFeed(session_id, dbUrl, `💭 ${text}`);
-                                                }
-                                            }
-                                        }
-                                        else if (parsed.type === "tool_result") {
-                                            const resultText = (parsed.content?.[0]?.text || "").slice(0, 300);
-                                            if (resultText)
-                                                postToFeed(session_id, dbUrl, `📄 Result: ${resultText}`);
-                                        }
+                                        fs.unlinkSync(rulesFile);
                                     }
                                     catch { }
-                                }
-                            });
-                            proc.stderr.on("data", (chunk) => log("[stderr] " + chunk.toString()));
-                            proc.on("close", (code) => {
-                                clearTimeout(timer);
-                                try {
-                                    fs.unlinkSync(rulesFile);
-                                }
-                                catch { }
-                                postToFeed(session_id, dbUrl, `✅ Process ${taskId} exited with code ${code}`);
-                            });
-                        })(); // Fire and forget
+                                    postToFeed(session_id, dbUrl, `✅ Process ${taskId} exited with code ${code}`);
+                                });
+                            }
+                            catch (err) {
+                                console.error(`[code_task] Error in async spawn: ${err.message}`);
+                                postToFeed(session_id, dbUrl, `❌ Task ${taskId} failed to start: ${err.message}`);
+                            }
+                        })().catch((err) => {
+                            console.error(`[code_task] Unhandled rejection: ${err.message}`);
+                        }); // Fire and forget
                         // Return IMMEDIATELY with task_id
                         return {
                             content: [{
@@ -656,52 +907,62 @@ function createMcpServer() {
                         fs.writeFileSync(clinerules, rules);
                         // Spawn ASYNC - return immediately
                         (async () => {
-                            const proc = (0, child_process_1.spawn)("/home/david/.npm-local/bin/cline", ["-y", "--json", "--timeout", String(timeout_seconds), instruction], {
-                                cwd: working_dir,
-                                env: {
-                                    ...process.env,
-                                    CLINE_COMMAND_PERMISSIONS: JSON.stringify({
-                                        allow: ["npm *", "git *", "node *", "npx *", "yarn *", "pnpm *"],
-                                        deny: ["rm -rf /", "sudo *"],
-                                    }),
-                                },
-                            });
-                            const outputLines = [];
-                            const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeout_seconds * 1000);
-                            proc.stdout.on("data", (chunk) => {
-                                const lines = chunk.toString().split("\n");
-                                for (const line of lines) {
-                                    if (!line.trim())
-                                        continue;
-                                    log(line);
-                                    try {
-                                        const parsed = JSON.parse(line);
-                                        if (parsed.type === "say" && !parsed.partial) {
-                                            outputLines.push(parsed.text || "");
-                                            if (parsed.say === "text") {
-                                                postToFeed(session_id, dbUrl, `💭 ${(parsed.text || "").slice(0, 500)}`);
-                                            }
-                                            else if (parsed.say === "tool") {
-                                                postToFeed(session_id, dbUrl, `🔧 ${(parsed.text || "").slice(0, 300)}`);
-                                            }
-                                            else if (parsed.say === "completion_result") {
-                                                postToFeed(session_id, dbUrl, `✅ Done: ${(parsed.text || "").slice(0, 1000)}`);
+                            try {
+                                const memUsage = process.memoryUsage();
+                                console.log(`[code_task] Starting task ${taskId}. Memory: ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB`);
+                                const proc = (0, child_process_1.spawn)("/home/david/.npm-local/bin/cline", ["-y", "--json", "--timeout", String(timeout_seconds), instruction], {
+                                    cwd: working_dir,
+                                    env: {
+                                        ...process.env,
+                                        CLINE_COMMAND_PERMISSIONS: JSON.stringify({
+                                            allow: ["npm *", "git *", "node *", "npx *", "yarn *", "pnpm *"],
+                                            deny: ["rm -rf /", "sudo *"],
+                                        }),
+                                    },
+                                });
+                                const outputLines = [];
+                                const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeout_seconds * 1000);
+                                proc.stdout.on("data", (chunk) => {
+                                    const lines = chunk.toString().split("\n");
+                                    for (const line of lines) {
+                                        if (!line.trim())
+                                            continue;
+                                        log(line);
+                                        try {
+                                            const parsed = JSON.parse(line);
+                                            if (parsed.type === "say" && !parsed.partial) {
+                                                outputLines.push(parsed.text || "");
+                                                if (parsed.say === "text") {
+                                                    postToFeed(session_id, dbUrl, `💭 ${(parsed.text || "").slice(0, 500)}`);
+                                                }
+                                                else if (parsed.say === "tool") {
+                                                    postToFeed(session_id, dbUrl, `🔧 ${(parsed.text || "").slice(0, 300)}`);
+                                                }
+                                                else if (parsed.say === "completion_result") {
+                                                    postToFeed(session_id, dbUrl, `✅ Done: ${(parsed.text || "").slice(0, 1000)}`);
+                                                }
                                             }
                                         }
+                                        catch { }
+                                    }
+                                });
+                                proc.stderr.on("data", (chunk) => log("[stderr] " + chunk.toString()));
+                                proc.on("close", (code) => {
+                                    clearTimeout(timer);
+                                    try {
+                                        fs.unlinkSync(clinerules);
                                     }
                                     catch { }
-                                }
-                            });
-                            proc.stderr.on("data", (chunk) => log("[stderr] " + chunk.toString()));
-                            proc.on("close", (code) => {
-                                clearTimeout(timer);
-                                try {
-                                    fs.unlinkSync(clinerules);
-                                }
-                                catch { }
-                                postToFeed(session_id, dbUrl, `✅ Process ${taskId} exited with code ${code}`);
-                            });
-                        })(); // Fire and forget
+                                    postToFeed(session_id, dbUrl, `✅ Process ${taskId} exited with code ${code}`);
+                                });
+                            }
+                            catch (err) {
+                                console.error(`[code_task] Error in async spawn: ${err.message}`);
+                                postToFeed(session_id, dbUrl, `❌ Task ${taskId} failed to start: ${err.message}`);
+                            }
+                        })().catch((err) => {
+                            console.error(`[code_task] Unhandled rejection: ${err.message}`);
+                        }); // Fire and forget
                         // Return IMMEDIATELY with task_id
                         return {
                             content: [{
@@ -1319,6 +1580,11 @@ function createMcpServer() {
                     const result = await (0, deploy_project_js_1.deployProject)(project_id, deploySessionId);
                     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
                 }
+                case "bootstrap_session": {
+                    const { user_request, user_id, project_hint } = args;
+                    const result = await bootstrapSession({ user_request, user_id, project_hint });
+                    return { content: [{ type: "text", text: JSON.stringify(result) }] };
+                }
                 default:
                     throw new Error(`Unknown tool: ${name}`);
             }
@@ -1561,9 +1827,18 @@ async function startListenChain() {
 }
 // ─── Start ─────────────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT || "9000", 10);
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
     console.log(`container-mcp v2.1.0 running on port ${PORT}`);
     console.log(`  SSE:    http://localhost:${PORT}/sse`);
     console.log(`  Health: http://localhost:${PORT}/health`);
+});
+server.on("error", (err) => {
+    if (err.code === "EADDRINUSE") {
+        console.error(`[container-mcp] Port ${PORT} still in use - retrying in 5s`);
+        setTimeout(() => { server.listen(PORT); }, 5000);
+    }
+    else {
+        console.error(`[container-mcp] Server error: ${err.message}`);
+    }
 });
 void startListenChain();
