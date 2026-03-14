@@ -90,7 +90,19 @@ async function notifySessionMessage(client: Client, sessionId: string, payload: 
 
 function httpGet(url: string, headers: Record<string, string>): Promise<string> {
   return new Promise((resolve, reject) => {
-    const parsed = new URL(url);
+    if (!url || typeof url !== 'string' || url.trim() === '') {
+      reject(new Error(`Invalid URL: empty or not a string`));
+      return;
+    }
+
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (e) {
+      reject(new Error(`Invalid URL constructor: ${url.slice(0, 100)} - ${(e as Error).message}`));
+      return;
+    }
+
     const lib = parsed.protocol === "https:" ? https : http;
     const req = lib.get(url, { headers }, (res) => {
       let data = "";
@@ -192,9 +204,12 @@ async function logCacheWarning(dbUrl: string, message: string): Promise<void> {
 async function fetchConfluencePage(pageId: string): Promise<{ versionNumber: number; versionWhen: string; bodyHtml: string }> {
   try {
     console.log(`[fetchConfluencePage] Fetching pageId=${pageId}`);
-    const baseUrl = (process.env.JIRA_URL ?? "").replace(/\/$/, "");
+    const baseUrl = (process.env.JIRA_URL || "https://zennya.atlassian.net").replace(/\/$/, "");
     const url = `${baseUrl}/wiki/rest/api/content/${encodeURIComponent(pageId)}?expand=body.storage,version`;
     console.log(`[fetchConfluencePage] baseUrl=${baseUrl}, url=${url}`);
+    if (!url || !url.startsWith('https://')) {
+      throw new Error(`Invalid Confluence URL constructed: ${url}`);
+    }
     const headers = await jiraAuthHeaders();
     console.log(`[fetchConfluencePage] Auth headers obtained`);
     let body: string;
