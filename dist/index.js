@@ -188,31 +188,48 @@ async function fetchJiraIssue(issueKey) {
         summary: data.fields?.summary ?? "",
     };
 }
-async function fetchConfluencePage(pageId) {
-    console.log(`[fetchConfluencePage] Fetching pageId=${pageId}`);
-    const baseUrl = (process.env.JIRA_URL ?? "").replace(/\/$/, "");
-    const url = `${baseUrl}/wiki/rest/api/content/${encodeURIComponent(pageId)}?expand=body.storage,version`;
-    console.log(`[fetchConfluencePage] baseUrl=${baseUrl}, url=${url}`);
-    const headers = await jiraAuthHeaders();
-    console.log(`[fetchConfluencePage] Auth headers obtained`);
-    let body;
+async function logCacheWarning(dbUrl, message) {
     try {
-        body = await httpGet(url, headers);
+        await withDbClient(dbUrl, async (client) => {
+            await client.query('INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at) VALUES (gen_random_uuid(), $1, $2, $3, $4, now())', ['cache-debug-log', 'dev_lead', '[CACHE] ' + message, 'console']);
+        });
+    }
+    catch (e) {
+        console.error('[logCacheWarning] Failed:', e);
+    }
+}
+async function fetchConfluencePage(pageId) {
+    try {
+        console.log(`[fetchConfluencePage] Fetching pageId=${pageId}`);
+        const baseUrl = (process.env.JIRA_URL ?? "").replace(/\/$/, "");
+        const url = `${baseUrl}/wiki/rest/api/content/${encodeURIComponent(pageId)}?expand=body.storage,version`;
+        console.log(`[fetchConfluencePage] baseUrl=${baseUrl}, url=${url}`);
+        const headers = await jiraAuthHeaders();
+        console.log(`[fetchConfluencePage] Auth headers obtained`);
+        let body;
+        try {
+            body = await httpGet(url, headers);
+        }
+        catch (err) {
+            console.log(`[fetchConfluencePage] ERROR during httpGet: ${err}`);
+            throw err;
+        }
+        console.log(`[fetchConfluencePage] Received response, bodyLength=${body.length}`);
+        const data = JSON.parse(body);
+        const versionNumber = data.version?.number ?? 0;
+        const bodyHtml = data.body?.storage?.value ?? "";
+        console.log(`[fetchConfluencePage] Parsed version=${versionNumber}, bodyLength=${bodyHtml.length}`);
+        return {
+            versionNumber,
+            versionWhen: data.version?.when ?? "",
+            bodyHtml,
+        };
     }
     catch (err) {
-        console.log(`[fetchConfluencePage] ERROR during httpGet: ${err}`);
+        const msg = 'fetchConfluencePage failed for pageId=' + pageId + ': ' + (err instanceof Error ? err.message : String(err));
+        console.error(msg);
         throw err;
     }
-    console.log(`[fetchConfluencePage] Received response, bodyLength=${body.length}`);
-    const data = JSON.parse(body);
-    const versionNumber = data.version?.number ?? 0;
-    const bodyHtml = data.body?.storage?.value ?? "";
-    console.log(`[fetchConfluencePage] Parsed version=${versionNumber}, bodyLength=${bodyHtml.length}`);
-    return {
-        versionNumber,
-        versionWhen: data.version?.when ?? "",
-        bodyHtml,
-    };
 }
 function stripHtml(html) {
     return html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
@@ -261,9 +278,16 @@ async function populateCacheForProject(dbUrl, jiraKeys, confluenceRootId) {
         if (confluenceRootId) {
             console.log(`[populateCacheForProject] Pushing task: fetchConfluencePage(${confluenceRootId})`);
             tasks.push((async () => {
-                const page = await fetchConfluencePage(confluenceRootId);
-                const summary = stripHtml(page.bodyHtml).slice(0, 2000);
-                await writeCacheEntry(dbUrl, `confluence:${confluenceRootId}`, "confluence", String(page.versionNumber), page.versionWhen || null, summary);
+                try {
+                    const page = await fetchConfluencePage(confluenceRootId);
+                    const summary = stripHtml(page.bodyHtml).slice(0, 2000);
+                    await writeCacheEntry(dbUrl, `confluence:${confluenceRootId}`, "confluence", String(page.versionNumber), page.versionWhen || null, summary);
+                }
+                catch (err) {
+                    const msg = 'Confluence cache failed for pageId=' + confluenceRootId + ': ' + (err instanceof Error ? err.message : String(err));
+                    await logCacheWarning(dbUrl, msg);
+                    throw err;
+                }
             })());
         }
         console.log(`[populateCacheForProject] Awaiting ${tasks.length} tasks`);
@@ -271,7 +295,9 @@ async function populateCacheForProject(dbUrl, jiraKeys, confluenceRootId) {
         console.log(`[populateCacheForProject] All tasks complete`);
     }
     catch (err) {
-        console.log(`[populateCacheForProject] ERROR: ${err}`);
+        const msg = 'populateCacheForProject failed: ' + (err instanceof Error ? err.message : String(err));
+        console.error(msg);
+        await logCacheWarning(dbUrl, msg);
         throw err;
     }
 }
