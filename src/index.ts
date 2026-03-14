@@ -281,7 +281,8 @@ async function populateCacheForProject(
         const issue = await fetchJiraIssue(key);
         const raw = issue.description || issue.summary || "";
         const summary = raw.slice(0, 2000);
-        await writeCacheEntry(dbUrl, `jira:${key}`, "jira", issue.updated, null, summary);
+        const contentHash = require('crypto').createHash('md5').update(issue.updated + ':' + summary).digest('hex');
+        await writeCacheEntry(dbUrl, `jira:${key}`, "jira", contentHash, issue.updated, summary);
       })());
     }
 
