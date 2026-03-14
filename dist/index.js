@@ -105,9 +105,31 @@ async function notifySessionMessage(client, sessionId, payload) {
     await client.query("SELECT pg_notify($1, $2)", [`session_messages_${safeId}`, text]);
 }
 // ─── Jira/Confluence fetch helpers ─────────────────────────────────────────
+function logHttpError(msg) {
+    const dbUrl = process.env.OPS_DB_URL;
+    if (!dbUrl)
+        return;
+    withDbClient(dbUrl, (client) => client.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, now())`, ['httpget-debug', 'dev_lead', '[HTTP-ERROR] ' + msg, 'console'])).catch(() => { });
+}
 function httpGet(url, headers) {
     return new Promise((resolve, reject) => {
-        const parsed = new URL(url);
+        if (!url || typeof url !== 'string' || url.trim() === '') {
+            const err = `httpGet: url is null/undefined/empty (typeof=${typeof url})`;
+            logHttpError(err);
+            reject(new Error(err));
+            return;
+        }
+        let parsed;
+        try {
+            parsed = new URL(url);
+        }
+        catch (e) {
+            const err = `URL constructor error for url=${url.slice(0, 150)}: ${e.message}`;
+            logHttpError(err);
+            reject(new Error(err));
+            return;
+        }
         const lib = parsed.protocol === "https:" ? https : http;
         const req = lib.get(url, { headers }, (res) => {
             let data = "";
@@ -201,9 +223,12 @@ async function logCacheWarning(dbUrl, message) {
 async function fetchConfluencePage(pageId) {
     try {
         console.log(`[fetchConfluencePage] Fetching pageId=${pageId}`);
-        const baseUrl = (process.env.JIRA_URL ?? "").replace(/\/$/, "");
+        const baseUrl = (process.env.JIRA_URL || "https://zennya.atlassian.net").replace(/\/$/, "");
         const url = `${baseUrl}/wiki/rest/api/content/${encodeURIComponent(pageId)}?expand=body.storage,version`;
         console.log(`[fetchConfluencePage] baseUrl=${baseUrl}, url=${url}`);
+        if (!url || !url.startsWith('https://')) {
+            throw new Error(`Invalid Confluence URL constructed: ${url}`);
+        }
         const headers = await jiraAuthHeaders();
         console.log(`[fetchConfluencePage] Auth headers obtained`);
         let body;
@@ -276,10 +301,11 @@ async function populateCacheForProject(dbUrl, jiraKeys, confluenceRootId) {
                 await writeCacheEntry(dbUrl, `jira:${key}`, "jira", contentHash, issue.updated, summary);
             })());
         }
-        if (confluenceRootId) {
+        if (confluenceRootId && typeof confluenceRootId === 'string' && confluenceRootId.trim() !== '') {
             console.log(`[populateCacheForProject] Pushing task: fetchConfluencePage(${confluenceRootId})`);
             tasks.push((async () => {
                 try {
+                    console.log(`[populateCacheForProject] About to fetch Confluence page: ${confluenceRootId}`);
                     const page = await fetchConfluencePage(confluenceRootId);
                     const summary = stripHtml(page.bodyHtml).slice(0, 2000);
                     const contentHash = String(page.versionNumber || 'unknown');

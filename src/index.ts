@@ -88,10 +88,24 @@ async function notifySessionMessage(client: Client, sessionId: string, payload: 
 
 // ─── Jira/Confluence fetch helpers ─────────────────────────────────────────
 
+function logHttpError(msg: string): void {
+  const dbUrl = process.env.OPS_DB_URL;
+  if (!dbUrl) return;
+  withDbClient(dbUrl, (client) =>
+    client.query(
+      `INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, now())`,
+      ['httpget-debug', 'dev_lead', '[HTTP-ERROR] ' + msg, 'console']
+    )
+  ).catch(() => {});
+}
+
 function httpGet(url: string, headers: Record<string, string>): Promise<string> {
   return new Promise((resolve, reject) => {
     if (!url || typeof url !== 'string' || url.trim() === '') {
-      reject(new Error(`Invalid URL: empty or not a string`));
+      const err = `httpGet: url is null/undefined/empty (typeof=${typeof url})`;
+      logHttpError(err);
+      reject(new Error(err));
       return;
     }
 
@@ -99,7 +113,9 @@ function httpGet(url: string, headers: Record<string, string>): Promise<string> 
     try {
       parsed = new URL(url);
     } catch (e) {
-      reject(new Error(`Invalid URL constructor: ${url.slice(0, 100)} - ${(e as Error).message}`));
+      const err = `URL constructor error for url=${url.slice(0, 150)}: ${(e as Error).message}`;
+      logHttpError(err);
+      reject(new Error(err));
       return;
     }
 
@@ -301,10 +317,11 @@ async function populateCacheForProject(
       })());
     }
 
-    if (confluenceRootId) {
+    if (confluenceRootId && typeof confluenceRootId === 'string' && confluenceRootId.trim() !== '') {
       console.log(`[populateCacheForProject] Pushing task: fetchConfluencePage(${confluenceRootId})`);
       tasks.push((async () => {
         try {
+          console.log(`[populateCacheForProject] About to fetch Confluence page: ${confluenceRootId}`);
           const page = await fetchConfluencePage(confluenceRootId);
           const summary = stripHtml(page.bodyHtml).slice(0, 2000);
           const contentHash = String(page.versionNumber || 'unknown');
