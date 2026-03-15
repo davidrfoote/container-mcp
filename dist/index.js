@@ -48,7 +48,6 @@ const index_js_1 = require("@modelcontextprotocol/sdk/server/index.js");
 const sse_js_1 = require("@modelcontextprotocol/sdk/server/sse.js");
 const types_js_1 = require("@modelcontextprotocol/sdk/types.js");
 const pg_1 = require("pg");
-const sdk_1 = __importDefault(require("@anthropic-ai/sdk"));
 const deploy_project_js_1 = require("./tools/deploy-project.js");
 async function withDbClient(connectionString, fn) {
     if (!connectionString) {
@@ -608,127 +607,38 @@ async function buildCloseoutMessage(sessionId, checkpointContent, dbUrl) {
     }
 }
 // ─── bootstrapSession helpers ───────────────────────────────────────────────
-async function matchProjectWithLLM(dbUrl, userRequest, projectHint) {
+/**
+ * Resolve a project by exact match on project_id/project_hint.
+ * Returns the matched project_id, or null + full project list for the caller to choose/create.
+ */
+async function resolveProject(dbUrl, projectId, projectHint) {
     return withDbClient(dbUrl, async (client) => {
-        const res = await client.query(`SELECT project_id, display_name, description FROM projects`);
-        if (res.rows.length === 0) {
-            return { project_id: null, confidence: "none", reasoning: "No projects registered" };
+        const res = await client.query(`SELECT project_id, display_name, description FROM projects ORDER BY updated_at DESC`);
+        const available_projects = res.rows;
+        // 1. Exact match on explicit project_id
+        if (projectId) {
+            const exact = available_projects.find((r) => r.project_id === projectId);
+            if (exact)
+                return { project_id: exact.project_id, available_projects };
         }
-        const projectList = res.rows
-            .map((r) => `- ${r.project_id}: ${r.display_name ?? "(no name)"} — ${r.description ?? "(no description)"}`)
-            .join("\n");
-        const prompt = `You are a project matcher. Given a user request and a list of registered projects, determine which project the request is about.
-
-## Registered Projects
-${projectList}
-
-## User Request
-"${userRequest}"${projectHint ? `\n\n## Hint\nThe user suggested this might be related to: "${projectHint}"` : ""}
-
-## Instructions
-Respond with EXACTLY one JSON object (no markdown fences, no extra text):
-{"project_id": "<matched_id or null>", "confidence": "<high|low|none>", "reasoning": "<one sentence>"}
-
-Rules:
-- "high" = clearly about this project
-- "low" = might be about this project but uncertain
-- "none" = doesn't match any project, likely a new project
-- If confidence is "none", set project_id to null`;
-        try {
-            const anthropic = new sdk_1.default();
-            const response = await anthropic.messages.create({
-                model: "claude-haiku-4-5-20251001",
-                max_tokens: 200,
-                messages: [{ role: "user", content: prompt }],
-            });
-            const text = response.content[0]?.type === "text" ? response.content[0].text.trim() : "";
-            const parsed = JSON.parse(text);
-            // Validate the returned project_id actually exists
-            if (parsed.project_id && !res.rows.some((r) => r.project_id === parsed.project_id)) {
-                console.warn(`[matchProjectWithLLM] LLM returned unknown project_id "${parsed.project_id}", treating as no match`);
-                return { project_id: null, confidence: "none", reasoning: `LLM hallucinated project_id: ${parsed.reasoning}` };
-            }
-            return {
-                project_id: parsed.project_id,
-                confidence: parsed.confidence || "none",
-                reasoning: parsed.reasoning || "",
-            };
+        // 2. Exact match on project_hint (case-insensitive)
+        if (projectHint) {
+            const hint = projectHint.toLowerCase();
+            const match = available_projects.find((r) => r.project_id.toLowerCase() === hint || (r.display_name ?? "").toLowerCase() === hint);
+            if (match)
+                return { project_id: match.project_id, available_projects };
         }
-        catch (e) {
-            console.warn(`[matchProjectWithLLM] LLM call failed, falling back to word scoring: ${e.message}`);
-            // Fallback: simple word scoring
-            const words = userRequest.toLowerCase().split(/\W+/).filter((w) => w.length > 2);
-            const hint = projectHint?.toLowerCase();
-            let bestMatch = null;
-            let bestScore = 0;
-            for (const row of res.rows) {
-                const id = row.project_id.toLowerCase();
-                const name = (row.display_name ?? "").toLowerCase();
-                const desc = (row.description ?? "").toLowerCase();
-                let score = 0;
-                if (hint && (id.includes(hint) || name.includes(hint)))
-                    score += 10;
-                for (const word of words) {
-                    if (id.includes(word))
-                        score += 3;
-                    if (name.includes(word))
-                        score += 2;
-                    if (desc.includes(word))
-                        score += 1;
-                }
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestMatch = row.project_id;
-                }
-            }
-            return {
-                project_id: bestScore > 0 ? bestMatch : null,
-                confidence: bestScore >= 10 ? "high" : bestScore > 0 ? "low" : "none",
-                reasoning: `Fallback word scoring (LLM unavailable): score=${bestScore}`,
-            };
-        }
+        // 3. No match — return null + list for the caller to decide
+        return { project_id: null, available_projects };
     });
 }
-async function autoCreateProject(dbUrl, userRequest, projectHint) {
-    // Use LLM to derive a sensible project_id and display_name from the request
-    let projectId;
-    let displayName;
-    let description;
-    try {
-        const anthropic = new sdk_1.default();
-        const response = await anthropic.messages.create({
-            model: "claude-haiku-4-5-20251001",
-            max_tokens: 200,
-            messages: [{ role: "user", content: `Given this user request for a new software feature/project, derive a short project identifier, display name, and description.
-
-User request: "${userRequest}"${projectHint ? `\nHint: "${projectHint}"` : ""}
-
-Respond with EXACTLY one JSON object (no markdown fences):
-{"project_id": "<lowercase-kebab-case, max 30 chars>", "display_name": "<Title Case, max 50 chars>", "description": "<one sentence describing the project>"}` }],
-        });
-        const text = response.content[0]?.type === "text" ? response.content[0].text.trim() : "";
-        const parsed = JSON.parse(text);
-        projectId = parsed.project_id.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 30);
-        displayName = parsed.display_name || projectId;
-        description = parsed.description || userRequest.slice(0, 200);
-    }
-    catch (e) {
-        // Fallback: derive from hint or first meaningful words
-        console.warn(`[autoCreateProject] LLM failed, using fallback: ${e.message}`);
-        projectId = (projectHint || userRequest)
-            .toLowerCase()
-            .replace(/[^a-z0-9\s-]/g, "")
-            .trim()
-            .split(/\s+/)
-            .slice(0, 3)
-            .join("-")
-            .slice(0, 30);
-        displayName = projectId.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-        description = userRequest.slice(0, 200);
-    }
-    // Insert into projects table with auto-detected settings
+/**
+ * Auto-create a project row from caller-provided details.
+ * The calling LLM is responsible for deriving project_id/display_name/description.
+ */
+async function ensureProject(dbUrl, projectId, displayName, description) {
     await withDbClient(dbUrl, async (client) => {
-        // Check candidate directories
+        // Check candidate directories for auto-detection
         let workingDir = null;
         for (const candidate of [`/home/david/${projectId}`, `/home/openclaw/apps/${projectId}`, `/opt/${projectId}`]) {
             if (fs.existsSync(candidate)) {
@@ -736,7 +646,6 @@ Respond with EXACTLY one JSON object (no markdown fences):
                 break;
             }
         }
-        // Auto-detect build/deploy if we found a directory
         let buildCmd = null;
         let deployCmd = null;
         if (workingDir) {
@@ -755,9 +664,11 @@ Respond with EXACTLY one JSON object (no markdown fences):
         }
         await client.query(`INSERT INTO projects (project_id, display_name, description, working_dir, default_container, build_cmd, deploy_cmd, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now())
-       ON CONFLICT (project_id) DO NOTHING`, [projectId, displayName, description, workingDir, "dev-david", buildCmd, deployCmd]);
+       ON CONFLICT (project_id) DO UPDATE SET
+         display_name = COALESCE(EXCLUDED.display_name, projects.display_name),
+         description = COALESCE(EXCLUDED.description, projects.description),
+         updated_at = now()`, [projectId, displayName || null, description || null, workingDir, "dev-david", buildCmd, deployCmd]);
     });
-    return projectId;
 }
 async function searchJiraForIssue(projectKey, keywords) {
     const baseUrl = (process.env.JIRA_URL ?? "").replace(/\/$/, "");
@@ -857,33 +768,37 @@ async function postToFeed(sessionId, dbUrl, content, role = "coding_agent", mess
 }
 // ─── bootstrapSession ───────────────────────────────────────────────────────
 async function bootstrapSession(params) {
-    const { user_request, user_id, project_hint } = params;
+    const { user_request, user_id, project_id, project_hint, display_name, description } = params;
     const dbUrl = process.env.OPS_DB_URL;
     if (!dbUrl)
         return { ok: false, error: "OPS_DB_URL not set" };
-    // Step 1: LLM-based project matching (with word-score fallback)
+    // Step 1: Resolve project — exact match on project_id or project_hint
     let projectId = null;
-    let matchResult = {
-        project_id: null, confidence: "none", reasoning: "",
-    };
     try {
-        matchResult = await matchProjectWithLLM(dbUrl, user_request, project_hint);
-        projectId = matchResult.project_id;
-        console.log(`[bootstrapSession] project match: ${JSON.stringify(matchResult)}`);
+        const resolved = await resolveProject(dbUrl, project_id, project_hint);
+        projectId = resolved.project_id;
+        if (!projectId) {
+            // If caller provided an explicit project_id, auto-create it
+            if (project_id) {
+                console.log(`[bootstrapSession] Auto-creating project: ${project_id}`);
+                await ensureProject(dbUrl, project_id, display_name, description);
+                projectId = project_id;
+            }
+            else {
+                // No match, no explicit ID — return project list for the caller to decide
+                console.log(`[bootstrapSession] No project matched, returning ${resolved.available_projects.length} projects for caller`);
+                return {
+                    ok: false,
+                    needs_project: true,
+                    available_projects: resolved.available_projects,
+                    error: `Could not match a project. Please call again with an explicit project_id (pick from available_projects, or provide a new one to auto-create it).`,
+                };
+            }
+        }
+        console.log(`[bootstrapSession] resolved project: ${projectId}`);
     }
     catch (e) {
         return { ok: false, error: `Project lookup failed: ${e.message}` };
-    }
-    // Auto-create project if no match found
-    if (!projectId) {
-        console.log(`[bootstrapSession] No project matched, auto-creating from request`);
-        try {
-            projectId = await autoCreateProject(dbUrl, user_request, project_hint);
-            console.log(`[bootstrapSession] Auto-created project: ${projectId}`);
-        }
-        catch (e) {
-            return { ok: false, error: `No matching project and auto-create failed: ${e.message}` };
-        }
     }
     // Steps 2-3: Check for existing active session
     try {
@@ -1414,7 +1329,7 @@ function createMcpServer() {
             },
             {
                 name: "bootstrap_session",
-                description: "Orchestrate a new dev session end-to-end: fuzzy-match project from request text, check for existing active session, warm Jira/Confluence cache, create/find Jira issue, compose task brief, create session record, and launch BOOTSTRAP planning pass via Claude Code CLI.",
+                description: "Orchestrate a new dev session end-to-end. Resolves the project (exact match on project_id or project_hint), checks for existing active session, warms Jira/Confluence cache, creates/finds Jira issue, composes task brief, creates session record, and launches BOOTSTRAP planning pass via Claude Code CLI. If no project matches and no project_id is provided, returns needs_project=true with available_projects — the caller should then pick or create a project_id and call again.",
                 inputSchema: {
                     type: "object",
                     properties: {
@@ -1426,9 +1341,21 @@ function createMcpServer() {
                             type: "string",
                             description: "User identifier (e.g. Slack user ID or email)",
                         },
+                        project_id: {
+                            type: "string",
+                            description: "Explicit project_id. If it matches an existing project, that project is used. If it doesn't exist, a new project is auto-created with the given display_name/description. If omitted, the server tries to match from project_hint.",
+                        },
                         project_hint: {
                             type: "string",
-                            description: "Optional project_id hint to bias fuzzy matching",
+                            description: "Optional project_id or display_name to match against existing projects (exact, case-insensitive). Ignored if project_id is provided.",
+                        },
+                        display_name: {
+                            type: "string",
+                            description: "Display name for auto-created projects (e.g. 'Ash Dashboard'). Only used when project_id is new.",
+                        },
+                        description: {
+                            type: "string",
+                            description: "Description for auto-created projects. Only used when project_id is new.",
                         },
                     },
                     required: ["user_request", "user_id"],
@@ -2491,8 +2418,8 @@ function createMcpServer() {
                     }
                 }
                 case "bootstrap_session": {
-                    const { user_request, user_id, project_hint } = args;
-                    const result = await bootstrapSession({ user_request, user_id, project_hint });
+                    const { user_request, user_id, project_id: bsProjectId, project_hint, display_name: bsDisplayName, description: bsDescription } = args;
+                    const result = await bootstrapSession({ user_request, user_id, project_id: bsProjectId, project_hint, display_name: bsDisplayName, description: bsDescription });
                     return { content: [{ type: "text", text: JSON.stringify(result) }] };
                 }
                 default:
