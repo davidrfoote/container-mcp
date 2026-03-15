@@ -110,8 +110,9 @@ async function lookupProject(dbUrl: string, projectId: string): Promise<ProjectR
 }
 
 async function detectAndRegisterProject(dbUrl: string, projectId: string): Promise<ProjectRow> {
+  const homeDir = process.env.AGENT_HOME_DIR ?? '/home/david';
   const candidateDirs = [
-    `/home/david/${projectId}`,
+    `${homeDir}/${projectId}`,
     `/home/openclaw/apps/${projectId}`,
     `/opt/${projectId}`,
   ];
