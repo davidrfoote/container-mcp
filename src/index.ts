@@ -13,6 +13,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { Client } from "pg";
+import Anthropic from "@anthropic-ai/sdk";
 import { deployProject } from './tools/deploy-project.js';
 
 async function withDbClient<T>(connectionString: string | undefined, fn: (client: Client) => Promise<T>): Promise<T> {
@@ -696,11 +697,11 @@ async function buildCloseoutMessage(sessionId: string, checkpointContent: string
 
 // ─── bootstrapSession helpers ───────────────────────────────────────────────
 
-async function fuzzyMatchProject(
+async function matchProjectWithLLM(
   dbUrl: string,
   userRequest: string,
   projectHint?: string
-): Promise<string | null> {
+): Promise<{ project_id: string | null; confidence: "high" | "low" | "none"; reasoning: string }> {
   return withDbClient(dbUrl, async (client) => {
     const res = await client.query<{
       project_id: string;
@@ -708,33 +709,159 @@ async function fuzzyMatchProject(
       description: string | null;
     }>(`SELECT project_id, display_name, description FROM projects`);
 
-    const words = userRequest.toLowerCase().split(/\W+/).filter((w) => w.length > 2);
-    const hint = projectHint?.toLowerCase();
+    if (res.rows.length === 0) {
+      return { project_id: null, confidence: "none", reasoning: "No projects registered" };
+    }
 
-    let bestMatch: string | null = null;
-    let bestScore = 0;
+    const projectList = res.rows
+      .map((r) => `- ${r.project_id}: ${r.display_name ?? "(no name)"} — ${r.description ?? "(no description)"}`)
+      .join("\n");
 
-    for (const row of res.rows) {
-      const id = row.project_id.toLowerCase();
-      const name = (row.display_name ?? "").toLowerCase();
-      const desc = (row.description ?? "").toLowerCase();
+    const prompt = `You are a project matcher. Given a user request and a list of registered projects, determine which project the request is about.
 
-      let score = 0;
-      if (hint && (id.includes(hint) || name.includes(hint))) score += 10;
-      for (const word of words) {
-        if (id.includes(word)) score += 3;
-        if (name.includes(word)) score += 2;
-        if (desc.includes(word)) score += 1;
+## Registered Projects
+${projectList}
+
+## User Request
+"${userRequest}"${projectHint ? `\n\n## Hint\nThe user suggested this might be related to: "${projectHint}"` : ""}
+
+## Instructions
+Respond with EXACTLY one JSON object (no markdown fences, no extra text):
+{"project_id": "<matched_id or null>", "confidence": "<high|low|none>", "reasoning": "<one sentence>"}
+
+Rules:
+- "high" = clearly about this project
+- "low" = might be about this project but uncertain
+- "none" = doesn't match any project, likely a new project
+- If confidence is "none", set project_id to null`;
+
+    try {
+      const anthropic = new Anthropic();
+      const response = await anthropic.messages.create({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 200,
+        messages: [{ role: "user", content: prompt }],
+      });
+
+      const text = response.content[0]?.type === "text" ? response.content[0].text.trim() : "";
+      const parsed = JSON.parse(text) as { project_id: string | null; confidence: string; reasoning: string };
+
+      // Validate the returned project_id actually exists
+      if (parsed.project_id && !res.rows.some((r) => r.project_id === parsed.project_id)) {
+        console.warn(`[matchProjectWithLLM] LLM returned unknown project_id "${parsed.project_id}", treating as no match`);
+        return { project_id: null, confidence: "none", reasoning: `LLM hallucinated project_id: ${parsed.reasoning}` };
       }
 
-      if (score > bestScore) {
-        bestScore = score;
-        bestMatch = row.project_id;
+      return {
+        project_id: parsed.project_id,
+        confidence: (parsed.confidence as "high" | "low" | "none") || "none",
+        reasoning: parsed.reasoning || "",
+      };
+    } catch (e: any) {
+      console.warn(`[matchProjectWithLLM] LLM call failed, falling back to word scoring: ${e.message}`);
+      // Fallback: simple word scoring
+      const words = userRequest.toLowerCase().split(/\W+/).filter((w) => w.length > 2);
+      const hint = projectHint?.toLowerCase();
+      let bestMatch: string | null = null;
+      let bestScore = 0;
+      for (const row of res.rows) {
+        const id = row.project_id.toLowerCase();
+        const name = (row.display_name ?? "").toLowerCase();
+        const desc = (row.description ?? "").toLowerCase();
+        let score = 0;
+        if (hint && (id.includes(hint) || name.includes(hint))) score += 10;
+        for (const word of words) {
+          if (id.includes(word)) score += 3;
+          if (name.includes(word)) score += 2;
+          if (desc.includes(word)) score += 1;
+        }
+        if (score > bestScore) { bestScore = score; bestMatch = row.project_id; }
+      }
+      return {
+        project_id: bestScore > 0 ? bestMatch : null,
+        confidence: bestScore >= 10 ? "high" : bestScore > 0 ? "low" : "none",
+        reasoning: `Fallback word scoring (LLM unavailable): score=${bestScore}`,
+      };
+    }
+  });
+}
+
+async function autoCreateProject(
+  dbUrl: string,
+  userRequest: string,
+  projectHint?: string
+): Promise<string> {
+  // Use LLM to derive a sensible project_id and display_name from the request
+  let projectId: string;
+  let displayName: string;
+  let description: string;
+
+  try {
+    const anthropic = new Anthropic();
+    const response = await anthropic.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 200,
+      messages: [{ role: "user", content: `Given this user request for a new software feature/project, derive a short project identifier, display name, and description.
+
+User request: "${userRequest}"${projectHint ? `\nHint: "${projectHint}"` : ""}
+
+Respond with EXACTLY one JSON object (no markdown fences):
+{"project_id": "<lowercase-kebab-case, max 30 chars>", "display_name": "<Title Case, max 50 chars>", "description": "<one sentence describing the project>"}` }],
+    });
+
+    const text = response.content[0]?.type === "text" ? response.content[0].text.trim() : "";
+    const parsed = JSON.parse(text) as { project_id: string; display_name: string; description: string };
+    projectId = parsed.project_id.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 30);
+    displayName = parsed.display_name || projectId;
+    description = parsed.description || userRequest.slice(0, 200);
+  } catch (e: any) {
+    // Fallback: derive from hint or first meaningful words
+    console.warn(`[autoCreateProject] LLM failed, using fallback: ${e.message}`);
+    projectId = (projectHint || userRequest)
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, "")
+      .trim()
+      .split(/\s+/)
+      .slice(0, 3)
+      .join("-")
+      .slice(0, 30);
+    displayName = projectId.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+    description = userRequest.slice(0, 200);
+  }
+
+  // Insert into projects table with auto-detected settings
+  await withDbClient(dbUrl, async (client) => {
+    // Check candidate directories
+    let workingDir: string | null = null;
+    for (const candidate of [`/home/david/${projectId}`, `/home/openclaw/apps/${projectId}`, `/opt/${projectId}`]) {
+      if (fs.existsSync(candidate)) { workingDir = candidate; break; }
+    }
+
+    // Auto-detect build/deploy if we found a directory
+    let buildCmd: string | null = null;
+    let deployCmd: string | null = null;
+    if (workingDir) {
+      if (fs.existsSync(path.join(workingDir, "swarm.yml"))) {
+        buildCmd = `cd ${workingDir} && docker build -t ${projectId}:latest .`;
+        deployCmd = `docker stack deploy -c ${workingDir}/swarm.yml ${projectId}`;
+      } else if (fs.existsSync(path.join(workingDir, "Dockerfile"))) {
+        buildCmd = `cd ${workingDir} && docker build -t ${projectId}:latest .`;
+        deployCmd = `docker service update --image ${projectId}:latest prod_${projectId} || docker service update --image ${projectId}:latest ${projectId}`;
+      } else if (fs.existsSync(path.join(workingDir, "package.json"))) {
+        buildCmd = `cd ${workingDir} && npm install && npm run build`;
+        deployCmd = `pkill -f "node dist/index.js" 2>/dev/null || true; nohup node ${workingDir}/dist/index.js > /tmp/${projectId}.log 2>&1 &`;
       }
     }
 
-    return bestScore > 0 ? bestMatch : null;
+    await client.query(
+      `INSERT INTO projects (project_id, display_name, description, working_dir, default_container, build_cmd, deploy_cmd, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now())
+       ON CONFLICT (project_id) DO NOTHING`,
+      [projectId, displayName, description, workingDir, "dev-david", buildCmd, deployCmd]
+    );
   });
+
+  return projectId;
 }
 
 async function searchJiraForIssue(projectKey: string, keywords: string): Promise<string | null> {
@@ -849,14 +976,29 @@ export async function bootstrapSession(params: {
   const dbUrl = process.env.OPS_DB_URL;
   if (!dbUrl) return { ok: false, error: "OPS_DB_URL not set" };
 
-  // Step 1: Fuzzy match project_id
+  // Step 1: LLM-based project matching (with word-score fallback)
   let projectId: string | null = null;
+  let matchResult: { project_id: string | null; confidence: string; reasoning: string } = {
+    project_id: null, confidence: "none", reasoning: "",
+  };
   try {
-    projectId = await fuzzyMatchProject(dbUrl, user_request, project_hint);
+    matchResult = await matchProjectWithLLM(dbUrl, user_request, project_hint);
+    projectId = matchResult.project_id;
+    console.log(`[bootstrapSession] project match: ${JSON.stringify(matchResult)}`);
   } catch (e: any) {
     return { ok: false, error: `Project lookup failed: ${e.message}` };
   }
-  if (!projectId) return { ok: false, error: "Could not match any project from request" };
+
+  // Auto-create project if no match found
+  if (!projectId) {
+    console.log(`[bootstrapSession] No project matched, auto-creating from request`);
+    try {
+      projectId = await autoCreateProject(dbUrl, user_request, project_hint);
+      console.log(`[bootstrapSession] Auto-created project: ${projectId}`);
+    } catch (e: any) {
+      return { ok: false, error: `No matching project and auto-create failed: ${e.message}` };
+    }
+  }
 
   // Steps 2-3: Check for existing active session
   try {
