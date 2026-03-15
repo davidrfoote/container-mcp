@@ -1354,6 +1354,56 @@ function createMcpServer() {
         },
       },
       {
+        name: "create_project",
+        description: "Register a new project in the projects table (or update an existing one). Sets display name, description, build/deploy commands, working directory, default container, Jira keys, Confluence root, and smoke URL. Auto-detects build/deploy commands from the filesystem if not provided.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            project_id: {
+              type: "string",
+              description: "Unique project identifier (e.g. 'my-api', 'ash-dashboard'). Used as PK in projects table.",
+            },
+            display_name: {
+              type: "string",
+              description: "Human-readable project name (e.g. 'Ash Dashboard')",
+            },
+            description: {
+              type: "string",
+              description: "Brief project description/context",
+            },
+            working_dir: {
+              type: "string",
+              description: "Absolute path to the project directory (e.g. /home/david/my-api). Auto-detected if omitted.",
+            },
+            default_container: {
+              type: "string",
+              description: "Default dev container name (e.g. 'dev-david')",
+            },
+            build_cmd: {
+              type: "string",
+              description: "Build command. Auto-detected from filesystem if omitted.",
+            },
+            deploy_cmd: {
+              type: "string",
+              description: "Deploy command. Auto-detected from filesystem if omitted.",
+            },
+            smoke_url: {
+              type: "string",
+              description: "Health-check URL to verify deployment (e.g. https://app.example.com/health)",
+            },
+            jira_issue_keys: {
+              type: "string",
+              description: "Comma-separated parent Jira issue keys (e.g. 'ZI-18820,ZI-18821')",
+            },
+            confluence_root_id: {
+              type: "string",
+              description: "Confluence page ID for project documentation root",
+            },
+          },
+          required: ["project_id"],
+        },
+      },
+      {
         name: "bootstrap_session",
         description: "Orchestrate a new dev session end-to-end: fuzzy-match project from request text, check for existing active session, warm Jira/Confluence cache, create/find Jira issue, compose task brief, create session record, and launch BOOTSTRAP planning pass via Claude Code CLI.",
         inputSchema: {
@@ -2394,6 +2444,114 @@ function createMcpServer() {
             return inserted;
           });
           return { content: [{ type: "text", text: JSON.stringify({ ok: true, message_id: row?.message_id }) }] };
+        }
+
+        case "create_project": {
+          const {
+            project_id: projectId,
+            display_name,
+            description: projDescription,
+            working_dir: inputWorkingDir,
+            default_container,
+            build_cmd: inputBuildCmd,
+            deploy_cmd: inputDeployCmd,
+            smoke_url: inputSmokeUrl,
+            jira_issue_keys: jiraKeysStr,
+            confluence_root_id,
+          } = args as any;
+
+          const dbUrl = process.env.OPS_DB_URL;
+          if (!dbUrl) {
+            return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "OPS_DB_URL not set" }) }] };
+          }
+
+          // Resolve working_dir: explicit > auto-detect from candidate dirs
+          let workingDir = inputWorkingDir || null;
+          if (!workingDir) {
+            for (const candidate of [`/home/david/${projectId}`, `/home/openclaw/apps/${projectId}`, `/opt/${projectId}`]) {
+              if (fs.existsSync(candidate)) { workingDir = candidate; break; }
+            }
+          }
+
+          // Auto-detect build/deploy commands if not provided and working_dir exists
+          let buildCmd = inputBuildCmd || null;
+          let deployCmd = inputDeployCmd || null;
+          if (workingDir && (!buildCmd || !deployCmd)) {
+            const hasSwarmYml = fs.existsSync(path.join(workingDir, 'swarm.yml'));
+            const hasDockerfile = fs.existsSync(path.join(workingDir, 'Dockerfile'));
+            const hasPkgJson = fs.existsSync(path.join(workingDir, 'package.json'));
+            const hasRequirements = fs.existsSync(path.join(workingDir, 'requirements.txt'));
+            const hasPyproject = fs.existsSync(path.join(workingDir, 'pyproject.toml'));
+
+            if (!buildCmd || !deployCmd) {
+              let detectedBuild: string | null = null;
+              let detectedDeploy: string | null = null;
+              if (hasSwarmYml) {
+                detectedBuild = `cd ${workingDir} && docker build -t ${projectId}:latest .`;
+                detectedDeploy = `docker stack deploy -c ${workingDir}/swarm.yml ${projectId}`;
+              } else if (hasDockerfile) {
+                detectedBuild = `cd ${workingDir} && docker build -t ${projectId}:latest .`;
+                detectedDeploy = `docker service update --image ${projectId}:latest prod_${projectId} || docker service update --image ${projectId}:latest ${projectId}`;
+              } else if (hasPkgJson) {
+                let pkgJson: Record<string, unknown> = {};
+                try { pkgJson = JSON.parse(fs.readFileSync(path.join(workingDir, 'package.json'), 'utf8')) as Record<string, unknown>; } catch {}
+                const deps = (pkgJson?.dependencies ?? {}) as Record<string, unknown>;
+                const devDeps = (pkgJson?.devDependencies ?? {}) as Record<string, unknown>;
+                const isNext = Boolean(deps.next ?? devDeps.next);
+                if (isNext) {
+                  detectedBuild = `cd ${workingDir} && docker build -t ${projectId}:latest .`;
+                  detectedDeploy = `docker service update --image ${projectId}:latest prod_${projectId} || docker service update --image ${projectId}:latest ${projectId}`;
+                } else {
+                  detectedBuild = `cd ${workingDir} && npm install && npm run build`;
+                  detectedDeploy = `pkill -f "node dist/index.js" 2>/dev/null || true; nohup node ${workingDir}/dist/index.js > /tmp/${projectId}.log 2>&1 &`;
+                }
+              } else if (hasRequirements || hasPyproject) {
+                detectedBuild = `cd ${workingDir} && pip install -r ${hasRequirements ? 'requirements.txt' : '.'} -q`;
+                detectedDeploy = `pkill -f "${workingDir}/main.py" 2>/dev/null || true; nohup python3 ${workingDir}/main.py > /tmp/${projectId}.log 2>&1 &`;
+              }
+              if (!buildCmd) buildCmd = detectedBuild;
+              if (!deployCmd) deployCmd = detectedDeploy;
+            }
+          }
+
+          // Parse jira keys into Postgres array literal
+          const jiraKeysArr = jiraKeysStr
+            ? `{${jiraKeysStr.split(",").map((k: string) => k.trim()).filter(Boolean).join(",")}}`
+            : null;
+
+          try {
+            await withDbClient(dbUrl, async (client) => {
+              await client.query(
+                `INSERT INTO projects (project_id, display_name, description, working_dir, default_container, build_cmd, deploy_cmd, smoke_url, jira_issue_keys, confluence_root_id, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text[], $10, now(), now())
+                 ON CONFLICT (project_id) DO UPDATE SET
+                   display_name = COALESCE(EXCLUDED.display_name, projects.display_name),
+                   description = COALESCE(EXCLUDED.description, projects.description),
+                   working_dir = COALESCE(EXCLUDED.working_dir, projects.working_dir),
+                   default_container = COALESCE(EXCLUDED.default_container, projects.default_container),
+                   build_cmd = COALESCE(EXCLUDED.build_cmd, projects.build_cmd),
+                   deploy_cmd = COALESCE(EXCLUDED.deploy_cmd, projects.deploy_cmd),
+                   smoke_url = COALESCE(EXCLUDED.smoke_url, projects.smoke_url),
+                   jira_issue_keys = COALESCE(EXCLUDED.jira_issue_keys, projects.jira_issue_keys),
+                   confluence_root_id = COALESCE(EXCLUDED.confluence_root_id, projects.confluence_root_id),
+                   updated_at = now()`,
+                [projectId, display_name || null, projDescription || null, workingDir, default_container || null, buildCmd, deployCmd, inputSmokeUrl || null, jiraKeysArr, confluence_root_id || null]
+              );
+            });
+
+            // Read back the full row to return
+            const row = await withDbClient(dbUrl, async (client) => {
+              const r = await client.query(
+                `SELECT project_id, display_name, description, working_dir, default_container, build_cmd, deploy_cmd, smoke_url, jira_issue_keys, confluence_root_id, created_at, updated_at FROM projects WHERE project_id = $1`,
+                [projectId]
+              );
+              return r.rows[0] ?? null;
+            });
+
+            return { content: [{ type: "text", text: JSON.stringify({ ok: true, project: row }) }] };
+          } catch (err: any) {
+            return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: err.message }) }], isError: true };
+          }
         }
 
         case "bootstrap_session": {
