@@ -15,6 +15,10 @@ import { z } from "zod";
 import { Client } from "pg";
 import { deployProject } from './tools/deploy-project.js';
 
+// Base directory for project repos and agent rules.
+// Override via AGENT_HOME_DIR env var to run as a different user.
+const HOME_DIR = process.env.AGENT_HOME_DIR ?? '/home/david';
+
 async function withDbClient<T>(connectionString: string | undefined, fn: (client: Client) => Promise<T>): Promise<T> {
   if (!connectionString) {
     throw new Error("OPS_DB_URL not set");
@@ -366,6 +370,7 @@ function spawnCodeTask(params: {
   const { instruction, workingDir, sessionId, dbUrl, maxTurns = 40, budgetUsd = 8.0, timeoutSeconds = 1200 } = params;
   const taskId = randomUUID();
   taskLogs.set(taskId, []);
+  taskLogTimestamps.set(taskId, Date.now());
   const log = (line: string) => taskLogs.get(taskId)!.push(line);
 
   postToFeed(sessionId!, dbUrl!, `🚀 Starting code task (${taskId})\n\n${instruction.slice(0, 400)}`);
@@ -374,8 +379,8 @@ function spawnCodeTask(params: {
     try {
       const rulesFile = `/tmp/container-mcp-rules-${taskId}.md`;
       let rules = "";
-      try { rules += fs.readFileSync("/home/david/.rules/base.md", "utf8") + "\n"; } catch {}
-      fs.writeFileSync(rulesFile, rules);
+      try { rules += fs.readFileSync(`${HOME_DIR}/.rules/base.md`, "utf8") + "\n"; } catch {}
+      await fs.promises.writeFile(rulesFile, rules);
 
       const proc = spawn("claude", [
         "-p", instruction,
@@ -470,7 +475,7 @@ async function buildBootstrapInstruction(sessionId: string, dbUrl: string): Prom
 
   const projectId = data.session?.project_id ?? "unknown";
   const jiraKeys = data.session?.jira_issue_keys ?? [];
-  const workingDir = `/home/david/${projectId}`;
+  const workingDir = `${HOME_DIR}/${projectId}`;
 
   // Read cache summaries
   const cacheKeys = [
@@ -562,7 +567,7 @@ async function buildExecutionInstruction(sessionId: string, dbUrl: string): Prom
   const projectId = data.session?.project_id ?? "unknown";
   const jiraKeys = data.session?.jira_issue_keys ?? [];
   const primaryJira = jiraKeys[0] ?? "";
-  const workingDir = `/home/david/${projectId}`;
+  const workingDir = `${HOME_DIR}/${projectId}`;
 
   const userMods = (data.approval !== "approved" && data.approval !== "auto-approved")
     ? `\n### User Modifications / Feedback\n${data.approval}\n`
@@ -728,13 +733,25 @@ async function createJiraTaskIssue(
 const app = express();
 app.use(express.json());
 
-// Task log storage
+// Task log storage with TTL eviction to prevent unbounded memory growth
 const taskLogs = new Map<string, string[]>();
+const taskLogTimestamps = new Map<string, number>();
+const TASK_LOG_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+setInterval(() => {
+  const cutoff = Date.now() - TASK_LOG_TTL_MS;
+  for (const [id, ts] of taskLogTimestamps) {
+    if (ts < cutoff) {
+      taskLogs.delete(id);
+      taskLogTimestamps.delete(id);
+    }
+  }
+}, 10 * 60 * 1000).unref();
 
 // ─── postToFeed helper ─────────────────────────────────────────────────────
 const _feedClients = new Map<string, { client: InstanceType<typeof Client>; queue: Promise<void> }>();
 
-async function postToFeed(sessionId: string, dbUrl: string, content: string, role = "coding_agent", messageType = "execution_update"): Promise<void> {
+async function postToFeed(sessionId: string | undefined, dbUrl: string | undefined, content: string, role = "coding_agent", messageType = "execution_update"): Promise<void> {
   if (!sessionId || !dbUrl) return;
   const key = `${sessionId}::${dbUrl}`;
   if (!_feedClients.has(key)) {
@@ -1299,16 +1316,30 @@ function createMcpServer() {
             budget_usd = 5.0,
             timeout_seconds = 900,
             task_rules,
-            base_rules_path = "/home/david/.rules/base.md",
+            base_rules_path = `${HOME_DIR}/.rules/base.md`,
             project_rules_path = "/.rules/project.md",
             session_id,
             ops_db_url,
-          } = args as any;
+          } = args as {
+            instruction: string;
+            working_dir: string;
+            driver?: string;
+            task_id?: string;
+            max_turns?: number;
+            budget_usd?: number;
+            timeout_seconds?: number;
+            task_rules?: string;
+            base_rules_path?: string;
+            project_rules_path?: string;
+            session_id?: string;
+            ops_db_url?: string;
+          };
 
           const dbUrl = ops_db_url || process.env.OPS_DB_URL;
 
           const taskId = task_id || randomUUID();
           taskLogs.set(taskId, []);
+          taskLogTimestamps.set(taskId, Date.now());
           const log = (line: string) => taskLogs.get(taskId)!.push(line);
 
           postToFeed(session_id, dbUrl, `🚀 Starting \`code_task\` (driver: ${driver}, task_id: ${taskId})\n\nInstruction: ${instruction.slice(0, 300)}`);
@@ -1321,7 +1352,7 @@ function createMcpServer() {
 
           if (driver === "claude") {
             const rulesFile = `/tmp/container-mcp-rules-${taskId}.md`;
-            fs.writeFileSync(rulesFile, rules);
+            await fs.promises.writeFile(rulesFile, rules);
 
             // Spawn ASYNC - return immediately
             (async () => {
@@ -1416,7 +1447,7 @@ function createMcpServer() {
           } else {
             // cline driver
             const clinerules = path.join(working_dir, ".clinerules");
-            fs.writeFileSync(clinerules, rules);
+            await fs.promises.writeFile(clinerules, rules);
 
             // Spawn ASYNC - return immediately
             (async () => {
@@ -1425,7 +1456,7 @@ function createMcpServer() {
                 console.log(`[code_task] Starting task ${taskId}. Memory: ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB`);
 
                 const proc = spawn(
-                  "/home/david/.npm-local/bin/cline",
+                  `${HOME_DIR}/.npm-local/bin/cline`,
                   ["-y", "--json", "--timeout", String(timeout_seconds), instruction],
                   {
                     cwd: working_dir,
@@ -1492,13 +1523,13 @@ function createMcpServer() {
         }
 
         case "get_task_log": {
-          const { task_id } = args as any;
+          const { task_id } = args as { task_id: string };
           const logs = taskLogs.get(task_id) || [];
           return { content: [{ type: "text", text: JSON.stringify({ task_id, lines: logs }) }] };
         }
 
         case "run_tests": {
-          const { working_dir, test_cmd } = args as any;
+          const { working_dir, test_cmd } = args as { working_dir: string; test_cmd?: string };
           let cmd = test_cmd;
           if (!cmd) {
             try {
@@ -1513,7 +1544,7 @@ function createMcpServer() {
         }
 
         case "run_build": {
-          const { working_dir, build_cmd } = args as any;
+          const { working_dir, build_cmd } = args as { working_dir: string; build_cmd?: string };
           let cmd = build_cmd;
           if (!cmd) {
             try {
@@ -1528,14 +1559,14 @@ function createMcpServer() {
         }
 
         case "get_diff": {
-          const { working_dir, from_ref = "HEAD", to_ref } = args as any;
+          const { working_dir, from_ref = "HEAD", to_ref } = args as { working_dir: string; from_ref?: string; to_ref?: string };
           const diffArgs = to_ref ? `${from_ref} ${to_ref}` : from_ref;
           const r = spawnSync("git", ["diff", ...diffArgs.split(" ")], { cwd: working_dir, encoding: "utf8" });
           return { content: [{ type: "text", text: JSON.stringify({ output: r.stdout + r.stderr, exit_code: r.status ?? -1 }) }] };
         }
 
         case "get_repo_state": {
-          const { working_dir } = args as any;
+          const { working_dir } = args as { working_dir: string };
           const run = (args: string[]) => spawnSync("git", args, { cwd: working_dir, encoding: "utf8" });
 
           const branchR = run(["rev-parse", "--abbrev-ref", "HEAD"]);
@@ -1562,7 +1593,7 @@ function createMcpServer() {
         }
 
         case "cache_read": {
-          const { cache_key } = args as any;
+          const { cache_key } = args as { cache_key: string };
           const dbUrl = process.env.OPS_DB_URL;
           const result = await withDbClient(dbUrl, async (client) => {
             const rowRes = await client.query<{
@@ -1596,7 +1627,13 @@ function createMcpServer() {
         }
 
         case "cache_write": {
-          const { cache_key, source_type, content_hash, source_updated = null, summary } = args as any;
+          const { cache_key, source_type, content_hash, source_updated = null, summary } = args as {
+            cache_key: string;
+            source_type: string;
+            content_hash: string;
+            source_updated?: string | null;
+            summary: string;
+          };
           const dbUrl = process.env.OPS_DB_URL;
           const result = await withDbClient(dbUrl, async (client) => {
             await client.query(
@@ -1618,7 +1655,7 @@ function createMcpServer() {
         }
 
         case "listen_for_approval": {
-          const { session_id, timeout_seconds = 1800 } = args as any;
+          const { session_id, timeout_seconds = 1800 } = args as { session_id: string; timeout_seconds?: number };
           const dbUrl = process.env.OPS_DB_URL;
           const result = await withDbClient(dbUrl, async (client) => {
             const channel = `session:${session_id}`;
@@ -1669,8 +1706,8 @@ function createMcpServer() {
         }
 
         case "git_status": {
-          const { repo } = args as any;
-          const working_dir = `/home/david/${repo}`;
+          const { repo } = args as { repo: string };
+          const working_dir = `${HOME_DIR}/${repo}`;
           const branchR = spawnSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: working_dir, encoding: "utf8" });
           const branch = branchR.stdout.trim();
           const statusR = spawnSync("git", ["status", "--short"], { cwd: working_dir, encoding: "utf8" });
@@ -1693,8 +1730,8 @@ function createMcpServer() {
         }
 
         case "git_checkout": {
-          const { repo, branch, create = false } = args as any;
-          const working_dir = `/home/david/${repo}`;
+          const { repo, branch, create = false } = args as { repo: string; branch: string; create?: boolean };
+          const working_dir = `${HOME_DIR}/${repo}`;
           const gitArgs = create ? ["checkout", "-b", branch] : ["checkout", branch];
           const r = spawnSync("git", gitArgs, { cwd: working_dir, encoding: "utf8" });
           const output = (r.stdout || "") + (r.stderr || "");
@@ -1702,16 +1739,16 @@ function createMcpServer() {
         }
 
         case "git_add": {
-          const { repo, files } = args as any;
-          const working_dir = `/home/david/${repo}`;
+          const { repo, files } = args as { repo: string; files: string[] };
+          const working_dir = `${HOME_DIR}/${repo}`;
           const r = spawnSync("git", ["add", ...files], { cwd: working_dir, encoding: "utf8" });
           const output = (r.stdout || "") + (r.stderr || "");
           return { content: [{ type: "text", text: JSON.stringify({ success: r.status === 0, output, exit_code: r.status ?? -1 }) }] };
         }
 
         case "git_commit": {
-          const { repo, message } = args as any;
-          const working_dir = `/home/david/${repo}`;
+          const { repo, message } = args as { repo: string; message: string };
+          const working_dir = `${HOME_DIR}/${repo}`;
           const gitEnv = {
             ...process.env,
             GIT_AUTHOR_NAME: "Dev-Lead Agent",
@@ -1725,8 +1762,8 @@ function createMcpServer() {
         }
 
         case "git_push": {
-          const { repo, branch, force = false } = args as any;
-          const working_dir = `/home/david/${repo}`;
+          const { repo, branch, force = false } = args as { repo: string; branch?: string; force?: boolean };
+          const working_dir = `${HOME_DIR}/${repo}`;
           const gitArgs = ["push"];
           if (force) gitArgs.push("--force");
           gitArgs.push("origin");
@@ -1737,8 +1774,8 @@ function createMcpServer() {
         }
 
         case "git_merge": {
-          const { repo, branch, no_ff = true } = args as any;
-          const working_dir = `/home/david/${repo}`;
+          const { repo, branch, no_ff = true } = args as { repo: string; branch: string; no_ff?: boolean };
+          const working_dir = `${HOME_DIR}/${repo}`;
           const gitArgs = ["merge"];
           if (no_ff) gitArgs.push("--no-ff");
           gitArgs.push(branch);
@@ -1748,8 +1785,8 @@ function createMcpServer() {
         }
 
         case "git_pull": {
-          const { repo } = args as any;
-          const working_dir = `/home/david/${repo}`;
+          const { repo } = args as { repo: string };
+          const working_dir = `${HOME_DIR}/${repo}`;
           const r = spawnSync("git", ["pull", "--rebase", "origin"], { cwd: working_dir, encoding: "utf8" });
           const output = (r.stdout || "") + (r.stderr || "");
           return { content: [{ type: "text", text: JSON.stringify({ success: r.status === 0, output, exit_code: r.status ?? -1 }) }] };
@@ -1760,8 +1797,13 @@ function createMcpServer() {
             message,
             session_id: chatSessionId,
             claude_session_id: existingClaudeSessionId,
-            working_dir: chatWorkingDir = "/home/david/dev-session-app",
-          } = args as any;
+            working_dir: chatWorkingDir = `${HOME_DIR}/dev-session-app`,
+          } = args as {
+            message: string;
+            session_id?: string;
+            claude_session_id?: string;
+            working_dir?: string;
+          };
 
           const dbUrl = process.env.OPS_DB_URL ?? "";
 
@@ -1795,7 +1837,7 @@ function createMcpServer() {
                 if (projRes.rows.length > 0) {
                   const proj = projRes.rows[0];
                   const repo = proj.project_id;
-                  const contextMsg = `You are Claude Code running in an interactive dev session. Project: ${proj.display_name} (${repo}). Path: /home/david/${repo}. Container: ${proj.default_container}. Description: ${proj.description}. Help the developer with code questions, debugging, and changes in this project.`;
+                  const contextMsg = `You are Claude Code running in an interactive dev session. Project: ${proj.display_name} (${repo}). Path: ${HOME_DIR}/${repo}. Container: ${proj.default_container}. Description: ${proj.description}. Help the developer with code questions, debugging, and changes in this project.`;
 
                   // Save context to session_messages so UI can optionally hide it
                   const bootstrapInsert = await bootstrapClient.query<{ message_id: string; created_at: string }>(
@@ -1816,7 +1858,7 @@ function createMcpServer() {
 
                   // Write temp file for --append-system-prompt-file
                   systemContextFile = `/tmp/container-mcp-ctx-${chatSessionId}.md`;
-                  fs.writeFileSync(systemContextFile, contextMsg);
+                  await fs.promises.writeFile(systemContextFile, contextMsg);
                   console.log(`[chat_session] bootstrap context injected for session ${chatSessionId} (project: ${repo})`);
                 }
               }
@@ -2017,7 +2059,7 @@ function createMcpServer() {
 
         case "spawn_dev_lead": {
           // POST to gateway /tools/invoke (async — returns immediately with childSessionKey)
-          const { session_id: sessionId } = args as any;
+          const { session_id: sessionId } = args as { session_id: string };
           const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
           const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
 
@@ -2039,11 +2081,12 @@ function createMcpServer() {
               return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: `Gateway ${resp.status}: ${text}` }) }] };
             }
 
-            const parsed = await resp.json().catch(() => ({})) as any;
+            const parsed = await resp.json().catch(() => ({})) as { childSessionKey?: string; session_key?: string };
             const childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
             return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: sessionId, childSessionKey }) }] };
-          } catch (fetchErr: any) {
-            return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: fetchErr.message }) }] };
+          } catch (fetchErr: unknown) {
+            const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+            return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: msg }) }] };
           }
         }
 
@@ -2055,7 +2098,14 @@ function createMcpServer() {
             task_brief,
             slack_thread_url,
             jira_keys,
-          } = args as any;
+          } = args as {
+            title: string;
+            repo: string;
+            container?: string;
+            task_brief: string;
+            slack_thread_url?: string;
+            jira_keys?: string;
+          };
 
           const dbUrl = process.env.OPS_DB_URL;
           if (!dbUrl) {
@@ -2134,12 +2184,12 @@ function createMcpServer() {
                 const text = await resp.text();
                 spawnError = `Gateway ${resp.status}: ${text}`;
               } else {
-                const parsed = await resp.json().catch(() => ({})) as any;
+                const parsed = await resp.json().catch(() => ({})) as { childSessionKey?: string; session_key?: string };
                 childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
                 spawnOk = true;
               }
-            } catch (fetchErr: any) {
-              spawnError = fetchErr.message;
+            } catch (fetchErr: unknown) {
+              spawnError = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
             }
 
             if (!spawnOk) {
@@ -2161,7 +2211,7 @@ function createMcpServer() {
         }
 
         case "warm_cache_for_repos": {
-          const { repos: targetRepos } = args as any;
+          const { repos: targetRepos } = args as { repos?: string[] };
           const repoList: string[] = Array.isArray(targetRepos) && targetRepos.length > 0
             ? targetRepos
             : ["dev-session-app", "container-mcp", "ash-dashboard"];
@@ -2202,7 +2252,13 @@ function createMcpServer() {
         }
 
         case "post_message": {
-          const { session_id: pmSessionId, role: pmRole = "dev_lead", content: pmContent, message_type: pmMsgType = "status_change", metadata: pmMetadata } = args as any;
+          const { session_id: pmSessionId, role: pmRole = "dev_lead", content: pmContent, message_type: pmMsgType = "status_change", metadata: pmMetadata } = args as {
+            session_id: string;
+            role?: string;
+            content: string;
+            message_type?: string;
+            metadata?: Record<string, unknown>;
+          };
           const dbUrl = process.env.OPS_DB_URL;
           if (!dbUrl) return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "OPS_DB_URL not set" }) }] };
           const row = await withDbClient(dbUrl, async (client) => {
@@ -2243,8 +2299,9 @@ function createMcpServer() {
         default:
           throw new Error(`Unknown tool: ${name}`);
       }
-    } catch (err: any) {
-      return { content: [{ type: "text", text: JSON.stringify({ error: err.message }) }], isError: true };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { content: [{ type: "text", text: JSON.stringify({ error: msg }) }], isError: true };
     }
   });
 
@@ -2318,15 +2375,23 @@ app.post("/session/:sessionId/message", async (req, res) => {
       return inserted;
     });
     res.json({ ok: true, message_id: row?.message_id });
-  } catch (e: any) {
-    console.error(`[/session/:id/message] Error: ${e.message}`);
-    res.status(500).json({ ok: false, error: e.message });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(`[/session/:id/message] Error: ${msg}`);
+    res.status(500).json({ ok: false, error: "Internal server error" });
   }
 });
 
 // ─── Background LISTEN chain (ZI-18776) ───────────────────────────────────
 // Active reconnect-safe Postgres LISTEN: task_brief insert → spawn dev-lead via gateway.
 // Replaces the passive instrumentation.ts chain that had zero reconnect logic.
+
+// Exponential backoff state for reconnect: 10s, 20s, 40s, ..., max 5 min
+let _listenChainAttempt = 0;
+
+function listenChainRetryDelay(): number {
+  return Math.min(10_000 * Math.pow(2, _listenChainAttempt), 300_000);
+}
 
 async function startListenChain(): Promise<void> {
   const dbUrl = process.env.OPS_DB_URL;
@@ -2343,6 +2408,7 @@ async function startListenChain(): Promise<void> {
     await listenClient.connect();
     await listenClient.query("LISTEN session_messages");
     await listenClient.query("LISTEN session_events");
+    _listenChainAttempt = 0; // reset backoff on successful connect
     console.log("[listen-chain] Postgres LISTEN session_messages + session_events started");
 
     listenClient.on("notification", (msg) => {
@@ -2482,7 +2548,7 @@ async function startListenChain(): Promise<void> {
           // ── checkpoint (coding_agent) → dev-lead close-out ────────────
           if (isCheckpoint) {
             console.log(`[listen-chain] checkpoint from coding_agent for ${sessionId} — spawning dev-lead close-out`);
-            const checkpointContent = (payload as any).content ?? "(no checkpoint content)";
+            const checkpointContent = (payload as { content?: string }).content ?? "(no checkpoint content)";
             try {
               const task = await buildCloseoutMessage(sessionId, checkpointContent, dbUrl);
               const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
@@ -2494,14 +2560,14 @@ async function startListenChain(): Promise<void> {
                 }),
               });
               if (resp.ok) {
-                const parsed = await resp.json().catch(() => ({})) as any;
+                const parsed = await resp.json().catch(() => ({})) as { childSessionKey?: string };
                 console.log(`[listen-chain] dev-lead close-out spawned for ${sessionId}, key=${parsed?.childSessionKey ?? "n/a"}`);
               } else {
                 const text = await resp.text().catch(() => "");
                 console.warn(`[listen-chain] dev-lead spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
               }
-            } catch (e: any) {
-              console.error(`[listen-chain] close-out spawn error for ${sessionId}:`, e.message);
+            } catch (e: unknown) {
+              console.error(`[listen-chain] close-out spawn error for ${sessionId}:`, e instanceof Error ? e.message : String(e));
             }
             return;
           }
@@ -2519,30 +2585,34 @@ async function startListenChain(): Promise<void> {
                 }),
               });
               if (resp.ok) {
-                const parsed = await resp.json().catch(() => ({})) as any;
+                const parsed = await resp.json().catch(() => ({})) as { childSessionKey?: string };
                 console.log(`[listen-chain] dev-lead spawned for chat ${sessionId}, key=${parsed?.childSessionKey ?? "n/a"}`);
               } else {
                 const text = await resp.text().catch(() => "");
                 console.warn(`[listen-chain] dev-lead chat spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
               }
-            } catch (e: any) {
-              console.error(`[listen-chain] chat spawn error for ${sessionId}:`, e.message);
+            } catch (e: unknown) {
+              console.error(`[listen-chain] chat spawn error for ${sessionId}:`, e instanceof Error ? e.message : String(e));
             }
           }
-        } catch (err: any) {
-          console.error("[listen-chain] notification handler error:", err.message);
+        } catch (err: unknown) {
+          console.error("[listen-chain] notification handler error:", err instanceof Error ? err.message : String(err));
         }
       })();
     });
 
     listenClient.on("error", (err: Error) => {
-      console.error("[listen-chain] Postgres LISTEN client error:", err.message);
-      // Reconnect after 10s (fixes the zero-reconnect failure mode)
-      setTimeout(() => { void startListenChain(); }, 10_000);
+      _listenChainAttempt++;
+      const delay = listenChainRetryDelay();
+      console.error(`[listen-chain] Postgres LISTEN client error: ${err.message} — retrying in ${delay / 1000}s (attempt ${_listenChainAttempt})`);
+      setTimeout(() => { void startListenChain(); }, delay);
     });
-  } catch (err: any) {
-    console.error("[listen-chain] failed to start LISTEN:", err.message);
-    setTimeout(() => { void startListenChain(); }, 10_000);
+  } catch (err: unknown) {
+    _listenChainAttempt++;
+    const delay = listenChainRetryDelay();
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[listen-chain] failed to start LISTEN: ${msg} — retrying in ${delay / 1000}s (attempt ${_listenChainAttempt})`);
+    setTimeout(() => { void startListenChain(); }, delay);
     return;
   }
 
