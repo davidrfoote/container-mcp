@@ -165,17 +165,21 @@ export async function buildExecutionInstruction(sessionId: string, dbUrl: string
     `### Instructions`,
     `1. Create a feature branch: \`git checkout -b feature/${primaryJira || "dev"}-<short-description>\``,
     `2. Implement the approved plan`,
-    `3. Commit with message: "${primaryJira ? primaryJira + ": " : ""}<description>"`,
-    `4. When fully done, post a checkpoint via:`,
+    `3. Run the build and fix any errors: \`${data.session?.build_cmd ?? "npm run build"}\``,
+    `4. Commit with message: "${primaryJira ? primaryJira + ": " : ""}<description>"`,
+    `5. Push the feature branch: \`git push origin feature/${primaryJira || "dev"}-<short-description>\``,
+    `6. When fully done, post a checkpoint via (include branch name and git SHA):`,
     ``,
     `\`\`\`bash`,
-    `SUMMARY="<what was changed, which files, git SHA>"`,
+    `BRANCH="feature/${primaryJira || "dev"}-<short-description>"`,
+    `SHA=$(git rev-parse HEAD)`,
+    `SUMMARY="<what was changed, which files>. Branch: $BRANCH. SHA: $SHA"`,
     `curl -s -X POST http://localhost:${PORT}/session/${sessionId}/message \\`,
     `  -H "Content-Type: application/json" \\`,
     `  -d "{\\"role\\":\\"coding_agent\\",\\"message_type\\":\\"checkpoint\\",\\"content\\":\\"$SUMMARY\\"}"`,
     `\`\`\``,
     ``,
-    `5. Exit after posting the checkpoint.`,
+    `7. Exit after posting the checkpoint.`,
   ].filter(Boolean).join("\n");
 
   return { instruction, workingDir, resumeClaudeSessionId };
@@ -213,7 +217,7 @@ export async function buildCloseoutMessage(sessionId: string, checkpointContent:
       ``,
       `You are dev-lead. The coding agent has finished. Your job is close-out only.`,
       `Read /home/openclaw/agents/dev-lead/AGENTS.md for the full procedure.`,
-      `Steps: verify git SHA → merge to main → deploy → Jira to Done → WIP Confluence page → mark session completed → notify Ash.`,
+      `Steps: verify git SHA → push feature branch → create PR via Atlassian Bitbucket MCP → Jira to In Review → WIP Confluence page → mark session pending_review → notify Ash with PR link.`,
     ].join("\n");
   } catch {
     return fallback;
