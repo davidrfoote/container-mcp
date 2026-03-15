@@ -72,8 +72,9 @@ app.post("/session/:sessionId/message", async (req, res) => {
         res.json({ ok: true, message_id: row?.message_id });
     }
     catch (e) {
-        console.error(`[/session/:id/message] Error: ${e.message}`);
-        res.status(500).json({ ok: false, error: e.message });
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error(`[/session/:id/message] Error: ${msg}`);
+        res.status(500).json({ ok: false, error: "Internal server error" });
     }
 });
 // ─── Start ─────────────────────────────────────────────────────────────────
