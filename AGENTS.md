@@ -61,25 +61,28 @@ fi
 
 > **Rule:** NEVER post completion unless the SHA is confirmed in `/home/openclaw/apps/<PROJECT>` git log.
 
-### Step 3 — Merge to main (if not already merged)
+### Step 3 — Push branch + Create PR
 
-Use container-mcp git tools:
-```
-mcporter call container-mcp.git_status '{"repo":"<PROJECT>"}'
-mcporter call container-mcp.git_checkout '{"repo":"<PROJECT>","branch":"main"}'
-mcporter call container-mcp.git_merge '{"repo":"<PROJECT>","branch":"feature/<branch>","no_ff":true}'
-mcporter call container-mcp.git_push '{"repo":"<PROJECT>"}'
-```
-
-### Step 4 — Deploy
-
+Push the feature branch:
 ```bash
-mcporter call container-mcp.deploy_project --project_id "<PROJECT>" --session_id "$SESSION_ID"
+mcporter call container-mcp.git_push '{"repo":"<PROJECT>","branch":"feature/<branch>"}'
 ```
 
-This reads build_cmd/deploy_cmd/smoke_url from the projects table, runs build → deploy → smoke test with 12 retries.
+Create a PR via Atlassian Bitbucket MCP:
+```
+mcporter call atlassian.create_pull_request \
+  --workspace "zennya" \
+  --repository "<PROJECT>" \
+  --title "ZI-XXXX: <one-line summary>" \
+  --description "Session: https://dev-sessions.ash.zennya.app/sessions/$SESSION_ID\nJira: <JIRA_KEYS>" \
+  --source_branch "feature/<branch>" \
+  --destination_branch "main" \
+  --close_source_branch true
+```
 
-### Step 5 — Transition Jira to Done
+Save the returned PR URL as `$PR_URL` for subsequent steps.
+
+### Step 4 — Transition Jira to In Review
 
 ```python
 import os, requests
@@ -92,43 +95,43 @@ for key in '<JIRA_KEYS>'.split(','):
     key = key.strip()
     if not key: continue
     r = requests.post(f'{base}/rest/api/2/issue/{key}/transitions',
-        json={'transition': {'id': '31'}}, auth=auth)
+        json={'transition': {'id': '21'}}, auth=auth)
     assert r.status_code == 204, f"Transition failed: {r.status_code} {r.text}"
     requests.post(f'{base}/rest/api/2/issue/{key}/comment',
-        json={'body': f'Completed in dev session {os.environ.get("SESSION_ID","?")}. Deployed to prod.'}, auth=auth)
-    print(f'{key} → Done')
+        json={'body': f'PR created for dev session {os.environ.get("SESSION_ID","?")}. PR: {os.environ.get("PR_URL","?")}'}, auth=auth)
+    print(f'{key} → In Review')
 ```
 
-### Step 6 — Create Confluence WIP page
+### Step 5 — Create Confluence WIP page
 
 ```bash
 mcporter call atlassian.confluence_create_page \
   --space_key ZAI \
-  --title "Completed: $SESSION_ID - <one-line summary>" \
+  --title "In Review: $SESSION_ID - <one-line summary>" \
   --parent_id "<confluence_wip_id from projects table>" \
-  --body "<p>Session: <a href='https://dev-sessions.ash.zennya.app/sessions/$SESSION_ID'>$SESSION_ID</a></p><p>Jira: <JIRA_KEYS></p><p>Status: Completed</p><p>Checkpoint: <CHECKPOINT summary></p>"
+  --body "<p>Session: <a href='https://dev-sessions.ash.zennya.app/sessions/$SESSION_ID'>$SESSION_ID</a></p><p>Jira: <JIRA_KEYS></p><p>Status: In Review</p><p>PR: $PR_URL</p><p>Checkpoint: <CHECKPOINT summary></p>"
 ```
 
-### Step 7 — Mark session completed in ops-db
+### Step 6 — Mark session pending_review in ops-db
 
 ```bash
 OPS_DB=$(PATH="/home/openclaw/.local/bin:$PATH" docker ps -q -f name=prod_ops-db | head -1)
-echo "UPDATE sessions SET status='completed', completed_at=now(), updated_at=now() WHERE session_id='$SESSION_ID';" \
+echo "UPDATE sessions SET status='pending_review', updated_at=now() WHERE session_id='$SESSION_ID';" \
   | PATH="/home/openclaw/.local/bin:$PATH" docker exec -i $OPS_DB psql -U ops -d ops
 ```
 
-### Step 8 — Post SESSION_COMPLETE checkpoint
+### Step 7 — Post SESSION_PENDING_REVIEW checkpoint
 
 ```bash
-mcporter call container-mcp.post_message "{\"session_id\":\"$SESSION_ID\",\"role\":\"dev_lead\",\"message_type\":\"checkpoint\",\"content\":\"SESSION_COMPLETE: $SESSION_ID deployed and verified. Jira closed.\"}"
+mcporter call container-mcp.post_message "{\"session_id\":\"$SESSION_ID\",\"role\":\"dev_lead\",\"message_type\":\"checkpoint\",\"content\":\"SESSION_PENDING_REVIEW: PR created at $PR_URL. Awaiting merge.\"}"
 ```
 
 **Note:** Use `role: "dev_lead"` here so the listen-chain does NOT re-trigger (it only triggers on `role: "coding_agent"` checkpoints).
 
-### Step 9 — Notify Ash
+### Step 8 — Notify Ash
 
 ```bash
-openclaw slack send -c D0AHM734G1X "Dev-lead done: <one-line summary>. Session: https://dev-sessions.ash.zennya.app/sessions/$SESSION_ID"
+openclaw slack send -c D0AHM734G1X "Dev-lead done: PR ready for review. PR: $PR_URL. Session: https://dev-sessions.ash.zennya.app/sessions/$SESSION_ID"
 ```
 
 ---
@@ -151,8 +154,7 @@ Message types:
 
 - **Never code** — the CLI coding agent handles all code changes
 - **Never skip SHA verification** — silent push failures happen; always confirm
-- **Never mark done without verifying** deploy succeeded (smoke test passed)
-- **Never commit to main directly** — merge from feature branch only
+- **Never merge directly to main** — create a PR instead
 - **Never post `role: "coding_agent"` checkpoints** — that would re-trigger the pipeline
 
 ---
@@ -161,7 +163,17 @@ Message types:
 
 ```
 mcporter call container-mcp.git_status   '{"repo":"<PROJECT>"}'
-mcporter call container-mcp.git_checkout '{"repo":"<PROJECT>","branch":"main"}'
-mcporter call container-mcp.git_merge    '{"repo":"<PROJECT>","branch":"feature/<branch>","no_ff":true}'
-mcporter call container-mcp.git_push     '{"repo":"<PROJECT>"}'
+mcporter call container-mcp.git_push     '{"repo":"<PROJECT>","branch":"feature/<branch>"}'
+```
+
+Create PRs via Atlassian Bitbucket MCP:
+```
+mcporter call atlassian.create_pull_request \
+  --workspace "zennya" \
+  --repository "<PROJECT>" \
+  --title "ZI-XXXX: <one-line summary>" \
+  --description "..." \
+  --source_branch "feature/<branch>" \
+  --destination_branch "main" \
+  --close_source_branch true
 ```
