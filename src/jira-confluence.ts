@@ -172,6 +172,30 @@ export async function fetchConfluencePage(pageId: string): Promise<{ versionNumb
   }
 }
 
+export async function fetchConfluenceChildPages(parentId: string): Promise<{ id: string; title: string; bodyHtml: string }[]> {
+  try {
+    const baseUrl = (process.env.JIRA_URL || "https://zennya.atlassian.net").replace(/\/$/, "");
+    const url = `${baseUrl}/wiki/rest/api/content/${encodeURIComponent(parentId)}/child/page?expand=body.storage&limit=25`;
+    if (!url.startsWith('https://')) throw new Error(`Invalid Confluence URL: ${url}`);
+    const headers = await jiraAuthHeaders();
+    const body = await httpGet(url, headers);
+    const data = JSON.parse(body);
+    const results: { id: string; title: string; bodyHtml: string }[] = [];
+    for (const child of (data.results ?? [])) {
+      results.push({
+        id: child.id ?? "",
+        title: child.title ?? "",
+        bodyHtml: child.body?.storage?.value ?? "",
+      });
+    }
+    console.log(`[fetchConfluenceChildPages] Fetched ${results.length} child pages for parentId=${parentId}`);
+    return results;
+  } catch (err) {
+    console.error(`[fetchConfluenceChildPages] Failed for parentId=${parentId}: ${err}`);
+    return [];
+  }
+}
+
 export function stripHtml(html: string): string {
   return html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 }
@@ -240,13 +264,41 @@ export async function populateCacheForProject(
     }
 
     if (confluenceRootId && typeof confluenceRootId === 'string' && confluenceRootId.trim() !== '') {
-      console.log(`[populateCacheForProject] Pushing task: fetchConfluencePage(${confluenceRootId})`);
+      console.log(`[populateCacheForProject] Pushing task: fetchConfluencePage+children(${confluenceRootId})`);
       tasks.push((async () => {
         try {
           console.log(`[populateCacheForProject] About to fetch Confluence page: ${confluenceRootId}`);
-          const page = await fetchConfluencePage(confluenceRootId);
-          const summary = stripHtml(page.bodyHtml).slice(0, 2000);
-          const contentHash = String(page.versionNumber || 'unknown');
+          const [page, children] = await Promise.all([
+            fetchConfluencePage(confluenceRootId),
+            fetchConfluenceChildPages(confluenceRootId),
+          ]);
+
+          // Build combined summary: root page + child pages
+          const rootText = stripHtml(page.bodyHtml).trim();
+          const parts: string[] = [];
+          if (rootText) parts.push(rootText);
+
+          // Budget: 8000 chars total, reserve space for child pages
+          const charBudget = 8000;
+          let used = parts.join("").length;
+          for (const child of children) {
+            const childText = stripHtml(child.bodyHtml).trim();
+            if (!childText) continue;
+            const section = `\n\n## ${child.title}\n${childText}`;
+            if (used + section.length > charBudget) {
+              // Add truncated version if there's room for at least the heading + 200 chars
+              const remaining = charBudget - used;
+              if (remaining > child.title.length + 210) {
+                parts.push(`\n\n## ${child.title}\n${childText.slice(0, remaining - child.title.length - 10)}…`);
+              }
+              break;
+            }
+            parts.push(section);
+            used += section.length;
+          }
+
+          const summary = parts.join("");
+          const contentHash = String(page.versionNumber || 'unknown') + ':' + children.length;
           await writeCacheEntry(
             dbUrl,
             `confluence:${confluenceRootId}`,
