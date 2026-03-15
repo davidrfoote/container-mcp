@@ -698,44 +698,88 @@ async function buildCloseoutMessage(sessionId: string, checkpointContent: string
 
 // ─── bootstrapSession helpers ───────────────────────────────────────────────
 
-async function fuzzyMatchProject(
+/**
+ * Resolve a project by exact match on project_id/project_hint.
+ * Returns the matched project_id, or null + full project list for the caller to choose/create.
+ */
+async function resolveProject(
   dbUrl: string,
-  userRequest: string,
+  projectId?: string,
   projectHint?: string
-): Promise<string | null> {
+): Promise<{
+  project_id: string | null;
+  available_projects: Array<{ project_id: string; display_name: string | null; description: string | null }>;
+}> {
   return withDbClient(dbUrl, async (client) => {
     const res = await client.query<{
       project_id: string;
       display_name: string | null;
       description: string | null;
-    }>(`SELECT project_id, display_name, description FROM projects`);
+    }>(`SELECT project_id, display_name, description FROM projects ORDER BY updated_at DESC`);
 
-    const words = userRequest.toLowerCase().split(/\W+/).filter((w) => w.length > 2);
-    const hint = projectHint?.toLowerCase();
+    const available_projects = res.rows;
 
-    let bestMatch: string | null = null;
-    let bestScore = 0;
+    // 1. Exact match on explicit project_id
+    if (projectId) {
+      const exact = available_projects.find((r) => r.project_id === projectId);
+      if (exact) return { project_id: exact.project_id, available_projects };
+    }
 
-    for (const row of res.rows) {
-      const id = row.project_id.toLowerCase();
-      const name = (row.display_name ?? "").toLowerCase();
-      const desc = (row.description ?? "").toLowerCase();
+    // 2. Exact match on project_hint (case-insensitive)
+    if (projectHint) {
+      const hint = projectHint.toLowerCase();
+      const match = available_projects.find(
+        (r) => r.project_id.toLowerCase() === hint || (r.display_name ?? "").toLowerCase() === hint
+      );
+      if (match) return { project_id: match.project_id, available_projects };
+    }
 
-      let score = 0;
-      if (hint && (id.includes(hint) || name.includes(hint))) score += 10;
-      for (const word of words) {
-        if (id.includes(word)) score += 3;
-        if (name.includes(word)) score += 2;
-        if (desc.includes(word)) score += 1;
-      }
+    // 3. No match — return null + list for the caller to decide
+    return { project_id: null, available_projects };
+  });
+}
 
-      if (score > bestScore) {
-        bestScore = score;
-        bestMatch = row.project_id;
+/**
+ * Auto-create a project row from caller-provided details.
+ * The calling LLM is responsible for deriving project_id/display_name/description.
+ */
+async function ensureProject(
+  dbUrl: string,
+  projectId: string,
+  displayName?: string,
+  description?: string
+): Promise<void> {
+  await withDbClient(dbUrl, async (client) => {
+    // Check candidate directories for auto-detection
+    let workingDir: string | null = null;
+    for (const candidate of [`/home/david/${projectId}`, `/home/openclaw/apps/${projectId}`, `/opt/${projectId}`]) {
+      if (fs.existsSync(candidate)) { workingDir = candidate; break; }
+    }
+
+    let buildCmd: string | null = null;
+    let deployCmd: string | null = null;
+    if (workingDir) {
+      if (fs.existsSync(path.join(workingDir, "swarm.yml"))) {
+        buildCmd = `cd ${workingDir} && docker build -t ${projectId}:latest .`;
+        deployCmd = `docker stack deploy -c ${workingDir}/swarm.yml ${projectId}`;
+      } else if (fs.existsSync(path.join(workingDir, "Dockerfile"))) {
+        buildCmd = `cd ${workingDir} && docker build -t ${projectId}:latest .`;
+        deployCmd = `docker service update --image ${projectId}:latest prod_${projectId} || docker service update --image ${projectId}:latest ${projectId}`;
+      } else if (fs.existsSync(path.join(workingDir, "package.json"))) {
+        buildCmd = `cd ${workingDir} && npm install && npm run build`;
+        deployCmd = `pkill -f "node dist/index.js" 2>/dev/null || true; nohup node ${workingDir}/dist/index.js > /tmp/${projectId}.log 2>&1 &`;
       }
     }
 
-    return bestScore > 0 ? bestMatch : null;
+    await client.query(
+      `INSERT INTO projects (project_id, display_name, description, working_dir, default_container, build_cmd, deploy_cmd, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now())
+       ON CONFLICT (project_id) DO UPDATE SET
+         display_name = COALESCE(EXCLUDED.display_name, projects.display_name),
+         description = COALESCE(EXCLUDED.description, projects.description),
+         updated_at = now()`,
+      [projectId, displayName || null, description || null, workingDir, "dev-david", buildCmd, deployCmd]
+    );
   });
 }
 
@@ -857,20 +901,49 @@ async function postToFeed(sessionId: string | undefined, dbUrl: string | undefin
 export async function bootstrapSession(params: {
   user_request: string;
   user_id: string;
+  project_id?: string;
   project_hint?: string;
-}): Promise<{ ok: boolean; session_id?: string; session_url?: string; error?: string }> {
-  const { user_request, user_id, project_hint } = params;
+  display_name?: string;
+  description?: string;
+}): Promise<{
+  ok: boolean;
+  session_id?: string;
+  session_url?: string;
+  error?: string;
+  needs_project?: boolean;
+  available_projects?: Array<{ project_id: string; display_name: string | null; description: string | null }>;
+}> {
+  const { user_request, user_id, project_id, project_hint, display_name, description } = params;
   const dbUrl = process.env.OPS_DB_URL;
   if (!dbUrl) return { ok: false, error: "OPS_DB_URL not set" };
 
-  // Step 1: Fuzzy match project_id
+  // Step 1: Resolve project — exact match on project_id or project_hint
   let projectId: string | null = null;
   try {
-    projectId = await fuzzyMatchProject(dbUrl, user_request, project_hint);
+    const resolved = await resolveProject(dbUrl, project_id, project_hint);
+    projectId = resolved.project_id;
+
+    if (!projectId) {
+      // If caller provided an explicit project_id, auto-create it
+      if (project_id) {
+        console.log(`[bootstrapSession] Auto-creating project: ${project_id}`);
+        await ensureProject(dbUrl, project_id, display_name, description);
+        projectId = project_id;
+      } else {
+        // No match, no explicit ID — return project list for the caller to decide
+        console.log(`[bootstrapSession] No project matched, returning ${resolved.available_projects.length} projects for caller`);
+        return {
+          ok: false,
+          needs_project: true,
+          available_projects: resolved.available_projects,
+          error: `Could not match a project. Please call again with an explicit project_id (pick from available_projects, or provide a new one to auto-create it).`,
+        };
+      }
+    }
+    console.log(`[bootstrapSession] resolved project: ${projectId}`);
   } catch (e: any) {
     return { ok: false, error: `Project lookup failed: ${e.message}` };
   }
-  if (!projectId) return { ok: false, error: "Could not match any project from request" };
 
   // Steps 2-3: Check for existing active session
   try {
@@ -1441,7 +1514,7 @@ function createMcpServer() {
       },
       {
         name: "bootstrap_session",
-        description: "Orchestrate a new dev session end-to-end: fuzzy-match project from request text, check for existing active session, warm Jira/Confluence cache, create/find Jira issue, compose task brief, create session record, and launch BOOTSTRAP planning pass via Claude Code CLI.",
+        description: "Orchestrate a new dev session end-to-end. Resolves the project (exact match on project_id or project_hint), checks for existing active session, warms Jira/Confluence cache, creates/finds Jira issue, composes task brief, creates session record, and launches BOOTSTRAP planning pass via Claude Code CLI. If no project matches and no project_id is provided, returns needs_project=true with available_projects — the caller should then pick or create a project_id and call again.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1453,9 +1526,21 @@ function createMcpServer() {
               type: "string",
               description: "User identifier (e.g. Slack user ID or email)",
             },
+            project_id: {
+              type: "string",
+              description: "Explicit project_id. If it matches an existing project, that project is used. If it doesn't exist, a new project is auto-created with the given display_name/description. If omitted, the server tries to match from project_hint.",
+            },
             project_hint: {
               type: "string",
-              description: "Optional project_id hint to bias fuzzy matching",
+              description: "Optional project_id or display_name to match against existing projects (exact, case-insensitive). Ignored if project_id is provided.",
+            },
+            display_name: {
+              type: "string",
+              description: "Display name for auto-created projects (e.g. 'Ash Dashboard'). Only used when project_id is new.",
+            },
+            description: {
+              type: "string",
+              description: "Description for auto-created projects. Only used when project_id is new.",
             },
           },
           required: ["user_request", "user_id"],
@@ -2696,12 +2781,15 @@ function createMcpServer() {
         }
 
         case "bootstrap_session": {
-          const { user_request, user_id, project_hint } = args as {
+          const { user_request, user_id, project_id: bsProjectId, project_hint, display_name: bsDisplayName, description: bsDescription } = args as {
             user_request: string;
             user_id: string;
+            project_id?: string;
             project_hint?: string;
+            display_name?: string;
+            description?: string;
           };
-          const result = await bootstrapSession({ user_request, user_id, project_hint });
+          const result = await bootstrapSession({ user_request, user_id, project_id: bsProjectId, project_hint, display_name: bsDisplayName, description: bsDescription });
           return { content: [{ type: "text", text: JSON.stringify(result) }] };
         }
 
