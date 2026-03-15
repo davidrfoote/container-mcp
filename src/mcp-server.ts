@@ -473,6 +473,10 @@ export function createMcpServer() {
               type: "string",
               description: "Description for auto-created projects. Only used when project_id is new.",
             },
+            slack_thread_url: {
+              type: "string",
+              description: "Slack thread URL to associate with the session (optional)",
+            },
           },
           required: ["user_request", "user_id"],
         },
@@ -1624,15 +1628,16 @@ export function createMcpServer() {
         }
 
         case "bootstrap_session": {
-          const { user_request, user_id, project_id: bsProjectId, project_hint, display_name: bsDisplayName, description: bsDescription } = args as {
+          const { user_request, user_id, project_id: bsProjectId, project_hint, display_name: bsDisplayName, description: bsDescription, slack_thread_url: bsSlackThreadUrl } = args as {
             user_request: string;
             user_id: string;
             project_id?: string;
             project_hint?: string;
             display_name?: string;
             description?: string;
+            slack_thread_url?: string;
           };
-          const result = await bootstrapSession({ user_request, user_id, project_id: bsProjectId, project_hint, display_name: bsDisplayName, description: bsDescription });
+          const result = await bootstrapSession({ user_request, user_id, project_id: bsProjectId, project_hint, display_name: bsDisplayName, description: bsDescription, slack_thread_url: bsSlackThreadUrl });
           return { content: [{ type: "text", text: JSON.stringify(result) }] };
         }
 

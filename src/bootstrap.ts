@@ -6,6 +6,12 @@ import { postToFeed } from "./feed.js";
 import { spawnCodeTask } from "./code-task.js";
 import { populateCacheForProject, searchJiraForIssue, createJiraTaskIssue } from "./jira-confluence.js";
 
+const SLACK_USER_MAP: Record<string, string> = {
+  U097Q46UX: "David",
+  U160P0C7M: "Shane",
+  U1AT2UF9V: "Jan",
+};
+
 // ─── Instruction builders ──────────────────────────────────────────────────
 
 export async function buildBootstrapInstruction(sessionId: string, dbUrl: string): Promise<{ instruction: string; workingDir: string; allowedTools: string[] }> {
@@ -298,6 +304,7 @@ export async function bootstrapSession(params: {
   project_hint?: string;
   display_name?: string;
   description?: string;
+  slack_thread_url?: string;
 }): Promise<{
   ok: boolean;
   session_id?: string;
@@ -306,7 +313,9 @@ export async function bootstrapSession(params: {
   needs_project?: boolean;
   available_projects?: Array<{ project_id: string; display_name: string | null; description: string | null }>;
 }> {
-  const { user_request, user_id, project_id, project_hint, display_name, description } = params;
+  const { user_request, user_id, project_id, project_hint, display_name, description, slack_thread_url } = params;
+  const triggeredByName = SLACK_USER_MAP[user_id] ?? user_id;
+  const triggeredBySlackUserId = user_id;
   const dbUrl = process.env.OPS_DB_URL;
   if (!dbUrl) return { ok: false, error: "OPS_DB_URL not set" };
 
@@ -422,10 +431,11 @@ export async function bootstrapSession(params: {
   try {
     await withDbClient(dbUrl, async (client) => {
       await client.query(
-        `INSERT INTO sessions (session_id, project_id, container, repo, status, session_type, title, prompt_preview, jira_issue_keys, user_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'pending', 'dev', $5, $6, $7::text[], $8, now(), now())`,
+        `INSERT INTO sessions (session_id, project_id, container, repo, status, session_type, title, prompt_preview, jira_issue_keys, user_id, triggered_by_name, triggered_by_slack_user_id, slack_thread_url, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'pending', 'dev', $5, $6, $7::text[], $8, $9, $10, $11, now(), now())`,
         [sessionId, projectId, projConfig!.default_container ?? "dev-david", projectId,
-          user_request.slice(0, 100), taskBrief.slice(0, 500), jiraKeysArr, user_id]
+          user_request.slice(0, 100), taskBrief.slice(0, 500), jiraKeysArr, user_id,
+          triggeredByName, triggeredBySlackUserId, slack_thread_url ?? null]
       );
       const msgId = `msg-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
       await client.query(
