@@ -90,6 +90,22 @@ function spawnCodeTask(params) {
                 cwd: workingDir, env: process.env, stdio: ["ignore", "pipe", "pipe"],
             });
             const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeoutSeconds * 1000);
+            proc.on("error", (err) => {
+                clearTimeout(timer);
+                try {
+                    fs.unlinkSync(rulesFile);
+                }
+                catch { }
+                const msg = `spawn claude failed: ${err.message}`;
+                console.error(`[spawnCodeTask] spawn error for task ${taskId}: ${msg}`);
+                (0, feed_js_1.postToFeed)(sessionId, dbUrl, `Task ${taskId} spawn error: ${msg}`);
+                if (sessionId && dbUrl) {
+                    void (0, db_js_1.withDbClient)(dbUrl, async (client) => {
+                        await client.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
+               VALUES (gen_random_uuid(), $1, 'system', $2, 'console', now())`, [sessionId, `Backfill BOOTSTRAP failed (spawn error): ${msg}`]);
+                    }).catch(() => { });
+                }
+            });
             proc.stdout.on("data", (chunk) => {
                 const lines = chunk.toString().split("\n");
                 for (const line of lines) {

@@ -347,8 +347,8 @@ async function bootstrapSession(params) {
     const jiraKeysArr = allJiraKeys.length > 0 ? `{${allJiraKeys.join(",")}}` : null;
     try {
         await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-            await client.query(`INSERT INTO sessions (session_id, project_id, container, repo, status, title, prompt_preview, jira_issue_keys, user_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7::text[], $8, now(), now())`, [sessionId, projectId, projConfig.default_container ?? "dev-david", projectId,
+            await client.query(`INSERT INTO sessions (session_id, project_id, container, repo, status, session_type, title, prompt_preview, jira_issue_keys, user_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'pending', 'dev', $5, $6, $7::text[], $8, now(), now())`, [sessionId, projectId, projConfig.default_container ?? "dev-david", projectId,
                 user_request.slice(0, 100), taskBrief.slice(0, 500), jiraKeysArr, user_id]);
             const msgId = `msg-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
             await client.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)

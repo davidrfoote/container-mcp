@@ -116,8 +116,9 @@ async function lookupProject(dbUrl, projectId) {
     });
 }
 async function detectAndRegisterProject(dbUrl, projectId) {
+    const homeDir = process.env.AGENT_HOME_DIR ?? '/home/david';
     const candidateDirs = [
-        `/home/david/${projectId}`,
+        `${homeDir}/${projectId}`,
         `/home/openclaw/apps/${projectId}`,
         `/opt/${projectId}`,
     ];

@@ -422,8 +422,8 @@ export async function bootstrapSession(params: {
   try {
     await withDbClient(dbUrl, async (client) => {
       await client.query(
-        `INSERT INTO sessions (session_id, project_id, container, repo, status, title, prompt_preview, jira_issue_keys, user_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7::text[], $8, now(), now())`,
+        `INSERT INTO sessions (session_id, project_id, container, repo, status, session_type, title, prompt_preview, jira_issue_keys, user_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'pending', 'dev', $5, $6, $7::text[], $8, now(), now())`,
         [sessionId, projectId, projConfig!.default_container ?? "dev-david", projectId,
           user_request.slice(0, 100), taskBrief.slice(0, 500), jiraKeysArr, user_id]
       );
