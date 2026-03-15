@@ -329,6 +329,240 @@ async function populateCacheForProject(dbUrl, jiraKeys, confluenceRootId) {
         throw err;
     }
 }
+// ─── Internal code task spawner ────────────────────────────────────────────
+function spawnCodeTask(params) {
+    const { instruction, workingDir, sessionId, dbUrl, maxTurns = 40, budgetUsd = 8.0, timeoutSeconds = 1200 } = params;
+    const taskId = (0, crypto_1.randomUUID)();
+    taskLogs.set(taskId, []);
+    const log = (line) => taskLogs.get(taskId).push(line);
+    postToFeed(sessionId, dbUrl, `🚀 Starting code task (${taskId})\n\n${instruction.slice(0, 400)}`);
+    (async () => {
+        try {
+            const rulesFile = `/tmp/container-mcp-rules-${taskId}.md`;
+            let rules = "";
+            try {
+                rules += fs.readFileSync("/home/david/.rules/base.md", "utf8") + "\n";
+            }
+            catch { }
+            fs.writeFileSync(rulesFile, rules);
+            const proc = (0, child_process_1.spawn)("claude", [
+                "-p", instruction,
+                "--output-format", "stream-json",
+                "--verbose",
+                "--include-partial-messages",
+                "--append-system-prompt-file", rulesFile,
+                "--permission-mode", "acceptEdits",
+                "--max-turns", String(maxTurns),
+                "--max-budget-usd", String(budgetUsd),
+                "--dangerously-skip-permissions",
+            ], { cwd: workingDir, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+            const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeoutSeconds * 1000);
+            proc.stdout.on("data", (chunk) => {
+                const lines = chunk.toString().split("\n");
+                for (const line of lines) {
+                    if (!line.trim())
+                        continue;
+                    log(line);
+                    try {
+                        const parsed = JSON.parse(line);
+                        if (parsed.type === "result") {
+                            const output = (parsed.result || parsed.output || "");
+                            postToFeed(sessionId, dbUrl, `✅ Task complete\n\n${output.slice(0, 2000)}`);
+                            const usage = parsed.usage;
+                            if (usage && sessionId && dbUrl) {
+                                const inputTokens = usage.input_tokens || 0;
+                                const outputTokens = usage.output_tokens || 0;
+                                const costUsd = (inputTokens / 1_000_000 * 3) + (outputTokens / 1_000_000 * 15);
+                                void withDbClient(dbUrl, async (client) => {
+                                    await client.query(`UPDATE sessions SET token_usage = COALESCE(token_usage, 0) + $1, cost_usd = COALESCE(cost_usd, 0) + $2 WHERE session_id = $3`, [inputTokens + outputTokens, costUsd, sessionId]);
+                                }).catch((err) => console.error("[token-usage] Failed:", err));
+                            }
+                        }
+                        else if (parsed.type === "assistant") {
+                            for (const block of (parsed.message?.content || [])) {
+                                if (block.type === "tool_use") {
+                                    postToFeed(sessionId, dbUrl, `🔧 \`${block.name}\` ${JSON.stringify(block.input || {}).slice(0, 200)}`);
+                                }
+                                else if (block.type === "text" && block.text?.trim() && !parsed.message?.usage) {
+                                    const text = block.text.trim().slice(0, 500);
+                                    if (text.length > 20)
+                                        postToFeed(sessionId, dbUrl, `💭 ${text}`);
+                                }
+                            }
+                        }
+                        else if (parsed.type === "tool_result") {
+                            const resultText = (parsed.content?.[0]?.text || "").slice(0, 300);
+                            if (resultText)
+                                postToFeed(sessionId, dbUrl, `📄 Result: ${resultText}`);
+                        }
+                    }
+                    catch { }
+                }
+            });
+            proc.stderr.on("data", (chunk) => log("[stderr] " + chunk.toString()));
+            proc.on("close", (code) => {
+                clearTimeout(timer);
+                try {
+                    fs.unlinkSync(rulesFile);
+                }
+                catch { }
+                postToFeed(sessionId, dbUrl, `✅ Process ${taskId} exited with code ${code}`);
+            });
+        }
+        catch (err) {
+            console.error(`[spawnCodeTask] Error: ${err.message}`);
+            postToFeed(sessionId, dbUrl, `❌ Task ${taskId} failed to start: ${err.message}`);
+        }
+    })().catch((err) => console.error(`[spawnCodeTask] Unhandled rejection: ${err.message}`));
+    return taskId;
+}
+async function buildBootstrapInstruction(sessionId, dbUrl) {
+    const PORT = process.env.PORT ?? "9000";
+    const data = await withDbClient(dbUrl, async (client) => {
+        const sessionRes = await client.query(`SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.default_container, p.confluence_root_id
+       FROM sessions s LEFT JOIN projects p ON p.project_id = s.project_id
+       WHERE s.session_id = $1`, [sessionId]);
+        const briefRes = await client.query(`SELECT content FROM session_messages WHERE session_id=$1 AND message_type='task_brief' ORDER BY created_at LIMIT 1`, [sessionId]);
+        return { session: sessionRes.rows[0] ?? null, brief: briefRes.rows[0]?.content ?? "(no brief)" };
+    });
+    const projectId = data.session?.project_id ?? "unknown";
+    const jiraKeys = data.session?.jira_issue_keys ?? [];
+    const workingDir = `/home/david/${projectId}`;
+    // Read cache summaries
+    const cacheKeys = [
+        ...(data.session?.confluence_root_id ? [`confluence:${data.session.confluence_root_id}`] : []),
+        ...jiraKeys.map((k) => `jira:${k}`),
+    ];
+    let cacheSummary = "";
+    for (const key of cacheKeys) {
+        try {
+            const row = await withDbClient(dbUrl, async (client) => {
+                const r = await client.query("SELECT summary FROM project_context_cache WHERE cache_key = $1", [key]);
+                return r.rows[0] ?? null;
+            });
+            if (row?.summary)
+                cacheSummary += `\n### ${key}\n${row.summary}\n`;
+        }
+        catch { }
+    }
+    const instruction = [
+        `## BOOTSTRAP PASS — Session ${sessionId}`,
+        ``,
+        `You are a coding agent running a BOOTSTRAP planning pass. Your ONLY job is to read the project, understand the task, and post an implementation plan as an approval_request. Do NOT implement anything yet.`,
+        ``,
+        `### Task Brief`,
+        data.brief,
+        ``,
+        `### Project`,
+        `- project_id: ${projectId}`,
+        `- repo: ${workingDir}`,
+        `- jira: ${jiraKeys.join(", ") || "none"}`,
+        `- build: ${data.session?.build_cmd ?? "none"}`,
+        ``,
+        cacheSummary ? `### Cached Context (Jira/Confluence)\n${cacheSummary}` : "",
+        ``,
+        `### Your Steps`,
+        `1. Explore the codebase at ${workingDir} — read relevant files to understand the current state`,
+        `2. Re-read the task brief and context above`,
+        `3. Write a detailed implementation plan: which files to change, what logic to add/modify`,
+        `4. Classify the complexity: trivial | low | medium | hard`,
+        `5. Post the plan as an approval_request by running this exact curl command (replace placeholders):`,
+        ``,
+        `\`\`\`bash`,
+        `PLAN="<your multi-line plan here — escape double-quotes with \\\\>"`,
+        `COMPLEXITY="medium"  # trivial | low | medium | hard`,
+        `curl -s -X POST http://localhost:${PORT}/session/${sessionId}/message \\`,
+        `  -H "Content-Type: application/json" \\`,
+        `  -d "{\\"role\\":\\"coding_agent\\",\\"message_type\\":\\"approval_request\\",\\"content\\":\\"$PLAN\\",\\"metadata\\":{\\"complexity\\":\\"$COMPLEXITY\\",\\"question\\":\\"Does this plan look good?\\",\\"options\\":[\\"approve\\",\\"reject\\"]}}"`,
+        `\`\`\``,
+        ``,
+        `6. After the curl succeeds, EXIT immediately. Do NOT start coding — wait for approval.`,
+    ].filter(Boolean).join("\n");
+    return { instruction, workingDir };
+}
+async function buildExecutionInstruction(sessionId, dbUrl) {
+    const PORT = process.env.PORT ?? "9000";
+    const data = await withDbClient(dbUrl, async (client) => {
+        const sessionRes = await client.query(`SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.default_container
+       FROM sessions s LEFT JOIN projects p ON p.project_id = s.project_id
+       WHERE s.session_id = $1`, [sessionId]);
+        const planRes = await client.query(`SELECT content FROM session_messages WHERE session_id=$1 AND message_type='approval_request' AND role='coding_agent' ORDER BY created_at DESC LIMIT 1`, [sessionId]);
+        const approvalRes = await client.query(`SELECT content FROM session_messages WHERE session_id=$1 AND message_type='approval_response' ORDER BY created_at DESC LIMIT 1`, [sessionId]);
+        return {
+            session: sessionRes.rows[0] ?? null,
+            plan: planRes.rows[0]?.content ?? "(no plan found — implement based on the task brief)",
+            approval: approvalRes.rows[0]?.content ?? "approved",
+        };
+    });
+    const projectId = data.session?.project_id ?? "unknown";
+    const jiraKeys = data.session?.jira_issue_keys ?? [];
+    const primaryJira = jiraKeys[0] ?? "";
+    const workingDir = `/home/david/${projectId}`;
+    const userMods = (data.approval !== "approved" && data.approval !== "auto-approved")
+        ? `\n### User Modifications / Feedback\n${data.approval}\n`
+        : "";
+    const instruction = [
+        `## EXECUTION PASS — Session ${sessionId}`,
+        ``,
+        `You are a coding agent. The plan below has been approved. Implement it fully.`,
+        ``,
+        `### Approved Plan`,
+        data.plan,
+        userMods,
+        `### Project`,
+        `- project_id: ${projectId}`,
+        `- repo: ${workingDir}`,
+        `- jira: ${jiraKeys.join(", ") || "none"}`,
+        `- build: ${data.session?.build_cmd ?? "none"}`,
+        `- deploy: ${data.session?.deploy_cmd ?? "none"}`,
+        ``,
+        `### Instructions`,
+        `1. Create a feature branch: \`git checkout -b feature/${primaryJira || "dev"}-<short-description>\``,
+        `2. Implement the approved plan`,
+        `3. Commit with message: "${primaryJira ? primaryJira + ": " : ""}<description>"`,
+        `4. When fully done, post a checkpoint via:`,
+        ``,
+        `\`\`\`bash`,
+        `SUMMARY="<what was changed, which files, git SHA>"`,
+        `curl -s -X POST http://localhost:${PORT}/session/${sessionId}/message \\`,
+        `  -H "Content-Type: application/json" \\`,
+        `  -d "{\\"role\\":\\"coding_agent\\",\\"message_type\\":\\"checkpoint\\",\\"content\\":\\"$SUMMARY\\"}"`,
+        `\`\`\``,
+        ``,
+        `5. Exit after posting the checkpoint.`,
+    ].filter(Boolean).join("\n");
+    return { instruction, workingDir };
+}
+async function buildCloseoutMessage(sessionId, checkpointContent, dbUrl) {
+    const fallback = `SESSION_ID: ${sessionId}\nROLE: close-out\nCHECKPOINT: ${checkpointContent}\n\nYou are dev-lead performing session close-out. Read AGENTS.md at /home/openclaw/agents/dev-lead/AGENTS.md.`;
+    try {
+        const config = await withDbClient(dbUrl, async (client) => {
+            const r = await client.query(`SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.smoke_url, p.default_container
+         FROM sessions s LEFT JOIN projects p ON p.project_id = s.project_id
+         WHERE s.session_id = $1`, [sessionId]);
+            return r.rows[0] ?? null;
+        });
+        if (!config)
+            return fallback;
+        return [
+            `SESSION_ID: ${sessionId}`,
+            `ROLE: close-out`,
+            `CHECKPOINT: ${checkpointContent.slice(0, 1000)}`,
+            `PROJECT: ${config.project_id}`,
+            `JIRA_KEYS: ${config.jira_issue_keys?.join(",") ?? "none"}`,
+            `BUILD: ${config.build_cmd ?? "none"}`,
+            `DEPLOY: ${config.deploy_cmd ?? "none"}`,
+            `SMOKE: ${config.smoke_url ?? "none"}`,
+            ``,
+            `You are dev-lead. The coding agent has finished. Your job is close-out only.`,
+            `Read /home/openclaw/agents/dev-lead/AGENTS.md for the full procedure.`,
+            `Steps: verify git SHA → merge to main → deploy → Jira to Done → WIP Confluence page → mark session completed → notify Ash.`,
+        ].join("\n");
+    }
+    catch {
+        return fallback;
+    }
+}
 // ─── bootstrapSession helpers ───────────────────────────────────────────────
 async function fuzzyMatchProject(dbUrl, userRequest, projectHint) {
     return withDbClient(dbUrl, async (client) => {
@@ -405,7 +639,7 @@ app.use(express_1.default.json());
 const taskLogs = new Map();
 // ─── postToFeed helper ─────────────────────────────────────────────────────
 const _feedClients = new Map();
-async function postToFeed(sessionId, dbUrl, content, role = "dev_lead", messageType = "execution_update") {
+async function postToFeed(sessionId, dbUrl, content, role = "coding_agent", messageType = "execution_update") {
     if (!sessionId || !dbUrl)
         return;
     const key = `${sessionId}::${dbUrl}`;
@@ -558,36 +792,25 @@ async function bootstrapSession(params) {
             await client.query('INSERT INTO session_messages (message_id, session_id, role, content, message_type) VALUES (gen_random_uuid(), $1, $2, $3, $4)', [sessionId, 'dev_lead', '[CACHE-FAILED] ' + e.message, 'console']);
         }).catch(() => { });
     }
-    // Spawn dev-lead (non-fatal on failure)
-    const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
-    const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
+    // Spawn BOOTSTRAP code task (non-fatal on failure)
     try {
-        const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${gatewayToken}` },
-            body: JSON.stringify({
-                tool: "sessions_spawn",
-                args: { agentId: "dev-lead", task: await buildSpawnMessage(sessionId, dbUrl), cwd: "/home/openclaw/agents/dev-lead" },
-            }),
-        });
-        if (!resp.ok) {
-            const text = await resp.text();
-            console.warn(`[bootstrapSession] spawn failed: ${resp.status} ${text.slice(0, 200)}`);
-            await withDbClient(dbUrl, async (client) => {
-                await client.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
-           VALUES (gen_random_uuid(), $1, 'dev_lead', $2, 'console', now())`, [sessionId, `⚠️ Session created but spawn_dev_lead failed: Gateway ${resp.status}`]);
-            }).catch(() => { });
-        }
+        const { instruction, workingDir } = await buildBootstrapInstruction(sessionId, dbUrl);
+        spawnCodeTask({ instruction, workingDir, sessionId, dbUrl });
+        console.log(`[bootstrapSession] BOOTSTRAP code task spawned for session ${sessionId}`);
     }
     catch (e) {
-        console.warn(`[bootstrapSession] spawn error (non-fatal): ${e.message}`);
+        console.warn(`[bootstrapSession] BOOTSTRAP spawn error (non-fatal): ${e.message}`);
+        await withDbClient(dbUrl, async (client) => {
+            await client.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
+         VALUES (gen_random_uuid(), $1, 'system', $2, 'console', now())`, [sessionId, `⚠️ Session created but BOOTSTRAP spawn failed: ${e.message}`]);
+        }).catch(() => { });
     }
     console.log(`[bootstrapSession] created session ${sessionId} for user ${user_id} / project ${projectId}`);
     return { ok: true, session_id: sessionId, session_url: sessionUrl };
 }
 // ─── MCP Server Factory ────────────────────────────────────────────────────
 function createMcpServer() {
-    const server = new index_js_1.Server({ name: "container-mcp", version: "2.0.0" }, { capabilities: { tools: {} } });
+    const server = new index_js_1.Server({ name: "container-mcp", version: "2.2.0" }, { capabilities: { tools: {} } });
     server.setRequestHandler(types_js_1.ListToolsRequestSchema, async () => ({
         tools: [
             {
@@ -874,8 +1097,32 @@ function createMcpServer() {
                 },
             },
             {
+                name: "post_message",
+                description: "Post a message to a session feed (inserts into session_messages and emits pg_notify). Use this to post status_change, approval_request, checkpoint, or console messages from dev-lead.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        session_id: { type: "string", description: "The ops-db session ID" },
+                        role: {
+                            type: "string",
+                            enum: ["coding_agent", "dev_lead", "system"],
+                            default: "dev_lead",
+                            description: "Message role",
+                        },
+                        content: { type: "string", description: "Message content" },
+                        message_type: {
+                            type: "string",
+                            default: "status_change",
+                            description: "Message type: status_change | approval_request | checkpoint | execution_update | console | execution_log",
+                        },
+                        metadata: { type: "object", description: "Optional metadata (e.g. {complexity, question, options} for approval_request)" },
+                    },
+                    required: ["session_id", "content"],
+                },
+            },
+            {
                 name: "bootstrap_session",
-                description: "Orchestrate a new dev session end-to-end: fuzzy-match project from request text, check for existing active session, warm Jira/Confluence cache, create/find Jira issue, compose task brief, create session record, and spawn dev-lead agent.",
+                description: "Orchestrate a new dev session end-to-end: fuzzy-match project from request text, check for existing active session, warm Jira/Confluence cache, create/find Jira issue, compose task brief, create session record, and launch BOOTSTRAP planning pass via Claude Code CLI.",
                 inputSchema: {
                     type: "object",
                     properties: {
@@ -1697,6 +1944,32 @@ function createMcpServer() {
                     const result = await (0, deploy_project_js_1.deployProject)(project_id, deploySessionId);
                     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
                 }
+                case "post_message": {
+                    const { session_id: pmSessionId, role: pmRole = "dev_lead", content: pmContent, message_type: pmMsgType = "status_change", metadata: pmMetadata } = args;
+                    const dbUrl = process.env.OPS_DB_URL;
+                    if (!dbUrl)
+                        return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "OPS_DB_URL not set" }) }] };
+                    const row = await withDbClient(dbUrl, async (client) => {
+                        const metadataJson = pmMetadata ? JSON.stringify(pmMetadata) : null;
+                        const insertRes = await client.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, metadata, created_at)
+               VALUES (gen_random_uuid(), $1, $2, $3, $4, $5::jsonb, now())
+               RETURNING message_id, created_at`, [pmSessionId, pmRole, pmContent, pmMsgType, metadataJson]);
+                        const inserted = insertRes.rows[0];
+                        if (inserted) {
+                            const notifyPayload = JSON.stringify({
+                                id: inserted.message_id, message_id: inserted.message_id,
+                                session_id: pmSessionId, role: pmRole, message_type: pmMsgType,
+                                content: pmContent, created_at: inserted.created_at,
+                            });
+                            const safeId = pmSessionId.replace(/-/g, "_");
+                            await client.query("SELECT pg_notify($1, $2)", [`session_messages_${safeId}`, notifyPayload]).catch(() => { });
+                            await client.query("SELECT pg_notify($1, $2)", [`session_messages`, notifyPayload]).catch(() => { });
+                            await client.query("SELECT pg_notify($1, $2)", [`session:${pmSessionId}`, notifyPayload]).catch(() => { });
+                        }
+                        return inserted;
+                    });
+                    return { content: [{ type: "text", text: JSON.stringify({ ok: true, message_id: row?.message_id }) }] };
+                }
                 case "bootstrap_session": {
                     const { user_request, user_id, project_hint } = args;
                     const result = await bootstrapSession({ user_request, user_id, project_hint });
@@ -1732,7 +2005,48 @@ app.post("/messages", async (req, res) => {
 });
 // ─── Health ────────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => {
-    res.json({ status: "ok", server: "container-mcp", version: "2.0.0" });
+    res.json({ status: "ok", server: "container-mcp", version: "2.2.0" });
+});
+// ─── Session message HTTP endpoint (for claude CLI to post back) ──────────
+// CLI uses: curl -X POST http://localhost:9000/session/:id/message -d '{"role":"coding_agent","message_type":"approval_request","content":"..."}'
+app.post("/session/:sessionId/message", async (req, res) => {
+    const { sessionId } = req.params;
+    const { role = "coding_agent", content, message_type = "execution_update", metadata } = req.body || {};
+    const dbUrl = process.env.OPS_DB_URL;
+    if (!dbUrl || !sessionId || !content) {
+        res.status(400).json({ ok: false, error: "Missing required fields: content" });
+        return;
+    }
+    try {
+        const row = await withDbClient(dbUrl, async (client) => {
+            const metadataJson = metadata ? JSON.stringify(metadata) : null;
+            const insertRes = await client.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, metadata, created_at)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5::jsonb, now())
+         RETURNING message_id, created_at`, [sessionId, role, content, message_type, metadataJson]);
+            const inserted = insertRes.rows[0];
+            if (inserted) {
+                const notifyPayload = JSON.stringify({
+                    id: inserted.message_id,
+                    message_id: inserted.message_id,
+                    session_id: sessionId,
+                    role,
+                    message_type,
+                    content,
+                    created_at: inserted.created_at,
+                });
+                const safeId = sessionId.replace(/-/g, "_");
+                await client.query("SELECT pg_notify($1, $2)", [`session_messages_${safeId}`, notifyPayload]).catch(() => { });
+                await client.query("SELECT pg_notify($1, $2)", [`session_messages`, notifyPayload]).catch(() => { });
+                await client.query("SELECT pg_notify($1, $2)", [`session:${sessionId}`, notifyPayload]).catch(() => { });
+            }
+            return inserted;
+        });
+        res.json({ ok: true, message_id: row?.message_id });
+    }
+    catch (e) {
+        console.error(`[/session/:id/message] Error: ${e.message}`);
+        res.status(500).json({ ok: false, error: e.message });
+    }
 });
 // ─── Background LISTEN chain (ZI-18776) ───────────────────────────────────
 // Active reconnect-safe Postgres LISTEN: task_brief insert → spawn dev-lead via gateway.
@@ -1761,14 +2075,14 @@ async function startListenChain() {
                     const messageType = payload.message_type;
                     if (!sessionId || !messageType)
                         return;
-                    const isTaskBrief = messageType === "task_brief" && payload.role === "user";
                     const isApprovalResponse = messageType === "approval_response";
                     const isChatMessage = messageType === "chat";
                     const isApprovalRequest = messageType === "approval_request";
-                    if (!isTaskBrief && !isApprovalResponse && !isChatMessage && !isApprovalRequest)
+                    // Checkpoint from coding_agent triggers dev-lead close-out
+                    const isCheckpoint = messageType === "checkpoint" && payload.role === "coding_agent";
+                    if (!isApprovalResponse && !isChatMessage && !isApprovalRequest && !isCheckpoint)
                         return;
-                    // Server-side auto-approve: for low/medium complexity approval_requests,
-                    // schedule an auto-approval 10 minutes after the message's created_at timestamp.
+                    // ── Auto-approve countdown for low/medium approval_requests ──────
                     if (isApprovalRequest) {
                         void (async () => {
                             try {
@@ -1783,26 +2097,23 @@ async function startListenChain() {
                                 const { message_id: approvalMsgId, metadata, created_at } = approvalRes.rows[0];
                                 const complexity = metadata?.complexity ?? "medium";
                                 if (complexity === "hard") {
-                                    console.log(`[listen-chain] approval_request ${approvalMsgId} for ${sessionId} is hard — no server-side auto-approve`);
+                                    console.log(`[listen-chain] approval_request ${approvalMsgId} for ${sessionId} is hard — no auto-approve`);
                                     return;
                                 }
                                 const deadline = new Date(created_at).getTime() + 600_000;
                                 const remaining = Math.max(0, deadline - Date.now());
-                                console.log(`[listen-chain] approval_request ${approvalMsgId} for ${sessionId} (${complexity}) — server auto-approve in ${Math.round(remaining / 1000)}s`);
+                                console.log(`[listen-chain] approval_request ${approvalMsgId} for ${sessionId} (${complexity}) — auto-approve in ${Math.round(remaining / 1000)}s`);
                                 setTimeout(async () => {
                                     try {
                                         const autoClient = new pg_1.Client({ connectionString: dbUrl });
                                         await autoClient.connect();
                                         const existingRes = await autoClient.query(`SELECT 1 FROM session_messages
-                       WHERE session_id = $1
-                         AND message_type = 'approval_response'
-                         AND created_at > (
-                           SELECT created_at FROM session_messages WHERE message_id = $2
-                         )
+                       WHERE session_id = $1 AND message_type = 'approval_response'
+                         AND created_at > (SELECT created_at FROM session_messages WHERE message_id = $2)
                        LIMIT 1`, [sessionId, approvalMsgId]);
                                         if (existingRes.rows.length > 0) {
-                                            console.log(`[listen-chain] server auto-approve skipped for ${sessionId} — already approved`);
                                             await autoClient.end().catch(() => { });
+                                            console.log(`[listen-chain] auto-approve skipped for ${sessionId} — already approved`);
                                             return;
                                         }
                                         const autoMsgId = `msg-${(0, crypto_1.randomUUID)()}`;
@@ -1810,22 +2121,19 @@ async function startListenChain() {
                                         await autoClient.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
                        VALUES ($1, $2, 'system', 'auto-approved', 'approval_response', NOW())`, [autoMsgId, sessionId]);
                                         const notifyPayload = JSON.stringify({
-                                            id: autoMsgId,
-                                            message_id: autoMsgId,
-                                            session_id: sessionId,
-                                            role: "system",
-                                            message_type: "approval_response",
-                                            content: "auto-approved",
-                                            created_at: nowIso,
+                                            id: autoMsgId, message_id: autoMsgId, session_id: sessionId,
+                                            role: "system", message_type: "approval_response",
+                                            content: "auto-approved", created_at: nowIso,
                                         });
                                         const safeId = sessionId.replace(/-/g, "_");
                                         await autoClient.query(`SELECT pg_notify($1, $2)`, [`session_messages_${safeId}`, notifyPayload]);
+                                        await autoClient.query(`SELECT pg_notify($1, $2)`, [`session_messages`, notifyPayload]);
                                         await autoClient.query(`SELECT pg_notify($1, $2)`, [`session:${sessionId}`, notifyPayload]);
                                         await autoClient.end().catch(() => { });
                                         console.log(`[listen-chain] server auto-approved session ${sessionId} (msg ${autoMsgId})`);
                                     }
                                     catch (err) {
-                                        console.error("[listen-chain] server auto-approve error:", err.message);
+                                        console.error("[listen-chain] auto-approve error:", err.message);
                                     }
                                 }, remaining);
                             }
@@ -1833,10 +2141,9 @@ async function startListenChain() {
                                 console.error("[listen-chain] approval_request handling error:", err.message);
                             }
                         })();
-                        return; // Don't spawn dev-lead for approval_request
+                        return;
                     }
-                    // Skip interactive sessions — they use chat_session directly, not dev-lead
-                    // Also only respawn on approval_response for active sessions.
+                    // ── Skip interactive sessions ──────────────────────────────────
                     try {
                         const checkClient = new pg_1.Client({ connectionString: dbUrl });
                         await checkClient.connect();
@@ -1845,7 +2152,7 @@ async function startListenChain() {
                         if (checkRes.rows.length > 0) {
                             const session = checkRes.rows[0];
                             if (session.session_type === "interactive") {
-                                console.log(`[listen-chain] skip dev-lead for interactive session ${sessionId}`);
+                                console.log(`[listen-chain] skip for interactive session ${sessionId}`);
                                 return;
                             }
                             if (isApprovalResponse && session.status !== "active") {
@@ -1857,25 +2164,71 @@ async function startListenChain() {
                     catch (e) {
                         console.warn(`[listen-chain] session check error for ${sessionId}:`, e.message);
                     }
-                    console.log(`[listen-chain] ${messageType} for ${sessionId} — spawning dev-lead via /tools/invoke`);
-                    const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
-                        method: "POST",
-                        headers: {
-                            "Content-Type": "application/json",
-                            "Authorization": `Bearer ${gatewayToken}`,
-                        },
-                        body: JSON.stringify({
-                            tool: "sessions_spawn",
-                            args: { agentId: "dev-lead", task: await buildSpawnMessage(sessionId, dbUrl), cwd: "/home/openclaw/agents/dev-lead" },
-                        }),
-                    });
-                    if (resp.ok) {
-                        const parsed = await resp.json().catch(() => ({}));
-                        console.log(`[listen-chain] dev-lead spawned for ${sessionId}, childSessionKey=${parsed?.childSessionKey ?? "n/a"}`);
+                    // ── approval_response → EXECUTION code_task ───────────────────
+                    if (isApprovalResponse) {
+                        console.log(`[listen-chain] approval_response for ${sessionId} — spawning EXECUTION code task`);
+                        try {
+                            const { instruction, workingDir } = await buildExecutionInstruction(sessionId, dbUrl);
+                            spawnCodeTask({ instruction, workingDir, sessionId, dbUrl });
+                            console.log(`[listen-chain] EXECUTION code task spawned for ${sessionId}`);
+                        }
+                        catch (e) {
+                            console.error(`[listen-chain] EXECUTION spawn error for ${sessionId}:`, e.message);
+                        }
+                        return;
                     }
-                    else {
-                        const text = await resp.text().catch(() => "");
-                        console.warn(`[listen-chain] gateway spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
+                    // ── checkpoint (coding_agent) → dev-lead close-out ────────────
+                    if (isCheckpoint) {
+                        console.log(`[listen-chain] checkpoint from coding_agent for ${sessionId} — spawning dev-lead close-out`);
+                        const checkpointContent = payload.content ?? "(no checkpoint content)";
+                        try {
+                            const task = await buildCloseoutMessage(sessionId, checkpointContent, dbUrl);
+                            const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${gatewayToken}` },
+                                body: JSON.stringify({
+                                    tool: "sessions_spawn",
+                                    args: { agentId: "dev-lead", task, cwd: "/home/openclaw/agents/dev-lead" },
+                                }),
+                            });
+                            if (resp.ok) {
+                                const parsed = await resp.json().catch(() => ({}));
+                                console.log(`[listen-chain] dev-lead close-out spawned for ${sessionId}, key=${parsed?.childSessionKey ?? "n/a"}`);
+                            }
+                            else {
+                                const text = await resp.text().catch(() => "");
+                                console.warn(`[listen-chain] dev-lead spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
+                            }
+                        }
+                        catch (e) {
+                            console.error(`[listen-chain] close-out spawn error for ${sessionId}:`, e.message);
+                        }
+                        return;
+                    }
+                    // ── chat → dev-lead (interactive help) ───────────────────────
+                    if (isChatMessage) {
+                        console.log(`[listen-chain] chat for ${sessionId} — spawning dev-lead`);
+                        try {
+                            const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${gatewayToken}` },
+                                body: JSON.stringify({
+                                    tool: "sessions_spawn",
+                                    args: { agentId: "dev-lead", task: await buildSpawnMessage(sessionId, dbUrl), cwd: "/home/openclaw/agents/dev-lead" },
+                                }),
+                            });
+                            if (resp.ok) {
+                                const parsed = await resp.json().catch(() => ({}));
+                                console.log(`[listen-chain] dev-lead spawned for chat ${sessionId}, key=${parsed?.childSessionKey ?? "n/a"}`);
+                            }
+                            else {
+                                const text = await resp.text().catch(() => "");
+                                console.warn(`[listen-chain] dev-lead chat spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
+                            }
+                        }
+                        catch (e) {
+                            console.error(`[listen-chain] chat spawn error for ${sessionId}:`, e.message);
+                        }
                     }
                 }
                 catch (err) {
@@ -1894,7 +2247,7 @@ async function startListenChain() {
         setTimeout(() => { void startListenChain(); }, 10_000);
         return;
     }
-    // Backfill: find stuck pending sessions on startup
+    // Backfill: find stuck pending sessions (no approval_request yet) → spawn BOOTSTRAP
     void (async () => {
         const backfillClient = new pg_1.Client({ connectionString: dbUrl });
         try {
@@ -1908,25 +2261,17 @@ async function startListenChain() {
            AND s.session_type != 'interactive'
            AND NOT EXISTS (
              SELECT 1 FROM session_messages sm2
-             WHERE sm2.session_id = s.session_id AND sm2.role = 'assistant'
+             WHERE sm2.session_id = s.session_id
+               AND sm2.role IN ('coding_agent', 'assistant')
            )
          ORDER BY s.session_id`);
             if (res.rows.length > 0) {
-                console.log(`[listen-chain] backfill: ${res.rows.length} pending session(s) found`);
+                console.log(`[listen-chain] backfill: ${res.rows.length} pending session(s) found — spawning BOOTSTRAP`);
                 for (const row of res.rows) {
                     try {
-                        const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
-                            method: "POST",
-                            headers: {
-                                "Content-Type": "application/json",
-                                "Authorization": `Bearer ${gatewayToken}`,
-                            },
-                            body: JSON.stringify({
-                                tool: "sessions_spawn",
-                                args: { agentId: "dev-lead", task: await buildSpawnMessage(row.session_id, dbUrl), cwd: "/home/openclaw/agents/dev-lead" },
-                            }),
-                        });
-                        console.log(`[listen-chain] backfill ${row.session_id}: ${resp.ok ? "spawned" : `failed (${resp.status})`}`);
+                        const { instruction, workingDir } = await buildBootstrapInstruction(row.session_id, dbUrl);
+                        spawnCodeTask({ instruction, workingDir, sessionId: row.session_id, dbUrl });
+                        console.log(`[listen-chain] backfill BOOTSTRAP spawned for ${row.session_id}`);
                     }
                     catch (e) {
                         console.error(`[listen-chain] backfill error for ${row.session_id}:`, e.message);
@@ -1945,7 +2290,7 @@ async function startListenChain() {
 // ─── Start ─────────────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT || "9000", 10);
 const server = app.listen(PORT, () => {
-    console.log(`container-mcp v2.1.0 running on port ${PORT}`);
+    console.log(`container-mcp v2.2.0 running on port ${PORT}`);
     console.log(`  SSE:    http://localhost:${PORT}/sse`);
     console.log(`  Health: http://localhost:${PORT}/health`);
 });
