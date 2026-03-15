@@ -1242,6 +1242,42 @@ function createMcpServer() {
         },
       },
       {
+        name: "create_git_worktree",
+        description: "Create an isolated git worktree for parallel work. Returns the worktree path and branch name.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repo: { type: "string", description: "Short repo name (resolved to /home/david/<repo>)" },
+            base_branch: { type: "string", default: "main", description: "Branch to base the worktree on (default: main)" },
+            worktree_id: { type: "string", description: "Optional identifier for the worktree (used in path and branch name). Auto-generated if omitted." },
+          },
+          required: ["repo"],
+        },
+      },
+      {
+        name: "delete_git_worktree",
+        description: "Remove a git worktree and optionally delete its branch.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            worktree_path: { type: "string", description: "Absolute path to the worktree to remove" },
+            delete_branch: { type: "boolean", default: false, description: "Also delete the worktree's branch after removal" },
+          },
+          required: ["worktree_path"],
+        },
+      },
+      {
+        name: "list_git_worktrees",
+        description: "List all active git worktrees for a repo.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repo: { type: "string", description: "Short repo name (resolved to /home/david/<repo>)" },
+          },
+          required: ["repo"],
+        },
+      },
+      {
         name: "spawn_dev_lead",
         description: "Spawn a dev-lead agent session via the OpenClaw gateway for a given ops-db session ID",
         inputSchema: {
@@ -1922,6 +1958,111 @@ function createMcpServer() {
           const r = spawnSync("git", ["pull", "--rebase", "origin"], { cwd: working_dir, encoding: "utf8" });
           const output = (r.stdout || "") + (r.stderr || "");
           return { content: [{ type: "text", text: JSON.stringify({ success: r.status === 0, output, exit_code: r.status ?? -1 }) }] };
+        }
+
+        case "create_git_worktree": {
+          const { repo, base_branch = "main", worktree_id } = args as any;
+          const repoDir = `/home/david/${repo}`;
+          const id = worktree_id || `wt-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+          const worktreePath = `/tmp/${repo}-${id}`;
+          const branchName = `worktree/${id}`;
+
+          // Ensure base branch is up to date
+          spawnSync("git", ["fetch", "origin", base_branch], { cwd: repoDir, encoding: "utf8" });
+
+          // Create worktree with a new branch based on the base branch
+          const r = spawnSync("git", ["worktree", "add", "-b", branchName, worktreePath, `origin/${base_branch}`], {
+            cwd: repoDir,
+            encoding: "utf8",
+          });
+          const output = (r.stdout || "") + (r.stderr || "");
+          if (r.status !== 0) {
+            return { content: [{ type: "text", text: JSON.stringify({ success: false, output, exit_code: r.status ?? -1 }) }] };
+          }
+          return {
+            content: [{ type: "text", text: JSON.stringify({
+              success: true,
+              worktree_path: worktreePath,
+              branch: branchName,
+              base_branch,
+              repo_dir: repoDir,
+              output,
+            }) }],
+          };
+        }
+
+        case "delete_git_worktree": {
+          const { worktree_path, delete_branch = false } = args as any;
+
+          // Detect which branch the worktree is on before removing
+          let worktreeBranch: string | null = null;
+          if (delete_branch) {
+            const branchR = spawnSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: worktree_path, encoding: "utf8" });
+            worktreeBranch = branchR.status === 0 ? branchR.stdout.trim() : null;
+          }
+
+          // Find the main repo dir from the worktree
+          const mainR = spawnSync("git", ["worktree", "list", "--porcelain"], { cwd: worktree_path, encoding: "utf8" });
+          let mainRepoDir: string | null = null;
+          if (mainR.status === 0) {
+            // First "worktree" entry in porcelain output is the main working tree
+            const match = mainR.stdout.match(/^worktree (.+)$/m);
+            if (match) mainRepoDir = match[1];
+          }
+
+          // Remove the worktree
+          const removeR = spawnSync("git", ["worktree", "remove", worktree_path, "--force"], {
+            cwd: mainRepoDir || worktree_path,
+            encoding: "utf8",
+          });
+          const output = (removeR.stdout || "") + (removeR.stderr || "");
+
+          // Optionally delete the branch
+          let branchDeleted = false;
+          if (delete_branch && worktreeBranch && mainRepoDir && removeR.status === 0) {
+            const delR = spawnSync("git", ["branch", "-D", worktreeBranch], { cwd: mainRepoDir, encoding: "utf8" });
+            branchDeleted = delR.status === 0;
+          }
+
+          return {
+            content: [{ type: "text", text: JSON.stringify({
+              success: removeR.status === 0,
+              output,
+              branch_deleted: branchDeleted,
+              exit_code: removeR.status ?? -1,
+            }) }],
+          };
+        }
+
+        case "list_git_worktrees": {
+          const { repo } = args as any;
+          const repoDir = `/home/david/${repo}`;
+          const r = spawnSync("git", ["worktree", "list", "--porcelain"], { cwd: repoDir, encoding: "utf8" });
+          if (r.status !== 0) {
+            const output = (r.stdout || "") + (r.stderr || "");
+            return { content: [{ type: "text", text: JSON.stringify({ success: false, output, exit_code: r.status ?? -1 }) }] };
+          }
+
+          // Parse porcelain output into structured list
+          const worktrees: Array<{ path: string; head: string; branch: string | null; bare: boolean; detached: boolean }> = [];
+          let current: any = {};
+          for (const line of r.stdout.split("\n")) {
+            if (line.startsWith("worktree ")) {
+              if (current.path) worktrees.push(current);
+              current = { path: line.slice(9), head: "", branch: null, bare: false, detached: false };
+            } else if (line.startsWith("HEAD ")) {
+              current.head = line.slice(5);
+            } else if (line.startsWith("branch ")) {
+              current.branch = line.slice(7);
+            } else if (line === "bare") {
+              current.bare = true;
+            } else if (line === "detached") {
+              current.detached = true;
+            }
+          }
+          if (current.path) worktrees.push(current);
+
+          return { content: [{ type: "text", text: JSON.stringify({ success: true, worktrees }) }] };
         }
 
         case "chat_session": {
