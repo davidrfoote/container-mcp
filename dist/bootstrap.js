@@ -259,6 +259,10 @@ async function bootstrapSession(params) {
         return { ok: false, error: "OPS_DB_URL not set" };
     // Step 1: Resolve project
     let projectId = null;
+    // Guard: reject project_id values that look like user IDs (e.g. Slack "U097Q46UX")
+    if (project_id && /^[A-Z][A-Z0-9]{5,}$/.test(project_id)) {
+        return { ok: false, error: `project_id "${project_id}" looks like a user ID, not a project identifier. Project IDs should be lowercase kebab-case (e.g. "my-api", "ash-dashboard").` };
+    }
     try {
         const resolved = await resolveProject(dbUrl, project_id, project_hint);
         projectId = resolved.project_id;
