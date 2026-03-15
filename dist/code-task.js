@@ -41,6 +41,54 @@ const path = __importStar(require("path"));
 const db_js_1 = require("./db.js");
 const feed_js_1 = require("./feed.js");
 const task_logs_js_1 = require("./task-logs.js");
+/**
+ * Kill stale claude/node processes and reap zombies before spawning a new task.
+ * Without this, defunct processes accumulate in the container and block new spawns.
+ */
+function cleanupStaleProcesses() {
+    try {
+        // Reap any zombie (defunct) processes by waiting on them
+        try {
+            (0, child_process_1.execSync)("kill -0 1 2>/dev/null && waitpid -e 2>/dev/null || true", { timeout: 3000 });
+        }
+        catch { }
+        // Find and kill orphaned claude CLI processes (not our parent MCP server)
+        // Only target 'claude' processes that are children of PID 1 (orphaned)
+        try {
+            const stale = (0, child_process_1.execSync)("ps -eo pid,ppid,stat,args 2>/dev/null | grep -E '(claude.*--output-format|[n]ode.*claude)' | grep -v grep || true", { timeout: 5000, encoding: "utf8" }).trim();
+            if (stale) {
+                const pids = [];
+                for (const line of stale.split("\n")) {
+                    const parts = line.trim().split(/\s+/);
+                    const pid = parseInt(parts[0], 10);
+                    const stat = parts[2] || "";
+                    // Kill zombies (Z) and orphaned processes (ppid=1)
+                    if (pid && (stat.includes("Z") || parts[1] === "1")) {
+                        pids.push(pid);
+                    }
+                }
+                if (pids.length > 0) {
+                    console.log(`[cleanupStaleProcesses] Killing ${pids.length} stale process(es): ${pids.join(", ")}`);
+                    for (const pid of pids) {
+                        try {
+                            process.kill(pid, "SIGKILL");
+                        }
+                        catch { }
+                    }
+                }
+            }
+        }
+        catch { }
+        // Final zombie reap pass — send SIGCHLD to init so it can clean up
+        try {
+            (0, child_process_1.execSync)("kill -s SIGCHLD 1 2>/dev/null || true", { timeout: 2000 });
+        }
+        catch { }
+    }
+    catch (err) {
+        console.warn(`[cleanupStaleProcesses] Non-fatal error: ${err}`);
+    }
+}
 function spawnCodeTask(params) {
     const { instruction, workingDir, sessionId, dbUrl, maxTurns = 40, budgetUsd = 8.0, timeoutSeconds = 1200, model, effort, agents, allowedTools, resumeClaudeSessionId, taskRules, } = params;
     const taskId = (0, crypto_1.randomUUID)();
@@ -50,6 +98,8 @@ function spawnCodeTask(params) {
     (0, feed_js_1.postToFeed)(sessionId, dbUrl, `🚀 Starting code task (${taskId})${model ? ` [${model}]` : ""}${resumeClaudeSessionId ? " [resumed]" : ""}\n\n${instruction.slice(0, 400)}`);
     (async () => {
         try {
+            // Clean up stale processes from prior tasks before spawning
+            cleanupStaleProcesses();
             // Build rules from base + project + task-specific
             const rulesFile = `/tmp/container-mcp-rules-${taskId}.md`;
             let rules = "";
@@ -155,6 +205,8 @@ function spawnCodeTask(params) {
                 catch { }
                 (0, feed_js_1.postToFeed)(sessionId, dbUrl, `✅ Process ${taskId} exited with code ${code}. Debug log: ${debugLogPath}`);
                 console.log(`[spawnCodeTask] task ${taskId} done (code ${code}), debug log at ${debugLogPath}`);
+                // Reap any orphaned child processes left behind by Claude CLI
+                cleanupStaleProcesses();
             });
         }
         catch (err) {
