@@ -366,23 +366,36 @@ function spawnCodeTask(params: {
   maxTurns?: number;
   budgetUsd?: number;
   timeoutSeconds?: number;
+  model?: string;
+  effort?: string;
+  agents?: string;        // JSON string for --agents
+  allowedTools?: string[]; // whitelist via --allowed-tools
+  resumeClaudeSessionId?: string; // --resume for context continuity
+  taskRules?: string;     // extra rules appended to system prompt
 }): string {
-  const { instruction, workingDir, sessionId, dbUrl, maxTurns = 40, budgetUsd = 8.0, timeoutSeconds = 1200 } = params;
+  const {
+    instruction, workingDir, sessionId, dbUrl,
+    maxTurns = 40, budgetUsd = 8.0, timeoutSeconds = 1200,
+    model, effort, agents, allowedTools, resumeClaudeSessionId, taskRules,
+  } = params;
+
   const taskId = randomUUID();
   taskLogs.set(taskId, []);
   taskLogTimestamps.set(taskId, Date.now());
   const log = (line: string) => taskLogs.get(taskId)!.push(line);
+  const debugLogPath = `/tmp/task-${taskId}-debug.log`;
 
-  postToFeed(sessionId!, dbUrl!, `🚀 Starting code task (${taskId})\n\n${instruction.slice(0, 400)}`);
+  postToFeed(sessionId!, dbUrl!, `🚀 Starting code task (${taskId})${model ? ` [${model}]` : ""}${resumeClaudeSessionId ? " [resumed]" : ""}\n\n${instruction.slice(0, 400)}`);
 
   (async () => {
     try {
+      // Build rules from base + project + task-specific
       const rulesFile = `/tmp/container-mcp-rules-${taskId}.md`;
       let rules = "";
       try { rules += fs.readFileSync(`${HOME_DIR}/.rules/base.md`, "utf8") + "\n"; } catch {}
       await fs.promises.writeFile(rulesFile, rules);
 
-      const proc = spawn("claude", [
+      const claudeArgs: string[] = [
         "-p", instruction,
         "--output-format", "stream-json",
         "--verbose",
@@ -392,7 +405,18 @@ function spawnCodeTask(params: {
         "--max-turns", String(maxTurns),
         "--max-budget-usd", String(budgetUsd),
         "--dangerously-skip-permissions",
-      ], { cwd: workingDir, env: process.env, stdio: ["ignore", "pipe", "pipe"] as const });
+        "--debug-file", debugLogPath,
+      ];
+
+      if (model) claudeArgs.push("--model", model);
+      if (effort) claudeArgs.push("--effort", effort);
+      if (agents) claudeArgs.push("--agents", agents);
+      if (allowedTools && allowedTools.length > 0) claudeArgs.push("--allowed-tools", allowedTools.join(","));
+      if (resumeClaudeSessionId) claudeArgs.push("--resume", resumeClaudeSessionId);
+
+      const proc = spawn("claude", claudeArgs, {
+        cwd: workingDir, env: process.env, stdio: ["ignore", "pipe", "pipe"] as const,
+      });
 
       const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeoutSeconds * 1000);
 
@@ -404,8 +428,18 @@ function spawnCodeTask(params: {
           try {
             const parsed = JSON.parse(line);
             if (parsed.type === "result") {
+              // Persist the claude session ID so EXECUTION pass can resume it
+              const claudeSessionId = parsed.session_id as string | undefined;
+              if (claudeSessionId && sessionId && dbUrl) {
+                void withDbClient(dbUrl, async (client) => {
+                  await client.query(
+                    `UPDATE sessions SET claude_session_id = $1, updated_at = now() WHERE session_id = $2`,
+                    [claudeSessionId, sessionId]
+                  ).catch(() => {});
+                });
+              }
               const output = (parsed.result || parsed.output || "") as string;
-              postToFeed(sessionId!, dbUrl!, `✅ Task complete\n\n${output.slice(0, 2000)}`);
+              postToFeed(sessionId!, dbUrl!, `✅ Task complete\n\n${output.slice(0, 4000)}`);
               const usage = parsed.usage as { input_tokens?: number; output_tokens?: number } | undefined;
               if (usage && sessionId && dbUrl) {
                 const inputTokens = usage.input_tokens || 0;
@@ -421,24 +455,32 @@ function spawnCodeTask(params: {
             } else if (parsed.type === "assistant") {
               for (const block of (parsed.message?.content || [])) {
                 if (block.type === "tool_use") {
-                  postToFeed(sessionId!, dbUrl!, `🔧 \`${block.name}\` ${JSON.stringify(block.input || {}).slice(0, 200)}`);
+                  postToFeed(sessionId!, dbUrl!, `🔧 \`${block.name}\` ${JSON.stringify(block.input || {}).slice(0, 500)}`);
                 } else if (block.type === "text" && block.text?.trim() && !parsed.message?.usage) {
-                  const text = block.text.trim().slice(0, 500);
+                  const text = block.text.trim().slice(0, 1000);
                   if (text.length > 20) postToFeed(sessionId!, dbUrl!, `💭 ${text}`);
                 }
               }
             } else if (parsed.type === "tool_result") {
-              const resultText = (parsed.content?.[0]?.text || "").slice(0, 300);
+              const resultText = (parsed.content?.[0]?.text || "").slice(0, 2000);
               if (resultText) postToFeed(sessionId!, dbUrl!, `📄 Result: ${resultText}`);
             }
           } catch {}
         }
       });
-      proc.stderr.on("data", (chunk: Buffer) => log("[stderr] " + chunk.toString()));
+      proc.stderr.on("data", (chunk: Buffer) => {
+        const text = chunk.toString();
+        log("[stderr] " + text);
+        // Surface non-trivial stderr to session feed (auth errors, crashes)
+        if (text.includes("Error") || text.includes("error") || text.includes("failed")) {
+          postToFeed(sessionId!, dbUrl!, `⚠️ stderr: ${text.slice(0, 500)}`, "system", "console");
+        }
+      });
       proc.on("close", (code) => {
         clearTimeout(timer);
         try { fs.unlinkSync(rulesFile); } catch {}
-        postToFeed(sessionId!, dbUrl!, `✅ Process ${taskId} exited with code ${code}`);
+        postToFeed(sessionId!, dbUrl!, `✅ Process ${taskId} exited with code ${code}. Debug log: ${debugLogPath}`);
+        console.log(`[spawnCodeTask] task ${taskId} done (code ${code}), debug log at ${debugLogPath}`);
       });
     } catch (err: any) {
       console.error(`[spawnCodeTask] Error: ${err.message}`);
@@ -449,7 +491,7 @@ function spawnCodeTask(params: {
   return taskId;
 }
 
-async function buildBootstrapInstruction(sessionId: string, dbUrl: string): Promise<{ instruction: string; workingDir: string }> {
+async function buildBootstrapInstruction(sessionId: string, dbUrl: string): Promise<{ instruction: string; workingDir: string; allowedTools: string[] }> {
   const PORT = process.env.PORT ?? "9000";
 
   const data = await withDbClient(dbUrl, async (client) => {
@@ -530,10 +572,13 @@ async function buildBootstrapInstruction(sessionId: string, dbUrl: string): Prom
     `6. After the curl succeeds, EXIT immediately. Do NOT start coding — wait for approval.`,
   ].filter(Boolean).join("\n");
 
-  return { instruction, workingDir };
+  // BOOTSTRAP is read-only: explore + plan only. Blocks Edit/Write/MultiEdit.
+  const allowedTools = ["Read", "Glob", "Grep", "Bash", "WebFetch", "WebSearch"];
+
+  return { instruction, workingDir, allowedTools };
 }
 
-async function buildExecutionInstruction(sessionId: string, dbUrl: string): Promise<{ instruction: string; workingDir: string }> {
+async function buildExecutionInstruction(sessionId: string, dbUrl: string): Promise<{ instruction: string; workingDir: string; resumeClaudeSessionId?: string }> {
   const PORT = process.env.PORT ?? "9000";
 
   const data = await withDbClient(dbUrl, async (client) => {
@@ -543,8 +588,9 @@ async function buildExecutionInstruction(sessionId: string, dbUrl: string): Prom
       build_cmd: string | null;
       deploy_cmd: string | null;
       default_container: string | null;
+      claude_session_id: string | null;
     }>(
-      `SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.default_container
+      `SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.default_container, s.claude_session_id
        FROM sessions s LEFT JOIN projects p ON p.project_id = s.project_id
        WHERE s.session_id = $1`,
       [sessionId]
@@ -573,9 +619,13 @@ async function buildExecutionInstruction(sessionId: string, dbUrl: string): Prom
     ? `\n### User Modifications / Feedback\n${data.approval}\n`
     : "";
 
+  const contextNote = resumeClaudeSessionId
+    ? `\n> **Note:** This session resumes the BOOTSTRAP planning pass. You already explored the codebase — skip re-reading files you already know.\n`
+    : "";
+
   const instruction = [
     `## EXECUTION PASS — Session ${sessionId}`,
-    ``,
+    contextNote,
     `You are a coding agent. The plan below has been approved. Implement it fully.`,
     ``,
     `### Approved Plan`,
@@ -604,7 +654,7 @@ async function buildExecutionInstruction(sessionId: string, dbUrl: string): Prom
     `5. Exit after posting the checkpoint.`,
   ].filter(Boolean).join("\n");
 
-  return { instruction, workingDir };
+  return { instruction, workingDir, resumeClaudeSessionId };
 }
 
 async function buildCloseoutMessage(sessionId: string, checkpointContent: string, dbUrl: string): Promise<string> {
@@ -941,8 +991,8 @@ export async function bootstrapSession(params: {
 
   // Spawn BOOTSTRAP code task (non-fatal on failure)
   try {
-    const { instruction, workingDir } = await buildBootstrapInstruction(sessionId, dbUrl);
-    spawnCodeTask({ instruction, workingDir, sessionId, dbUrl });
+    const { instruction, workingDir, allowedTools } = await buildBootstrapInstruction(sessionId, dbUrl);
+    spawnCodeTask({ instruction, workingDir, sessionId, dbUrl, allowedTools });
     console.log(`[bootstrapSession] BOOTSTRAP code task spawned for session ${sessionId}`);
   } catch (e: any) {
     console.warn(`[bootstrapSession] BOOTSTRAP spawn error (non-fatal): ${e.message}`);
@@ -987,11 +1037,38 @@ function createMcpServer() {
             max_turns: { type: "number", default: 30 },
             budget_usd: { type: "number", default: 5.0 },
             timeout_seconds: { type: "number", default: 900 },
-            task_rules: { type: "string", description: "Extra rules to append" },
+            task_rules: { type: "string", description: "Extra rules to append to system prompt" },
             base_rules_path: { type: "string", default: "/home/david/.rules/base.md" },
             project_rules_path: { type: "string", default: "/.rules/project.md" },
             session_id: { type: "string", description: "ops-db session ID to post execution_update messages to" },
             ops_db_url: { type: "string", description: "PostgreSQL connection URL (falls back to OPS_DB_URL env)" },
+            model: {
+              type: "string",
+              description: "Model override (e.g. 'haiku', 'sonnet', 'opus', or full model ID). Defaults to account default.",
+            },
+            effort: {
+              type: "string",
+              enum: ["low", "medium", "high", "max"],
+              description: "Effort level (controls reasoning depth). Default: medium.",
+            },
+            agents: {
+              type: "string",
+              description: "JSON object defining custom sub-agents available to this task. E.g. '{\"reviewer\":{\"description\":\"Reviews code\",\"prompt\":\"You are a code reviewer\"}}'",
+            },
+            allowed_tools: {
+              type: "array",
+              items: { type: "string" },
+              description: "Whitelist of tools the CLI may use. E.g. [\"Read\",\"Glob\",\"Grep\",\"Bash\"]. Omit for all tools.",
+            },
+            resume_claude_session_id: {
+              type: "string",
+              description: "Resume a previous claude CLI session by session ID for context continuity across passes.",
+            },
+            add_dirs: {
+              type: "array",
+              items: { type: "string" },
+              description: "Additional directories to allow tool access to (passed as --add-dir).",
+            },
           },
           required: ["instruction", "working_dir"],
         },
@@ -1341,8 +1418,9 @@ function createMcpServer() {
           taskLogs.set(taskId, []);
           taskLogTimestamps.set(taskId, Date.now());
           const log = (line: string) => taskLogs.get(taskId)!.push(line);
+          const debugLogPath = `/tmp/task-${taskId}-debug.log`;
 
-          postToFeed(session_id, dbUrl, `🚀 Starting \`code_task\` (driver: ${driver}, task_id: ${taskId})\n\nInstruction: ${instruction.slice(0, 300)}`);
+          postToFeed(session_id, dbUrl, `🚀 Starting \`code_task\` (driver: ${driver}, task_id: ${taskId}${model ? `, model: ${model}` : ""}${resume_claude_session_id ? ", resumed" : ""})\n\nInstruction: ${instruction.slice(0, 400)}`);
 
           // Compose rules
           let rules = "";
@@ -1360,7 +1438,7 @@ function createMcpServer() {
                 const memUsage = process.memoryUsage();
                 console.log(`[code_task] Starting task ${taskId}. Memory: ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB`);
 
-                const proc = spawn("claude", [
+                const claudeArgs: string[] = [
                   "-p", instruction,
                   "--output-format", "stream-json",
                   "--verbose",
@@ -1371,7 +1449,23 @@ function createMcpServer() {
                   "--max-budget-usd", String(budget_usd),
                   "--session-id", taskId,
                   "--dangerously-skip-permissions",
-                ], { cwd: working_dir, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] as const });
+                  "--debug-file", debugLogPath,
+                ];
+
+                if (model) claudeArgs.push("--model", model);
+                if (effort) claudeArgs.push("--effort", effort);
+                if (agents) claudeArgs.push("--agents", typeof agents === "string" ? agents : JSON.stringify(agents));
+                if (allowed_tools && Array.isArray(allowed_tools) && allowed_tools.length > 0) {
+                  claudeArgs.push("--allowed-tools", allowed_tools.join(","));
+                }
+                if (resume_claude_session_id) claudeArgs.push("--resume", resume_claude_session_id);
+                if (add_dirs && Array.isArray(add_dirs)) {
+                  for (const dir of add_dirs) claudeArgs.push("--add-dir", dir);
+                }
+
+                const proc = spawn("claude", claudeArgs, {
+                  cwd: working_dir, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] as const,
+                });
 
                 let output = "";
                 const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeout_seconds * 1000);
@@ -1384,8 +1478,18 @@ function createMcpServer() {
                     try {
                       const parsed = JSON.parse(line);
                       if (parsed.type === "result") {
+                        // Save claude session ID for potential resume
+                        const claudeSessionId = parsed.session_id as string | undefined;
+                        if (claudeSessionId && session_id && dbUrl) {
+                          void withDbClient(dbUrl, async (client) => {
+                            await client.query(
+                              `UPDATE sessions SET claude_session_id = $1, updated_at = now() WHERE session_id = $2`,
+                              [claudeSessionId, session_id]
+                            );
+                          }).catch(() => {});
+                        }
                         output = parsed.result || parsed.output || JSON.stringify(parsed);
-                        postToFeed(session_id, dbUrl, `✅ Task complete\n\n${output.slice(0, 2000)}`);
+                        postToFeed(session_id, dbUrl, `✅ Task complete\n\n${output.slice(0, 4000)}`);
                         const usage = parsed.usage as { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } | undefined;
                         if (usage && (usage.input_tokens || usage.output_tokens) && session_id && dbUrl) {
                           const inputTokens = usage.input_tokens || 0;
@@ -1403,26 +1507,31 @@ function createMcpServer() {
                         const content = parsed.message?.content || [];
                         for (const block of content) {
                           if (block.type === "tool_use") {
-                            const toolName = block.name;
-                            const toolInput = JSON.stringify(block.input || {}).slice(0, 200);
-                            postToFeed(session_id, dbUrl, `🔧 \`${toolName}\` ${toolInput}`);
+                            const toolInput = JSON.stringify(block.input || {}).slice(0, 500);
+                            postToFeed(session_id, dbUrl, `🔧 \`${block.name}\` ${toolInput}`);
                           } else if (block.type === "text" && block.text?.trim() && !parsed.message?.usage) {
-                            const text = block.text.trim().slice(0, 500);
+                            const text = block.text.trim().slice(0, 1000);
                             if (text.length > 20) postToFeed(session_id, dbUrl, `💭 ${text}`);
                           }
                         }
                       } else if (parsed.type === "tool_result") {
-                        const resultText = (parsed.content?.[0]?.text || "").slice(0, 300);
+                        const resultText = (parsed.content?.[0]?.text || "").slice(0, 2000);
                         if (resultText) postToFeed(session_id, dbUrl, `📄 Result: ${resultText}`);
                       }
                     } catch {}
                   }
                 });
-                proc.stderr.on("data", (chunk: Buffer) => log("[stderr] " + chunk.toString()));
+                proc.stderr.on("data", (chunk: Buffer) => {
+                  const text = chunk.toString();
+                  log("[stderr] " + text);
+                  if (text.includes("Error") || text.includes("error") || text.includes("failed")) {
+                    postToFeed(session_id, dbUrl, `⚠️ stderr: ${text.slice(0, 500)}`, "system", "console");
+                  }
+                });
                 proc.on("close", (code) => {
                   clearTimeout(timer);
                   try { fs.unlinkSync(rulesFile); } catch {}
-                  postToFeed(session_id, dbUrl, `✅ Process ${taskId} exited with code ${code}`);
+                  postToFeed(session_id, dbUrl, `✅ Process ${taskId} exited with code ${code}. Debug log: ${debugLogPath}`);
                 });
               } catch (err: any) {
                 console.error(`[code_task] Error in async spawn: ${err.message}`);
@@ -1440,7 +1549,8 @@ function createMcpServer() {
                   ok: true,
                   task_id: taskId,
                   status: "spawned",
-                  message: `Process spawned. Poll get_task_log('${taskId}') for output.`
+                  debug_log: debugLogPath,
+                  message: `Process spawned. Poll get_task_log('${taskId}') or read ${debugLogPath} for output.`
                 })
               }]
             };
@@ -2536,8 +2646,8 @@ async function startListenChain(): Promise<void> {
           if (isApprovalResponse) {
             console.log(`[listen-chain] approval_response for ${sessionId} — spawning EXECUTION code task`);
             try {
-              const { instruction, workingDir } = await buildExecutionInstruction(sessionId, dbUrl);
-              spawnCodeTask({ instruction, workingDir, sessionId, dbUrl });
+              const { instruction, workingDir, resumeClaudeSessionId } = await buildExecutionInstruction(sessionId, dbUrl);
+              spawnCodeTask({ instruction, workingDir, sessionId, dbUrl, resumeClaudeSessionId });
               console.log(`[listen-chain] EXECUTION code task spawned for ${sessionId}`);
             } catch (e: any) {
               console.error(`[listen-chain] EXECUTION spawn error for ${sessionId}:`, e.message);
@@ -2640,8 +2750,8 @@ async function startListenChain(): Promise<void> {
         console.log(`[listen-chain] backfill: ${res.rows.length} pending session(s) found — spawning BOOTSTRAP`);
         for (const row of res.rows) {
           try {
-            const { instruction, workingDir } = await buildBootstrapInstruction(row.session_id, dbUrl);
-            spawnCodeTask({ instruction, workingDir, sessionId: row.session_id, dbUrl });
+            const { instruction, workingDir, allowedTools } = await buildBootstrapInstruction(row.session_id, dbUrl);
+            spawnCodeTask({ instruction, workingDir, sessionId: row.session_id, dbUrl, allowedTools });
             console.log(`[listen-chain] backfill BOOTSTRAP spawned for ${row.session_id}`);
           } catch (e: any) {
             console.error(`[listen-chain] backfill error for ${row.session_id}:`, e.message);
