@@ -109,7 +109,7 @@ async function startListenChain() {
                                 console.log(`[listen-chain] skip for interactive session ${sessionId}`);
                                 return;
                             }
-                            if (isApprovalResponse && session.status !== "active") {
+                            if (isApprovalResponse && session.status !== "active" && session.status !== "pending") {
                                 console.log(`[listen-chain] skip approval wake for non-active session ${sessionId} (${session.status})`);
                                 return;
                             }
