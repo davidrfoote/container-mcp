@@ -424,6 +424,9 @@ async function bootstrapSession(params) {
         const { instruction, workingDir, allowedTools } = await buildBootstrapInstruction(sessionId, dbUrl);
         (0, code_task_js_1.spawnCodeTask)({ instruction, workingDir, sessionId, dbUrl, allowedTools });
         console.log(`[bootstrapSession] BOOTSTRAP code task spawned for session ${sessionId}`);
+        await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
+            await client.query("UPDATE sessions SET status = 'active', updated_at = now() WHERE session_id = $1", [sessionId]);
+        }).catch((e) => console.warn('[bootstrapSession] failed to set status=active: ' + e.message));
     }
     catch (e) {
         console.warn(`[bootstrapSession] BOOTSTRAP spawn error (non-fatal): ${e.message}`);
