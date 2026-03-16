@@ -64,7 +64,7 @@ export function spawnCodeTask(params: {
       if (resumeClaudeSessionId) claudeArgs.push("--resume", resumeClaudeSessionId);
 
       const proc = spawn("claude", claudeArgs, {
-        cwd: workingDir, env: { ...process.env, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined }, stdio: ["ignore", "pipe", "pipe"] as const,
+        cwd: workingDir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined }, stdio: ["ignore", "pipe", "pipe"] as const,
       });
 
       const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeoutSeconds * 1000);
