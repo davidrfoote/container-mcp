@@ -1,10 +1,29 @@
 import { randomUUID } from "crypto";
 import * as fs from "fs";
 import * as path from "path";
+import * as http from "http";
+import * as https from "https";
 import { withDbClient } from "./db.js";
 import { postToFeed } from "./feed.js";
 import { spawnCodeTask } from "./code-task.js";
 import { populateCacheForProject, searchJiraForIssue, createJiraTaskIssue } from "./jira-confluence.js";
+
+function httpGetWithTimeout(url: string, timeoutMs: number): Promise<Record<string, unknown> | null> {
+  return new Promise((resolve) => {
+    const parsed = new URL(url);
+    const lib = parsed.protocol === "https:" ? https : http;
+    const req = lib.get(url, { timeout: timeoutMs }, (res) => {
+      let data = "";
+      res.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+      res.on("end", () => {
+        try { resolve(JSON.parse(data) as Record<string, unknown>); }
+        catch { resolve(null); }
+      });
+    });
+    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.on("error", () => resolve(null));
+  });
+}
 
 const SLACK_USER_MAP: Record<string, string> = {
   U097Q46UX: "David",
@@ -61,6 +80,16 @@ export async function buildBootstrapInstruction(sessionId: string, dbUrl: string
     } catch {}
   }
 
+  // Fetch gitnexus code graph context (non-fatal)
+  let codeGraphContext = "";
+  try {
+    if (process.env.GITNEXUS_SERVICE_URL) {
+      const url = new URL(`/context/${path.basename(workingDir)}`, process.env.GITNEXUS_SERVICE_URL);
+      const res = await httpGetWithTimeout(url.toString(), 5000);
+      if (res?.wiki_summary) codeGraphContext = `\n\n## Code Graph Context\n${res.wiki_summary}`;
+    }
+  } catch {}
+
   const instruction = [
     `## BOOTSTRAP PASS — Session ${sessionId}`,
     ``,
@@ -76,6 +105,7 @@ export async function buildBootstrapInstruction(sessionId: string, dbUrl: string
     `- build: ${data.session?.build_cmd ?? "none"}`,
     ``,
     cacheSummary ? `### Cached Context (Jira/Confluence)\n${cacheSummary}` : "",
+    codeGraphContext,
     ``,
     `### Your Steps`,
     `1. Explore the codebase at ${workingDir} — read relevant files to understand the current state`,

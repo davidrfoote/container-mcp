@@ -42,9 +42,31 @@ exports.bootstrapSession = bootstrapSession;
 const crypto_1 = require("crypto");
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
+const http = __importStar(require("http"));
+const https = __importStar(require("https"));
 const db_js_1 = require("./db.js");
 const code_task_js_1 = require("./code-task.js");
 const jira_confluence_js_1 = require("./jira-confluence.js");
+function httpGetWithTimeout(url, timeoutMs) {
+    return new Promise((resolve) => {
+        const parsed = new URL(url);
+        const lib = parsed.protocol === "https:" ? https : http;
+        const req = lib.get(url, { timeout: timeoutMs }, (res) => {
+            let data = "";
+            res.on("data", (chunk) => { data += chunk.toString(); });
+            res.on("end", () => {
+                try {
+                    resolve(JSON.parse(data));
+                }
+                catch {
+                    resolve(null);
+                }
+            });
+        });
+        req.on("timeout", () => { req.destroy(); resolve(null); });
+        req.on("error", () => resolve(null));
+    });
+}
 const SLACK_USER_MAP = {
     U097Q46UX: "David",
     U160P0C7M: "Shane",
@@ -80,6 +102,17 @@ async function buildBootstrapInstruction(sessionId, dbUrl) {
         }
         catch { }
     }
+    // Fetch gitnexus code graph context (non-fatal)
+    let codeGraphContext = "";
+    try {
+        if (process.env.GITNEXUS_SERVICE_URL) {
+            const url = new URL(`/context/${path.basename(workingDir)}`, process.env.GITNEXUS_SERVICE_URL);
+            const res = await httpGetWithTimeout(url.toString(), 5000);
+            if (res?.wiki_summary)
+                codeGraphContext = `\n\n## Code Graph Context\n${res.wiki_summary}`;
+        }
+    }
+    catch { }
     const instruction = [
         `## BOOTSTRAP PASS — Session ${sessionId}`,
         ``,
@@ -95,6 +128,7 @@ async function buildBootstrapInstruction(sessionId, dbUrl) {
         `- build: ${data.session?.build_cmd ?? "none"}`,
         ``,
         cacheSummary ? `### Cached Context (Jira/Confluence)\n${cacheSummary}` : "",
+        codeGraphContext,
         ``,
         `### Your Steps`,
         `1. Explore the codebase at ${workingDir} — read relevant files to understand the current state`,
