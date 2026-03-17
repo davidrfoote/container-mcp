@@ -53,19 +53,22 @@ app.post("/session/:sessionId/message", async (req, res) => {
          RETURNING message_id, created_at`, [sessionId, role, content, message_type, metadataJson]);
             const inserted = insertRes.rows[0];
             if (inserted) {
+                // Truncate content to stay well under PostgreSQL's 8000-byte pg_notify limit.
+                // The listen-chain only needs session_id + message_type — full content is never read from the payload.
                 const notifyPayload = JSON.stringify({
                     id: inserted.message_id,
                     message_id: inserted.message_id,
                     session_id: sessionId,
                     role,
                     message_type,
-                    content,
+                    content: typeof content === "string" ? content.slice(0, 500) : "",
                     created_at: inserted.created_at,
                 });
                 const safeId = sessionId.replace(/-/g, "_");
-                await client.query("SELECT pg_notify($1, $2)", [`session_messages_${safeId}`, notifyPayload]).catch(() => { });
-                await client.query("SELECT pg_notify($1, $2)", [`session_messages`, notifyPayload]).catch(() => { });
-                await client.query("SELECT pg_notify($1, $2)", [`session:${sessionId}`, notifyPayload]).catch(() => { });
+                const notifyErr = (e) => console.error("[pg_notify] error:", e.message);
+                await client.query("SELECT pg_notify($1, $2)", [`session_messages_${safeId}`, notifyPayload]).catch(notifyErr);
+                await client.query("SELECT pg_notify($1, $2)", [`session_messages`, notifyPayload]).catch(notifyErr);
+                await client.query("SELECT pg_notify($1, $2)", [`session:${sessionId}`, notifyPayload]).catch(notifyErr);
             }
             return inserted;
         });

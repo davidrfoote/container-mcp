@@ -16,7 +16,12 @@ export async function withDbClient<T>(connectionString: string | undefined, fn: 
 
 export async function notifySessionMessage(client: Client, sessionId: string, payload: Record<string, unknown>): Promise<void> {
   const safeId = sessionId.replace(/-/g, "_");
-  const text = JSON.stringify(payload);
+  // Truncate content to avoid exceeding PostgreSQL's 8000-byte pg_notify limit.
+  const truncated = { ...payload };
+  if (typeof truncated.content === "string") {
+    truncated.content = truncated.content.slice(0, 500);
+  }
+  const text = JSON.stringify(truncated);
   await client.query("SELECT pg_notify($1, $2)", [`session_messages_${safeId}`, text]);
 }
 

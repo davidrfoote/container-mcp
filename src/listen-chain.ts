@@ -6,6 +6,49 @@ import { buildBootstrapInstruction, buildExecutionInstruction, buildCloseoutMess
 import { logger } from "./logger.js";
 
 let _reconnectMs = 1_000;
+// Interval handle for periodic backfill2; cleared on pg client error to avoid timer accumulation.
+let _backfill2Interval: ReturnType<typeof setInterval> | null = null;
+
+// ── Backfill 2: find sessions with approval_response but no EXECUTION yet ──
+// Extracted so it can be called at startup, after reconnect, and periodically.
+async function runBackfill2(dbUrl: string): Promise<void> {
+  const client = new Client({ connectionString: dbUrl });
+  try {
+    await client.connect();
+    const res = await client.query<{ session_id: string }>(
+      `SELECT DISTINCT s.session_id
+       FROM sessions s
+       JOIN session_messages sm_ar ON sm_ar.session_id = s.session_id
+         AND sm_ar.message_type = 'approval_response'
+       WHERE s.status IN ('active', 'pending')
+         AND s.session_type != 'interactive'
+         AND NOT EXISTS (
+           SELECT 1 FROM session_messages sm2
+           WHERE sm2.session_id = s.session_id
+             AND sm2.message_type IN ('execution_update', 'checkpoint')
+             AND sm2.role = 'coding_agent'
+             AND sm2.created_at > sm_ar.created_at
+         )
+       ORDER BY s.session_id`
+    );
+    if (res.rows.length > 0) {
+      logger.log(`[listen-chain] backfill2: ${res.rows.length} session(s) with unprocessed approval_response — spawning EXECUTION`);
+      for (const row of res.rows) {
+        try {
+          const { instruction, workingDir, resumeClaudeSessionId } = await buildExecutionInstruction(row.session_id, dbUrl);
+          spawnCodeTask({ instruction, workingDir, sessionId: row.session_id, dbUrl, resumeClaudeSessionId });
+          logger.log(`[listen-chain] backfill2 EXECUTION spawned for ${row.session_id}`);
+        } catch (e: any) {
+          logger.error(`[listen-chain] backfill2 error for ${row.session_id}:`, e.message);
+        }
+      }
+    }
+  } catch (err: any) {
+    logger.error("[listen-chain] backfill2 error:", err.message);
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
 
 export async function startListenChain(): Promise<void> {
   const dbUrl = process.env.OPS_DB_URL;
@@ -28,6 +71,9 @@ export async function startListenChain(): Promise<void> {
     listenClient.on("notification", (msg) => {
       void (async () => {
         try {
+          // Log every notification received so we can trace missing events.
+          logger.log(`[listen-chain] notification: channel=${msg.channel} len=${msg.payload?.length ?? 0}`);
+
           if (!msg.payload) return;
           const payload = JSON.parse(msg.payload) as {
             session_id?: string;
@@ -140,6 +186,7 @@ export async function startListenChain(): Promise<void> {
                 logger.log(`[listen-chain] skip approval wake for non-active session ${sessionId} (${session.status})`);
                 return;
               }
+              logger.log(`[listen-chain] session check passed for ${sessionId} (type=${session.session_type} status=${session.status})`);
             }
           } catch (e: any) {
             logger.warn(`[listen-chain] session check error for ${sessionId}:`, e.message);
@@ -216,6 +263,11 @@ export async function startListenChain(): Promise<void> {
 
     listenClient.on("error", (err: Error) => {
       logger.error("[listen-chain] Postgres LISTEN client error:", err.message);
+      // Clear the periodic backfill2 interval — the new connection will set up a fresh one.
+      if (_backfill2Interval !== null) {
+        clearInterval(_backfill2Interval);
+        _backfill2Interval = null;
+      }
       const delay = _reconnectMs;
       _reconnectMs = Math.min(_reconnectMs * 2, 60_000);
       setTimeout(() => { void startListenChain(); }, delay);
@@ -267,43 +319,8 @@ export async function startListenChain(): Promise<void> {
     }
   })();
 
-  // Backfill 2: find active/pending sessions with approval_response but no EXECUTION yet
-  void (async () => {
-    const backfill2Client = new Client({ connectionString: dbUrl });
-    try {
-      await backfill2Client.connect();
-      const res = await backfill2Client.query<{ session_id: string }>(
-        `SELECT DISTINCT s.session_id
-         FROM sessions s
-         JOIN session_messages sm_ar ON sm_ar.session_id = s.session_id
-           AND sm_ar.message_type = 'approval_response'
-         WHERE s.status IN ('active', 'pending')
-           AND s.session_type != 'interactive'
-           AND NOT EXISTS (
-             SELECT 1 FROM session_messages sm2
-             WHERE sm2.session_id = s.session_id
-               AND sm2.message_type IN ('execution_update', 'checkpoint')
-               AND sm2.role = 'coding_agent'
-               AND sm2.created_at > sm_ar.created_at
-           )
-         ORDER BY s.session_id`
-      );
-      if (res.rows.length > 0) {
-        logger.log(`[listen-chain] backfill2: ${res.rows.length} session(s) with unprocessed approval_response — spawning EXECUTION`);
-        for (const row of res.rows) {
-          try {
-            const { instruction, workingDir, resumeClaudeSessionId } = await buildExecutionInstruction(row.session_id, dbUrl);
-            spawnCodeTask({ instruction, workingDir, sessionId: row.session_id, dbUrl, resumeClaudeSessionId });
-            logger.log(`[listen-chain] backfill2 EXECUTION spawned for ${row.session_id}`);
-          } catch (e: any) {
-            logger.error(`[listen-chain] backfill2 error for ${row.session_id}:`, e.message);
-          }
-        }
-      }
-    } catch (err: any) {
-      logger.error("[listen-chain] backfill2 error:", err.message);
-    } finally {
-      await backfill2Client.end().catch(() => {});
-    }
-  })();
+  // Backfill 2: run immediately on (re)connect, then every 60 seconds as a safety net.
+  // This catches any approval_response notifications that were missed during a reconnect gap.
+  void runBackfill2(dbUrl);
+  _backfill2Interval = setInterval(() => { void runBackfill2(dbUrl); }, 60_000);
 }
