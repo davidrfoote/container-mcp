@@ -7,6 +7,46 @@ import { logger } from "./logger.js";
 
 let _reconnectMs = 1_000;
 
+// ── Backfill 2: find active/pending sessions with approval_response but no EXECUTION yet ──
+async function runBackfill2(dbUrl: string): Promise<void> {
+  const backfill2Client = new Client({ connectionString: dbUrl });
+  try {
+    await backfill2Client.connect();
+    const res = await backfill2Client.query<{ session_id: string }>(
+      `SELECT DISTINCT s.session_id
+       FROM sessions s
+       JOIN session_messages sm_ar ON sm_ar.session_id = s.session_id
+         AND sm_ar.message_type = 'approval_response'
+       WHERE s.status IN ('active', 'pending')
+         AND s.session_type != 'interactive'
+         AND NOT EXISTS (
+           SELECT 1 FROM session_messages sm2
+           WHERE sm2.session_id = s.session_id
+             AND sm2.message_type IN ('execution_update', 'checkpoint')
+             AND sm2.role = 'coding_agent'
+             AND sm2.created_at > sm_ar.created_at
+         )
+       ORDER BY s.session_id`
+    );
+    if (res.rows.length > 0) {
+      logger.log(`[listen-chain] backfill2: ${res.rows.length} session(s) with unprocessed approval_response — spawning EXECUTION`);
+      for (const row of res.rows) {
+        try {
+          const { instruction, workingDir, resumeClaudeSessionId } = await buildExecutionInstruction(row.session_id, dbUrl);
+          spawnCodeTask({ instruction, workingDir, sessionId: row.session_id, dbUrl, resumeClaudeSessionId });
+          logger.log(`[listen-chain] backfill2 EXECUTION spawned for ${row.session_id}`);
+        } catch (e: any) {
+          logger.error(`[listen-chain] backfill2 error for ${row.session_id}:`, e.message);
+        }
+      }
+    }
+  } catch (err: any) {
+    logger.error("[listen-chain] backfill2 error:", err.message);
+  } finally {
+    await backfill2Client.end().catch(() => {});
+  }
+}
+
 export async function startListenChain(): Promise<void> {
   const dbUrl = process.env.OPS_DB_URL;
   if (!dbUrl) {
@@ -18,6 +58,8 @@ export async function startListenChain(): Promise<void> {
   const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
 
   const listenClient = new Client({ connectionString: dbUrl });
+  let backfill2Interval: ReturnType<typeof setInterval> | null = null;
+
   try {
     await listenClient.connect();
     await listenClient.query("LISTEN session_messages");
@@ -28,6 +70,9 @@ export async function startListenChain(): Promise<void> {
     listenClient.on("notification", (msg) => {
       void (async () => {
         try {
+          // Log every notification received so we can tell if it arrived at all
+          logger.log(`[listen-chain] notification: channel=${msg.channel} len=${msg.payload?.length ?? 0}`);
+
           if (!msg.payload) return;
           const payload = JSON.parse(msg.payload) as {
             session_id?: string;
@@ -140,6 +185,9 @@ export async function startListenChain(): Promise<void> {
                 logger.log(`[listen-chain] skip approval wake for non-active session ${sessionId} (${session.status})`);
                 return;
               }
+              if (isApprovalResponse) {
+                logger.log(`[listen-chain] session check passed for ${sessionId} (status=${session.status}) — proceeding to spawn EXECUTION`);
+              }
             }
           } catch (e: any) {
             logger.warn(`[listen-chain] session check error for ${sessionId}:`, e.message);
@@ -216,12 +264,21 @@ export async function startListenChain(): Promise<void> {
 
     listenClient.on("error", (err: Error) => {
       logger.error("[listen-chain] Postgres LISTEN client error:", err.message);
+      // Clear periodic backfill2 timer so it doesn't fire on a dead client
+      if (backfill2Interval !== null) {
+        clearInterval(backfill2Interval);
+        backfill2Interval = null;
+      }
       const delay = _reconnectMs;
       _reconnectMs = Math.min(_reconnectMs * 2, 60_000);
       setTimeout(() => { void startListenChain(); }, delay);
     });
   } catch (err: any) {
     logger.error("[listen-chain] failed to start LISTEN:", err.message);
+    if (backfill2Interval !== null) {
+      clearInterval(backfill2Interval);
+      backfill2Interval = null;
+    }
     const delay = _reconnectMs;
     _reconnectMs = Math.min(_reconnectMs * 2, 60_000);
     setTimeout(() => { void startListenChain(); }, delay);
@@ -267,43 +324,7 @@ export async function startListenChain(): Promise<void> {
     }
   })();
 
-  // Backfill 2: find active/pending sessions with approval_response but no EXECUTION yet
-  void (async () => {
-    const backfill2Client = new Client({ connectionString: dbUrl });
-    try {
-      await backfill2Client.connect();
-      const res = await backfill2Client.query<{ session_id: string }>(
-        `SELECT DISTINCT s.session_id
-         FROM sessions s
-         JOIN session_messages sm_ar ON sm_ar.session_id = s.session_id
-           AND sm_ar.message_type = 'approval_response'
-         WHERE s.status IN ('active', 'pending')
-           AND s.session_type != 'interactive'
-           AND NOT EXISTS (
-             SELECT 1 FROM session_messages sm2
-             WHERE sm2.session_id = s.session_id
-               AND sm2.message_type IN ('execution_update', 'checkpoint')
-               AND sm2.role = 'coding_agent'
-               AND sm2.created_at > sm_ar.created_at
-           )
-         ORDER BY s.session_id`
-      );
-      if (res.rows.length > 0) {
-        logger.log(`[listen-chain] backfill2: ${res.rows.length} session(s) with unprocessed approval_response — spawning EXECUTION`);
-        for (const row of res.rows) {
-          try {
-            const { instruction, workingDir, resumeClaudeSessionId } = await buildExecutionInstruction(row.session_id, dbUrl);
-            spawnCodeTask({ instruction, workingDir, sessionId: row.session_id, dbUrl, resumeClaudeSessionId });
-            logger.log(`[listen-chain] backfill2 EXECUTION spawned for ${row.session_id}`);
-          } catch (e: any) {
-            logger.error(`[listen-chain] backfill2 error for ${row.session_id}:`, e.message);
-          }
-        }
-      }
-    } catch (err: any) {
-      logger.error("[listen-chain] backfill2 error:", err.message);
-    } finally {
-      await backfill2Client.end().catch(() => {});
-    }
-  })();
+  // Backfill 2: run immediately after connect, then every 60 seconds as a safety net
+  void runBackfill2(dbUrl);
+  backfill2Interval = setInterval(() => { void runBackfill2(dbUrl); }, 60_000);
 }
