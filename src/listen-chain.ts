@@ -3,11 +3,14 @@ import { Client } from "pg";
 import { buildSpawnMessage } from "./db.js";
 import { spawnCodeTask } from "./code-task.js";
 import { buildBootstrapInstruction, buildExecutionInstruction, buildCloseoutMessage } from "./bootstrap.js";
+import { logger } from "./logger.js";
+
+let _reconnectMs = 1_000;
 
 export async function startListenChain(): Promise<void> {
   const dbUrl = process.env.OPS_DB_URL;
   if (!dbUrl) {
-    console.warn("[listen-chain] OPS_DB_URL not set — background LISTEN chain disabled");
+    logger.warn("[listen-chain] OPS_DB_URL not set — background LISTEN chain disabled");
     return;
   }
 
@@ -19,7 +22,8 @@ export async function startListenChain(): Promise<void> {
     await listenClient.connect();
     await listenClient.query("LISTEN session_messages");
     await listenClient.query("LISTEN session_events");
-    console.log("[listen-chain] Postgres LISTEN session_messages + session_events started");
+    _reconnectMs = 1_000;
+    logger.log("[listen-chain] Postgres LISTEN session_messages + session_events started");
 
     listenClient.on("notification", (msg) => {
       void (async () => {
@@ -64,13 +68,13 @@ export async function startListenChain(): Promise<void> {
                 const complexity = (metadata?.complexity as string | undefined) ?? "medium";
 
                 if (complexity === "hard") {
-                  console.log(`[listen-chain] approval_request ${approvalMsgId} for ${sessionId} is hard — no auto-approve`);
+                  logger.log(`[listen-chain] approval_request ${approvalMsgId} for ${sessionId} is hard — no auto-approve`);
                   return;
                 }
 
                 const deadline = new Date(created_at).getTime() + 600_000;
                 const remaining = Math.max(0, deadline - Date.now());
-                console.log(`[listen-chain] approval_request ${approvalMsgId} for ${sessionId} (${complexity}) — auto-approve in ${Math.round(remaining / 1000)}s`);
+                logger.log(`[listen-chain] approval_request ${approvalMsgId} for ${sessionId} (${complexity}) — auto-approve in ${Math.round(remaining / 1000)}s`);
 
                 setTimeout(async () => {
                   try {
@@ -85,7 +89,7 @@ export async function startListenChain(): Promise<void> {
                     );
                     if (existingRes.rows.length > 0) {
                       await autoClient.end().catch(() => {});
-                      console.log(`[listen-chain] auto-approve skipped for ${sessionId} — already approved`);
+                      logger.log(`[listen-chain] auto-approve skipped for ${sessionId} — already approved`);
                       return;
                     }
                     const autoMsgId = `msg-${randomUUID()}`;
@@ -105,13 +109,13 @@ export async function startListenChain(): Promise<void> {
                     await autoClient.query(`SELECT pg_notify($1, $2)`, [`session_messages`, notifyPayload]);
                     await autoClient.query(`SELECT pg_notify($1, $2)`, [`session:${sessionId}`, notifyPayload]);
                     await autoClient.end().catch(() => {});
-                    console.log(`[listen-chain] server auto-approved session ${sessionId} (msg ${autoMsgId})`);
+                    logger.log(`[listen-chain] server auto-approved session ${sessionId} (msg ${autoMsgId})`);
                   } catch (err: any) {
-                    console.error("[listen-chain] auto-approve error:", err.message);
+                    logger.error("[listen-chain] auto-approve error:", err.message);
                   }
                 }, remaining);
               } catch (err: any) {
-                console.error("[listen-chain] approval_request handling error:", err.message);
+                logger.error("[listen-chain] approval_request handling error:", err.message);
               }
             })();
             return;
@@ -129,34 +133,34 @@ export async function startListenChain(): Promise<void> {
             if (checkRes.rows.length > 0) {
               const session = checkRes.rows[0];
               if (session.session_type === "interactive") {
-                console.log(`[listen-chain] skip for interactive session ${sessionId}`);
+                logger.log(`[listen-chain] skip for interactive session ${sessionId}`);
                 return;
               }
               if (isApprovalResponse && session.status !== "active" && session.status !== "pending") {
-                console.log(`[listen-chain] skip approval wake for non-active session ${sessionId} (${session.status})`);
+                logger.log(`[listen-chain] skip approval wake for non-active session ${sessionId} (${session.status})`);
                 return;
               }
             }
           } catch (e: any) {
-            console.warn(`[listen-chain] session check error for ${sessionId}:`, e.message);
+            logger.warn(`[listen-chain] session check error for ${sessionId}:`, e.message);
           }
 
           // ── approval_response → EXECUTION code_task ───────────────────
           if (isApprovalResponse) {
-            console.log(`[listen-chain] approval_response for ${sessionId} — spawning EXECUTION code task`);
+            logger.log(`[listen-chain] approval_response for ${sessionId} — spawning EXECUTION code task`);
             try {
               const { instruction, workingDir, resumeClaudeSessionId } = await buildExecutionInstruction(sessionId, dbUrl);
               spawnCodeTask({ instruction, workingDir, sessionId, dbUrl, resumeClaudeSessionId });
-              console.log(`[listen-chain] EXECUTION code task spawned for ${sessionId}`);
+              logger.log(`[listen-chain] EXECUTION code task spawned for ${sessionId}`);
             } catch (e: any) {
-              console.error(`[listen-chain] EXECUTION spawn error for ${sessionId}:`, e.message);
+              logger.error(`[listen-chain] EXECUTION spawn error for ${sessionId}:`, e.message);
             }
             return;
           }
 
           // ── checkpoint (coding_agent) → dev-lead close-out ────────────
           if (isCheckpoint) {
-            console.log(`[listen-chain] checkpoint from coding_agent for ${sessionId} — spawning dev-lead close-out`);
+            logger.log(`[listen-chain] checkpoint from coding_agent for ${sessionId} — spawning dev-lead close-out`);
             const checkpointContent = (payload as any).content ?? "(no checkpoint content)";
             try {
               const task = await buildCloseoutMessage(sessionId, checkpointContent, dbUrl);
@@ -170,20 +174,20 @@ export async function startListenChain(): Promise<void> {
               });
               if (resp.ok) {
                 const parsed = await resp.json().catch(() => ({})) as any;
-                console.log(`[listen-chain] dev-lead close-out spawned for ${sessionId}, key=${parsed?.childSessionKey ?? "n/a"}`);
+                logger.log(`[listen-chain] dev-lead close-out spawned for ${sessionId}, key=${parsed?.childSessionKey ?? "n/a"}`);
               } else {
                 const text = await resp.text().catch(() => "");
-                console.warn(`[listen-chain] dev-lead spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
+                logger.warn(`[listen-chain] dev-lead spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
               }
             } catch (e: any) {
-              console.error(`[listen-chain] close-out spawn error for ${sessionId}:`, e.message);
+              logger.error(`[listen-chain] close-out spawn error for ${sessionId}:`, e.message);
             }
             return;
           }
 
           // ── chat → dev-lead (interactive help) ───────────────────────
           if (isChatMessage) {
-            console.log(`[listen-chain] chat for ${sessionId} — spawning dev-lead`);
+            logger.log(`[listen-chain] chat for ${sessionId} — spawning dev-lead`);
             try {
               const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
                 method: "POST",
@@ -195,32 +199,36 @@ export async function startListenChain(): Promise<void> {
               });
               if (resp.ok) {
                 const parsed = await resp.json().catch(() => ({})) as any;
-                console.log(`[listen-chain] dev-lead spawned for chat ${sessionId}, key=${parsed?.childSessionKey ?? "n/a"}`);
+                logger.log(`[listen-chain] dev-lead spawned for chat ${sessionId}, key=${parsed?.childSessionKey ?? "n/a"}`);
               } else {
                 const text = await resp.text().catch(() => "");
-                console.warn(`[listen-chain] dev-lead chat spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
+                logger.warn(`[listen-chain] dev-lead chat spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
               }
             } catch (e: any) {
-              console.error(`[listen-chain] chat spawn error for ${sessionId}:`, e.message);
+              logger.error(`[listen-chain] chat spawn error for ${sessionId}:`, e.message);
             }
           }
         } catch (err: any) {
-          console.error("[listen-chain] notification handler error:", err.message);
+          logger.error("[listen-chain] notification handler error:", err.message);
         }
       })();
     });
 
     listenClient.on("error", (err: Error) => {
-      console.error("[listen-chain] Postgres LISTEN client error:", err.message);
-      setTimeout(() => { void startListenChain(); }, 10_000);
+      logger.error("[listen-chain] Postgres LISTEN client error:", err.message);
+      const delay = _reconnectMs;
+      _reconnectMs = Math.min(_reconnectMs * 2, 60_000);
+      setTimeout(() => { void startListenChain(); }, delay);
     });
   } catch (err: any) {
-    console.error("[listen-chain] failed to start LISTEN:", err.message);
-    setTimeout(() => { void startListenChain(); }, 10_000);
+    logger.error("[listen-chain] failed to start LISTEN:", err.message);
+    const delay = _reconnectMs;
+    _reconnectMs = Math.min(_reconnectMs * 2, 60_000);
+    setTimeout(() => { void startListenChain(); }, delay);
     return;
   }
 
-  // Backfill: find stuck pending sessions
+  // Backfill 1: find stuck pending sessions (BOOTSTRAP never ran)
   void (async () => {
     const backfillClient = new Client({ connectionString: dbUrl });
     try {
@@ -241,21 +249,61 @@ export async function startListenChain(): Promise<void> {
          ORDER BY s.session_id`
       );
       if (res.rows.length > 0) {
-        console.log(`[listen-chain] backfill: ${res.rows.length} pending session(s) found — spawning BOOTSTRAP`);
+        logger.log(`[listen-chain] backfill: ${res.rows.length} pending session(s) found — spawning BOOTSTRAP`);
         for (const row of res.rows) {
           try {
             const { instruction, workingDir, allowedTools } = await buildBootstrapInstruction(row.session_id, dbUrl);
             spawnCodeTask({ instruction, workingDir, sessionId: row.session_id, dbUrl, allowedTools });
-            console.log(`[listen-chain] backfill BOOTSTRAP spawned for ${row.session_id}`);
+            logger.log(`[listen-chain] backfill BOOTSTRAP spawned for ${row.session_id}`);
           } catch (e: any) {
-            console.error(`[listen-chain] backfill error for ${row.session_id}:`, e.message);
+            logger.error(`[listen-chain] backfill error for ${row.session_id}:`, e.message);
           }
         }
       }
     } catch (err: any) {
-      console.error("[listen-chain] backfill error:", err.message);
+      logger.error("[listen-chain] backfill error:", err.message);
     } finally {
       await backfillClient.end().catch(() => {});
+    }
+  })();
+
+  // Backfill 2: find active/pending sessions with approval_response but no EXECUTION yet
+  void (async () => {
+    const backfill2Client = new Client({ connectionString: dbUrl });
+    try {
+      await backfill2Client.connect();
+      const res = await backfill2Client.query<{ session_id: string }>(
+        `SELECT DISTINCT s.session_id
+         FROM sessions s
+         JOIN session_messages sm_ar ON sm_ar.session_id = s.session_id
+           AND sm_ar.message_type = 'approval_response'
+         WHERE s.status IN ('active', 'pending')
+           AND s.session_type != 'interactive'
+           AND NOT EXISTS (
+             SELECT 1 FROM session_messages sm2
+             WHERE sm2.session_id = s.session_id
+               AND sm2.message_type IN ('execution_update', 'checkpoint')
+               AND sm2.role = 'coding_agent'
+               AND sm2.created_at > sm_ar.created_at
+           )
+         ORDER BY s.session_id`
+      );
+      if (res.rows.length > 0) {
+        logger.log(`[listen-chain] backfill2: ${res.rows.length} session(s) with unprocessed approval_response — spawning EXECUTION`);
+        for (const row of res.rows) {
+          try {
+            const { instruction, workingDir, resumeClaudeSessionId } = await buildExecutionInstruction(row.session_id, dbUrl);
+            spawnCodeTask({ instruction, workingDir, sessionId: row.session_id, dbUrl, resumeClaudeSessionId });
+            logger.log(`[listen-chain] backfill2 EXECUTION spawned for ${row.session_id}`);
+          } catch (e: any) {
+            logger.error(`[listen-chain] backfill2 error for ${row.session_id}:`, e.message);
+          }
+        }
+      }
+    } catch (err: any) {
+      logger.error("[listen-chain] backfill2 error:", err.message);
+    } finally {
+      await backfill2Client.end().catch(() => {});
     }
   })();
 }
