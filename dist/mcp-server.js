@@ -381,7 +381,7 @@ function createMcpServer() {
             },
             {
                 name: "deploy_project",
-                description: "Deploy a project by ID. Reads build_cmd/deploy_cmd/smoke_url from projects table. Auto-detects deploy type for new projects. Runs build, deploy, smoke test with 12 retries. Posts result to session feed.",
+                description: "Deploy a project by ID. Spawns a CLI agent (Sonnet) that inspects topology files, builds, deploys, and smoke-tests the project. Returns immediately with a task ID; smoke_status is 'pending' until the agent posts a checkpoint to the session feed.",
                 inputSchema: {
                     type: "object",
                     properties: {
