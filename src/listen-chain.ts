@@ -2,7 +2,8 @@ import { randomUUID } from "crypto";
 import { Client } from "pg";
 import { buildSpawnMessage } from "./db.js";
 import { spawnCodeTask } from "./code-task.js";
-import { buildBootstrapInstruction, buildExecutionInstruction, buildCloseoutMessage } from "./bootstrap.js";
+import { buildBootstrapInstruction, buildExecutionInstruction } from "./bootstrap.js";
+import { runCloseout } from "./closeout.js";
 import { logger } from "./logger.js";
 
 let _reconnectMs = 1_000;
@@ -45,6 +46,39 @@ async function runBackfill2(dbUrl: string): Promise<void> {
     }
   } catch (err: any) {
     logger.error("[listen-chain] backfill2 error:", err.message);
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
+
+// ── Backfill 3: find active sessions with a checkpoint but no pending_review yet ──
+// Catches sessions whose close-out notification was missed during a reconnect gap.
+async function runBackfillCloseout(dbUrl: string): Promise<void> {
+  const client = new Client({ connectionString: dbUrl });
+  try {
+    await client.connect();
+    const res = await client.query<{ session_id: string; checkpoint_content: string }>(
+      `SELECT DISTINCT ON (s.session_id)
+         s.session_id,
+         sm.content AS checkpoint_content
+       FROM sessions s
+       JOIN session_messages sm ON sm.session_id = s.session_id
+         AND sm.message_type = 'checkpoint'
+         AND sm.role = 'coding_agent'
+       WHERE s.status = 'active'
+         AND s.session_type != 'interactive'
+       ORDER BY s.session_id, sm.created_at DESC`
+    );
+    if (res.rows.length > 0) {
+      logger.log(`[listen-chain] backfill-closeout: ${res.rows.length} session(s) with unprocessed checkpoint — running close-out`);
+      for (const row of res.rows) {
+        void runCloseout(row.session_id, row.checkpoint_content ?? "(no content)", dbUrl).catch((e: any) =>
+          logger.error(`[listen-chain] backfill-closeout error for ${row.session_id}:`, e.message)
+        );
+      }
+    }
+  } catch (err: any) {
+    logger.error("[listen-chain] backfill-closeout error:", err.message);
   } finally {
     await client.end().catch(() => {});
   }
@@ -205,30 +239,13 @@ export async function startListenChain(): Promise<void> {
             return;
           }
 
-          // ── checkpoint (coding_agent) → dev-lead close-out ────────────
+          // ── checkpoint (coding_agent) → direct close-out ──────────────
           if (isCheckpoint) {
-            logger.log(`[listen-chain] checkpoint from coding_agent for ${sessionId} — spawning dev-lead close-out`);
+            logger.log(`[listen-chain] checkpoint from coding_agent for ${sessionId} — running direct close-out`);
             const checkpointContent = (payload as any).content ?? "(no checkpoint content)";
-            try {
-              const task = await buildCloseoutMessage(sessionId, checkpointContent, dbUrl);
-              const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${gatewayToken}` },
-                body: JSON.stringify({
-                  tool: "sessions_spawn",
-                  args: { agentId: "dev-lead", task, cwd: "/home/openclaw/agents/dev-lead" },
-                }),
-              });
-              if (resp.ok) {
-                const parsed = await resp.json().catch(() => ({})) as any;
-                logger.log(`[listen-chain] dev-lead close-out spawned for ${sessionId}, key=${parsed?.childSessionKey ?? "n/a"}`);
-              } else {
-                const text = await resp.text().catch(() => "");
-                logger.warn(`[listen-chain] dev-lead spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
-              }
-            } catch (e: any) {
-              logger.error(`[listen-chain] close-out spawn error for ${sessionId}:`, e.message);
-            }
+            void runCloseout(sessionId, checkpointContent, dbUrl).catch((e: any) =>
+              logger.error(`[listen-chain] close-out error for ${sessionId}:`, e.message)
+            );
             return;
           }
 
@@ -323,4 +340,8 @@ export async function startListenChain(): Promise<void> {
   // This catches any approval_response notifications that were missed during a reconnect gap.
   void runBackfill2(dbUrl);
   _backfill2Interval = setInterval(() => { void runBackfill2(dbUrl); }, 60_000);
+
+  // Backfill 3: find active sessions with a checkpoint but no close-out yet.
+  // Runs once on (re)connect — no periodic interval needed (checkpoints are one-shot).
+  void runBackfillCloseout(dbUrl);
 }

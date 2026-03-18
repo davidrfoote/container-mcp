@@ -29,6 +29,7 @@ export async function ensureMigrations(dbUrl: string): Promise<void> {
   await withDbClient(dbUrl, async (client) => {
     await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS branch TEXT`);
     await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS worktree_path TEXT`);
+    await client.query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS github_repo TEXT`);
   });
 }
 
