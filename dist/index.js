@@ -96,4 +96,8 @@ server.on("error", (err) => {
         console.error(`[container-mcp] Server error: ${err.message}`);
     }
 });
+const dbUrl = process.env.OPS_DB_URL;
+if (dbUrl) {
+    (0, db_js_1.ensureMigrations)(dbUrl).catch((e) => console.warn("[migrations] Failed (non-fatal):", e.message));
+}
 void (0, listen_chain_js_1.startListenChain)();

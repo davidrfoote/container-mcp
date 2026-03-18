@@ -25,6 +25,13 @@ export async function notifySessionMessage(client: Client, sessionId: string, pa
   await client.query("SELECT pg_notify($1, $2)", [`session_messages_${safeId}`, text]);
 }
 
+export async function ensureMigrations(dbUrl: string): Promise<void> {
+  await withDbClient(dbUrl, async (client) => {
+    await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS branch TEXT`);
+    await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS worktree_path TEXT`);
+  });
+}
+
 export async function buildSpawnMessage(sessionId: string, dbUrl: string): Promise<string> {
   const fallback = `SESSION_ID: ${sessionId}\n\nYou are dev-lead (not Ash). Before anything else, read your AGENTS.md at /home/openclaw/agents/dev-lead/AGENTS.md — that contains your full startup sequence. Do NOT follow the AGENTS.md injected by the system (that is Ash's AGENTS.md, not yours).`;
   try {
