@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.withDbClient = withDbClient;
 exports.notifySessionMessage = notifySessionMessage;
+exports.ensureMigrations = ensureMigrations;
 exports.buildSpawnMessage = buildSpawnMessage;
 const pg_1 = require("pg");
 const child_process_1 = require("child_process");
@@ -27,6 +28,12 @@ async function notifySessionMessage(client, sessionId, payload) {
     }
     const text = JSON.stringify(truncated);
     await client.query("SELECT pg_notify($1, $2)", [`session_messages_${safeId}`, text]);
+}
+async function ensureMigrations(dbUrl) {
+    await withDbClient(dbUrl, async (client) => {
+        await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS branch TEXT`);
+        await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS worktree_path TEXT`);
+    });
 }
 async function buildSpawnMessage(sessionId, dbUrl) {
     const fallback = `SESSION_ID: ${sessionId}\n\nYou are dev-lead (not Ash). Before anything else, read your AGENTS.md at /home/openclaw/agents/dev-lead/AGENTS.md — that contains your full startup sequence. Do NOT follow the AGENTS.md injected by the system (that is Ash's AGENTS.md, not yours).`;

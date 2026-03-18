@@ -1,4 +1,5 @@
 import { randomUUID } from "crypto";
+import { spawnSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import * as http from "http";
@@ -44,8 +45,10 @@ export async function buildBootstrapInstruction(sessionId: string, dbUrl: string
       deploy_cmd: string | null;
       default_container: string | null;
       confluence_root_id: string | null;
+      branch: string | null;
+      worktree_path: string | null;
     }>(
-      `SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.default_container, p.confluence_root_id
+      `SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.default_container, p.confluence_root_id, s.branch, s.worktree_path
        FROM sessions s LEFT JOIN projects p ON p.project_id = s.project_id
        WHERE s.session_id = $1`,
       [sessionId]
@@ -59,7 +62,23 @@ export async function buildBootstrapInstruction(sessionId: string, dbUrl: string
 
   const projectId = data.session?.project_id ?? "unknown";
   const jiraKeys = data.session?.jira_issue_keys ?? [];
-  const workingDir = `/home/david/${projectId}`;
+  const sessionBranch = data.session?.branch ?? null;
+  const sessionWorktreePath = data.session?.worktree_path ?? null;
+
+  // Create worktree server-side and use it as workingDir (falls back to main repo if no worktree_path)
+  let workingDir = `/home/david/${projectId}`;
+  if (sessionWorktreePath && sessionBranch) {
+    if (!fs.existsSync(sessionWorktreePath)) {
+      fs.mkdirSync(path.dirname(sessionWorktreePath), { recursive: true });
+      const repoPath = `/home/david/${projectId}`;
+      const r = spawnSync("git", ["-C", repoPath, "worktree", "add", "-b", sessionBranch, sessionWorktreePath, "HEAD"], { encoding: "utf8" });
+      if (r.status !== 0) {
+        // Branch already exists — attach without -b
+        spawnSync("git", ["-C", repoPath, "worktree", "add", sessionWorktreePath, sessionBranch], { encoding: "utf8" });
+      }
+    }
+    workingDir = sessionWorktreePath;
+  }
 
   // Read cache summaries
   const cacheKeys = [
@@ -101,6 +120,7 @@ export async function buildBootstrapInstruction(sessionId: string, dbUrl: string
     `### Project`,
     `- project_id: ${projectId}`,
     `- repo: ${workingDir}`,
+    `- branch: ${sessionBranch ?? "main (no worktree)"}`,
     `- jira: ${jiraKeys.join(", ") || "none"}`,
     `- build: ${data.session?.build_cmd ?? "none"}`,
     ``,
@@ -142,8 +162,10 @@ export async function buildExecutionInstruction(sessionId: string, dbUrl: string
       deploy_cmd: string | null;
       default_container: string | null;
       claude_session_id: string | null;
+      branch: string | null;
+      worktree_path: string | null;
     }>(
-      `SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.default_container, s.claude_session_id
+      `SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.default_container, s.claude_session_id, s.branch, s.worktree_path
        FROM sessions s LEFT JOIN projects p ON p.project_id = s.project_id
        WHERE s.session_id = $1`,
       [sessionId]
@@ -166,7 +188,9 @@ export async function buildExecutionInstruction(sessionId: string, dbUrl: string
   const projectId = data.session?.project_id ?? "unknown";
   const jiraKeys = data.session?.jira_issue_keys ?? [];
   const primaryJira = jiraKeys[0] ?? "";
-  const workingDir = `/home/david/${projectId}`;
+  const worktreePath = data.session?.worktree_path ?? null;
+  const branch = data.session?.branch ?? null;
+  const workingDir = worktreePath ?? `/home/david/${projectId}`;
   const resumeClaudeSessionId = data.session?.claude_session_id ?? undefined;
 
   const userMods = (data.approval !== "approved" && data.approval !== "auto-approved")
@@ -188,16 +212,21 @@ export async function buildExecutionInstruction(sessionId: string, dbUrl: string
     `### Project`,
     `- project_id: ${projectId}`,
     `- repo: ${workingDir}`,
+    `- branch: ${branch ?? "main (no worktree)"}`,
     `- jira: ${jiraKeys.join(", ") || "none"}`,
     `- build: ${data.session?.build_cmd ?? "none"}`,
     `- deploy: ${data.session?.deploy_cmd ?? "none"}`,
     ``,
     `### Instructions`,
-    `1. Create a feature branch: \`git checkout -b feature/${primaryJira || "dev"}-<short-description>\``,
+    branch
+      ? `1. You are already on branch \`${branch}\` in the worktree at \`${workingDir}\`. Do NOT create another branch.`
+      : `1. Create a feature branch: \`git checkout -b feature/${primaryJira || "dev"}-<short-description>\``,
     `2. Implement the approved plan`,
     `3. Run the build and fix any errors: \`${data.session?.build_cmd ?? "npm run build"}\``,
     `4. Commit with message: "${primaryJira ? primaryJira + ": " : ""}<description>"`,
-    `5. Push the feature branch: \`git push origin feature/${primaryJira || "dev"}-<short-description>\``,
+    branch
+      ? `5. Push the branch: \`git push origin ${branch}\``
+      : `5. Push the feature branch: \`git push origin feature/${primaryJira || "dev"}-<short-description>\``,
     `6. When fully done, post a checkpoint via (include branch name and git SHA):`,
     ``,
     `\`\`\`bash`,
@@ -389,7 +418,7 @@ export async function bootstrapSession(params: {
   try {
     const existing = await withDbClient(dbUrl, async (client) => {
       const r = await client.query<{ session_id: string }>(
-        `SELECT session_id FROM sessions WHERE user_id = $1 AND project_id = $2 AND status = 'active' ORDER BY created_at DESC LIMIT 1`,
+        `SELECT session_id FROM sessions WHERE user_id = $1 AND project_id = $2 AND status = 'active' AND created_at > now() - interval '4 hours' ORDER BY created_at DESC LIMIT 1`,
         [user_id, projectId]
       );
       return r.rows[0] ?? null;
@@ -462,14 +491,25 @@ export async function bootstrapSession(params: {
   const sessionUrl = `https://dev-sessions.ash.zennya.app/sessions/${sessionId}`;
   const jiraKeysArr = allJiraKeys.length > 0 ? `{${allJiraKeys.join(",")}}` : null;
 
+  // Compute worktree branch + path for this session
+  const shortDesc = user_request
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 30);
+  const jiraSlug = (jiraIssueKey ?? "task").toLowerCase().replace(/[^a-z0-9]+/g, "-");
+  const sessionBranch = `ash/${jiraSlug}-${shortDesc}`;
+  const sessionWorktreePath = `/home/david/worktrees/${projectId}/${sessionBranch.replace(/\//g, "-")}`;
+
   try {
     await withDbClient(dbUrl, async (client) => {
       await client.query(
-        `INSERT INTO sessions (session_id, project_id, container, repo, status, session_type, title, prompt_preview, jira_issue_keys, user_id, triggered_by_name, triggered_by_slack_user_id, slack_thread_url, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'pending', 'dev', $5, $6, $7::text[], $8, $9, $10, $11, now(), now())`,
+        `INSERT INTO sessions (session_id, project_id, container, repo, status, session_type, title, prompt_preview, jira_issue_keys, user_id, triggered_by_name, triggered_by_slack_user_id, slack_thread_url, branch, worktree_path, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'pending', 'dev', $5, $6, $7::text[], $8, $9, $10, $11, $12, $13, now(), now())`,
         [sessionId, projectId, projConfig!.default_container ?? "dev-david", projectId,
           user_request.slice(0, 100), taskBrief.slice(0, 500), jiraKeysArr, user_id,
-          triggeredByName, triggeredBySlackUserId, slack_thread_url ?? null]
+          triggeredByName, triggeredBySlackUserId, slack_thread_url ?? null,
+          sessionBranch, sessionWorktreePath]
       );
       const msgId = `msg-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
       await client.query(

@@ -1,6 +1,6 @@
 import express from "express";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import { withDbClient, notifySessionMessage } from "./db.js";
+import { withDbClient, notifySessionMessage, ensureMigrations } from "./db.js";
 import { createMcpServer } from "./mcp-server.js";
 import { startListenChain } from "./listen-chain.js";
 
@@ -103,5 +103,10 @@ server.on("error", (err: NodeJS.ErrnoException) => {
     console.error(`[container-mcp] Server error: ${err.message}`);
   }
 });
+
+const dbUrl = process.env.OPS_DB_URL;
+if (dbUrl) {
+  ensureMigrations(dbUrl).catch((e) => console.warn("[migrations] Failed (non-fatal):", e.message));
+}
 
 void startListenChain();
