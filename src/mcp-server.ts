@@ -29,9 +29,12 @@ export function createMcpServer() {
     { capabilities: { tools: {} } }
   );
 
+  const codeTaskEnabled = process.env.CODE_TASK_ENABLED === "true";
+
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
-      {
+      ...(codeTaskEnabled ? [{
+      
         name: "code_task",
         description: "Run a coding task via Claude or Cline agent",
         inputSchema: {
@@ -84,7 +87,7 @@ export function createMcpServer() {
           },
           required: ["instruction", "working_dir"],
         },
-      },
+      }] : []),
       {
         name: "get_task_log",
         description: "Get buffered log lines for a task",
@@ -326,6 +329,7 @@ export function createMcpServer() {
             task_brief: { type: "string", description: "Full task brief content to post as task_brief message" },
             slack_thread_url: { type: "string", description: "Slack thread URL for notifications (optional)" },
             jira_keys: { type: "string", description: "Comma-separated Jira issue keys (optional, e.g. ZI-18820)" },
+            ash_session_key: { type: "string", description: "OpenClaw session key of the spawning Ash session (e.g. agent:main:openai:xxxx) for callback. Defaults to OPENCLAW_SESSION_KEY env var if not provided." },
           },
           required: ["title", "repo", "task_brief"],
         },
@@ -498,6 +502,9 @@ export function createMcpServer() {
     try {
       switch (name) {
         case "code_task": {
+          if (process.env.CODE_TASK_ENABLED !== "true") {
+            return { content: [{ type: "text", text: "code_task is disabled on this container (CODE_TASK_ENABLED not set to true)" }], isError: true };
+          }
           const {
             instruction,
             working_dir,
@@ -1383,6 +1390,7 @@ export function createMcpServer() {
             task_brief,
             slack_thread_url,
             jira_keys,
+            ash_session_key,
           } = args as any;
 
           const dbUrl = process.env.OPS_DB_URL;
@@ -1449,7 +1457,7 @@ export function createMcpServer() {
                 },
                 body: JSON.stringify({
                   tool: "sessions_spawn",
-                  args: { agentId: "dev-lead", task: await buildSpawnMessage(sessionId, dbUrl), cwd: "/home/openclaw/agents/dev-lead" },
+                  args: { agentId: "dev-lead", task: await buildSpawnMessage(sessionId, dbUrl, ash_session_key), cwd: "/home/openclaw/agents/dev-lead" },
                 }),
               });
               if (!resp.ok) {
