@@ -407,7 +407,7 @@ export function createMcpServer() {
       },
       {
         name: "create_project",
-        description: "Register a new project in the projects table (or update an existing one). Sets display name, description, build/deploy commands, working directory, default container, Jira keys, Confluence root, and smoke URL. Auto-detects build/deploy commands from the filesystem if not provided.",
+        description: "Register a new project in the projects table (or update an existing one). Sets display name, description, build command, working directory, default container, Jira keys, Confluence root, and smoke URL. Auto-detects build command from the filesystem if not provided. Note: deploy_cmd is deprecated — deployment is handled by the CLI agent via deploy_project.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1563,7 +1563,6 @@ export function createMcpServer() {
             working_dir: inputWorkingDir,
             default_container,
             build_cmd: inputBuildCmd,
-            deploy_cmd: inputDeployCmd,
             smoke_url: inputSmokeUrl,
             jira_issue_keys: jiraKeysStr,
             confluence_root_id,
@@ -1582,43 +1581,23 @@ export function createMcpServer() {
           }
 
           let buildCmd = inputBuildCmd || null;
-          let deployCmd = inputDeployCmd || null;
-          if (workingDir && (!buildCmd || !deployCmd)) {
+          const deployCmd: string | null = null; // deprecated — deploy_project uses CLI agent topology detection
+          if (workingDir && !buildCmd) {
             const hasSwarmYml = fs.existsSync(path.join(workingDir, 'swarm.yml'));
             const hasDockerfile = fs.existsSync(path.join(workingDir, 'Dockerfile'));
             const hasPkgJson = fs.existsSync(path.join(workingDir, 'package.json'));
             const hasRequirements = fs.existsSync(path.join(workingDir, 'requirements.txt'));
             const hasPyproject = fs.existsSync(path.join(workingDir, 'pyproject.toml'));
 
-            if (!buildCmd || !deployCmd) {
-              let detectedBuild: string | null = null;
-              let detectedDeploy: string | null = null;
-              if (hasSwarmYml) {
-                detectedBuild = `cd ${workingDir} && docker build -t ${projectId}:latest .`;
-                detectedDeploy = `docker stack deploy -c ${workingDir}/swarm.yml ${projectId}`;
-              } else if (hasDockerfile) {
-                detectedBuild = `cd ${workingDir} && docker build -t ${projectId}:latest .`;
-                detectedDeploy = `docker service update --image ${projectId}:latest prod_${projectId} || docker service update --image ${projectId}:latest ${projectId}`;
-              } else if (hasPkgJson) {
-                let pkgJson: Record<string, unknown> = {};
-                try { pkgJson = JSON.parse(fs.readFileSync(path.join(workingDir, 'package.json'), 'utf8')) as Record<string, unknown>; } catch {}
-                const deps = (pkgJson?.dependencies ?? {}) as Record<string, unknown>;
-                const devDeps = (pkgJson?.devDependencies ?? {}) as Record<string, unknown>;
-                const isNext = Boolean(deps.next ?? devDeps.next);
-                if (isNext) {
-                  detectedBuild = `cd ${workingDir} && docker build -t ${projectId}:latest .`;
-                  detectedDeploy = `docker service update --image ${projectId}:latest prod_${projectId} || docker service update --image ${projectId}:latest ${projectId}`;
-                } else {
-                  detectedBuild = `cd ${workingDir} && npm install && npm run build`;
-                  detectedDeploy = `pkill -f "node dist/index.js" 2>/dev/null || true; nohup node ${workingDir}/dist/index.js > /tmp/${projectId}.log 2>&1 &`;
-                }
-              } else if (hasRequirements || hasPyproject) {
-                detectedBuild = `cd ${workingDir} && pip install -r ${hasRequirements ? 'requirements.txt' : '.'} -q`;
-                detectedDeploy = `pkill -f "${workingDir}/main.py" 2>/dev/null || true; nohup python3 ${workingDir}/main.py > /tmp/${projectId}.log 2>&1 &`;
-              }
-              if (!buildCmd) buildCmd = detectedBuild;
-              if (!deployCmd) deployCmd = detectedDeploy;
+            let detectedBuild: string | null = null;
+            if (hasSwarmYml || hasDockerfile) {
+              detectedBuild = `cd ${workingDir} && docker build -t ${projectId}:latest .`;
+            } else if (hasPkgJson) {
+              detectedBuild = `cd ${workingDir} && npm install && npm run build`;
+            } else if (hasRequirements || hasPyproject) {
+              detectedBuild = `cd ${workingDir} && pip install -r ${hasRequirements ? 'requirements.txt' : '.'} -q`;
             }
+            buildCmd = detectedBuild;
           }
 
           const jiraKeysArr = jiraKeysStr
