@@ -407,7 +407,7 @@ export function createMcpServer() {
       },
       {
         name: "create_project",
-        description: "Register a new project in the projects table (or update an existing one). Sets display name, description, build/deploy commands, working directory, default container, Jira keys, Confluence root, and smoke URL. Auto-detects build/deploy commands from the filesystem if not provided.",
+        description: "Register a new project in the projects table (or update an existing one). Sets display name, description, build command, working directory, default container, Jira keys, Confluence root, and smoke URL. Auto-detects build command from the filesystem if not provided. Note: deploy_cmd is deprecated — deployment is handled by the CLI agent via deploy_project.",
         inputSchema: {
           type: "object",
           properties: {
