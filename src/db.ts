@@ -34,6 +34,10 @@ export async function ensureMigrations(dbUrl: string): Promise<void> {
     await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS active_task_id TEXT`);
     await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS task_started_at TIMESTAMPTZ`);
     await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS container_heartbeat_at TIMESTAMPTZ`);
+    // CLI execution metadata (populated from stream-json result event)
+    await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS model TEXT`);
+    await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS num_turns INT`);
+    await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS task_duration_ms INT`);
   });
 }
 

@@ -58,7 +58,6 @@ export function spawnCodeTask(params: {
         "-p", instruction,
         "--output-format", "stream-json",
         "--verbose",
-        "--include-partial-messages",
         "--append-system-prompt-file", rulesFile,
         "--permission-mode", "acceptEdits",
         "--max-turns", String(maxTurns),
@@ -106,60 +105,180 @@ export function spawnCodeTask(params: {
         }
       });
 
+      // Accumulate stdout across chunks — JSON lines may span chunk boundaries
+      let stdoutBuf = "";
       proc.stdout.on("data", (chunk: Buffer) => {
-        const lines = chunk.toString().split("\n");
+        stdoutBuf += chunk.toString();
+        const lines = stdoutBuf.split("\n");
+        // Keep the last (potentially incomplete) line in the buffer
+        stdoutBuf = lines.pop() ?? "";
+
         for (const line of lines) {
           if (!line.trim()) continue;
           log(line);
           try {
-            const parsed = JSON.parse(line);
-            if (parsed.type === "result") {
-              // Persist the claude session ID so EXECUTION pass can resume it
+            const parsed = JSON.parse(line) as Record<string, unknown>;
+            const evType = parsed.type as string;
+
+            // ── system init: model, version, tools, MCP servers ──────────────
+            if (evType === "system" && parsed.subtype === "init") {
+              const cliModel = parsed.model as string | undefined;
+              const version = parsed.claude_code_version as string | undefined;
+              const permMode = parsed.permissionMode as string | undefined;
+              const mcpServers = (parsed.mcp_servers as string[]) ?? [];
+              const tools = (parsed.tools as string[]) ?? [];
+
+              // Persist model name into sessions table
+              if (cliModel && sessionId && dbUrl) {
+                void withDbClient(dbUrl, async (client) => {
+                  await client.query(
+                    `UPDATE sessions SET model = $1, updated_at = now() WHERE session_id = $2`,
+                    [cliModel, sessionId]
+                  );
+                }).catch((e: Error) => console.error(`[spawnCodeTask] model write failed: ${e.message}`));
+              }
+
+              const mcpStr = mcpServers.length > 0 ? mcpServers.join(", ") : "none";
+              postToFeed(
+                sessionId!, dbUrl!,
+                `⚙️ Claude Code v${version ?? "?"} · Model: ${cliModel ?? "?"} · Mode: ${permMode ?? "?"} · MCP: ${mcpStr} · ${tools.length} tools available`,
+                "system", "console"
+              );
+
+            // ── assistant turn: tool calls and thinking text ─────────────────
+            } else if (evType === "assistant") {
+              const content = (parsed.message as any)?.content ?? [];
+              for (const block of content) {
+                if (block.type === "tool_use") {
+                  const argsStr = JSON.stringify(block.input ?? {}).slice(0, 600);
+                  postToFeed(sessionId!, dbUrl!, `🔧 \`${block.name}\` ${argsStr}`, "coding_agent", "execution_log");
+                } else if (block.type === "text" && block.text?.trim()) {
+                  const text = (block.text as string).trim().slice(0, 1500);
+                  if (text.length > 20) postToFeed(sessionId!, dbUrl!, `💭 ${text}`, "coding_agent", "execution_log");
+                }
+              }
+
+            // ── user turn: tool results (this is where they actually live) ───
+            } else if (evType === "user") {
+              const content = (parsed.message as any)?.content ?? [];
+              for (const block of content) {
+                if (block.type === "tool_result") {
+                  const isError = block.is_error === true;
+                  const raw = block.content;
+                  const resultText: string = typeof raw === "string"
+                    ? raw
+                    : Array.isArray(raw)
+                      ? (raw as { type: string; text?: string }[])
+                          .filter(c => c.type === "text")
+                          .map(c => c.text ?? "")
+                          .join("")
+                      : "";
+                  const truncated = resultText.slice(0, 2000);
+                  if (truncated) {
+                    postToFeed(
+                      sessionId!, dbUrl!,
+                      `${isError ? "❌" : "📄"} ${truncated}`,
+                      "coding_agent", "execution_log"
+                    );
+                  }
+                }
+              }
+
+            // ── rate limit: surface blockages immediately ────────────────────
+            } else if (evType === "rate_limit_event") {
+              const info = parsed.rate_limit_info as Record<string, unknown> | undefined;
+              if (info?.status === "blocked") {
+                const resetsAt = typeof info.resetsAt === "number"
+                  ? new Date(info.resetsAt * 1000).toISOString()
+                  : "unknown";
+                postToFeed(
+                  sessionId!, dbUrl!,
+                  `⏸️ Rate limited (${info.rateLimitType ?? "unknown"}) — resets at ${resetsAt}`,
+                  "system", "console"
+                );
+              }
+
+            // ── result: final summary with accurate cost, turns, model usage ─
+            } else if (evType === "result") {
               const claudeSessionId = parsed.session_id as string | undefined;
+              const subtype = (parsed.subtype as string) ?? "success";
+              const isError = parsed.is_error === true;
+              const output = ((parsed.result ?? parsed.output ?? "") as string);
+              const totalCostUsd = parsed.total_cost_usd as number | undefined;
+              const numTurns = parsed.num_turns as number | undefined;
+              const durationMs = parsed.duration_ms as number | undefined;
+              const permDenials = (parsed.permission_denials as { tool_name: string }[]) ?? [];
+              const modelUsage = parsed.modelUsage as Record<string, { costUSD?: number; inputTokens?: number; outputTokens?: number }> | undefined;
+              const usage = parsed.usage as { input_tokens?: number; output_tokens?: number } | undefined;
+
+              // Persist claude session ID for EXECUTION pass --resume
               if (claudeSessionId && sessionId && dbUrl) {
                 void withDbClient(dbUrl, async (client) => {
                   await client.query(
                     `UPDATE sessions SET claude_session_id = $1, updated_at = now() WHERE session_id = $2`,
                     [claudeSessionId, sessionId]
-                  ).catch(() => {});
-                });
+                  );
+                }).catch(() => {});
               }
-              const output = (parsed.result || parsed.output || "") as string;
-              postToFeed(sessionId!, dbUrl!, `✅ Task complete\n\n${output.slice(0, 4000)}`);
-              const usage = parsed.usage as { input_tokens?: number; output_tokens?: number } | undefined;
-              if (usage && sessionId && dbUrl) {
-                const inputTokens = usage.input_tokens || 0;
-                const outputTokens = usage.output_tokens || 0;
-                const costUsd = (inputTokens / 1_000_000 * 3) + (outputTokens / 1_000_000 * 15);
+
+              // Build human-readable summary line
+              const icon = isError ? "❌" : subtype === "interrupted" ? "⚠️" : subtype === "timeout" ? "⏱️" : "✅";
+              const parts: string[] = [`${icon} Task ${subtype}`];
+              if (durationMs !== undefined) parts.push(`${(durationMs / 1000).toFixed(1)}s`);
+              if (numTurns !== undefined) parts.push(`${numTurns} turn${numTurns !== 1 ? "s" : ""}`);
+              if (totalCostUsd !== undefined) parts.push(`$${totalCostUsd.toFixed(4)}`);
+
+              // Per-model cost breakdown when multiple models were used
+              if (modelUsage) {
+                const breakdown = Object.entries(modelUsage)
+                  .map(([m, u]) => `${m}: $${(u.costUSD ?? 0).toFixed(4)}`)
+                  .join(", ");
+                if (breakdown) parts.push(`[${breakdown}]`);
+              }
+
+              let summary = parts.join(" · ");
+              if (permDenials.length > 0) {
+                summary += `\n⛔ Permission denials: ${permDenials.map(p => p.tool_name).join(", ")}`;
+              }
+              if (output) summary += `\n\n${output.slice(0, 3000)}`;
+
+              postToFeed(sessionId!, dbUrl!, summary);
+
+              // Update token usage and cost using accurate values from Claude
+              if (sessionId && dbUrl) {
+                const inputTokens = usage?.input_tokens ?? 0;
+                const outputTokens = usage?.output_tokens ?? 0;
+                const costToStore = totalCostUsd ?? ((inputTokens / 1_000_000 * 3) + (outputTokens / 1_000_000 * 15));
                 void withDbClient(dbUrl, async (client) => {
                   await client.query(
-                    `UPDATE sessions SET token_usage = COALESCE(token_usage, 0) + $1, cost_usd = COALESCE(cost_usd, 0) + $2 WHERE session_id = $3`,
-                    [inputTokens + outputTokens, costUsd, sessionId]
+                    `UPDATE sessions
+                     SET token_usage = COALESCE(token_usage, 0) + $1,
+                         cost_usd = COALESCE(cost_usd, 0) + $2,
+                         num_turns = COALESCE(num_turns, 0) + $3,
+                         task_duration_ms = COALESCE(task_duration_ms, 0) + $4,
+                         updated_at = now()
+                     WHERE session_id = $5`,
+                    [inputTokens + outputTokens, costToStore, numTurns ?? 0, durationMs ?? 0, sessionId]
                   );
-                }).catch((err) => console.error("[token-usage] Failed:", err));
+                }).catch((err: Error) => console.error("[token-usage] Failed:", err));
               }
-            } else if (parsed.type === "assistant") {
-              for (const block of (parsed.message?.content || [])) {
-                if (block.type === "tool_use") {
-                  postToFeed(sessionId!, dbUrl!, `🔧 \`${block.name}\` ${JSON.stringify(block.input || {}).slice(0, 500)}`);
-                } else if (block.type === "text" && block.text?.trim() && !parsed.message?.usage) {
-                  const text = block.text.trim().slice(0, 1000);
-                  if (text.length > 20) postToFeed(sessionId!, dbUrl!, `💭 ${text}`);
-                }
-              }
-            } else if (parsed.type === "tool_result") {
-              const resultText = (parsed.content?.[0]?.text || "").slice(0, 2000);
-              if (resultText) postToFeed(sessionId!, dbUrl!, `📄 Result: ${resultText}`);
             }
           } catch {}
         }
       });
+      let stderrBuf = "";
       proc.stderr.on("data", (chunk: Buffer) => {
         const text = chunk.toString();
+        stderrBuf += text;
         log("[stderr] " + text);
-        // Surface non-trivial stderr to session feed (auth errors, crashes)
-        if (text.includes("Error") || text.includes("error") || text.includes("failed")) {
-          postToFeed(sessionId!, dbUrl!, `⚠️ stderr: ${text.slice(0, 500)}`, "system", "console");
+        // Surface all stderr to the session feed — not just errors.
+        // Warnings, deprecations, and diagnostics are all useful for debugging.
+        // Debounce: flush when we see a newline to avoid posting char-by-char.
+        const newlineIdx = stderrBuf.indexOf("\n");
+        if (newlineIdx !== -1) {
+          const toPost = stderrBuf.slice(0, 2000).trim();
+          stderrBuf = "";
+          if (toPost) postToFeed(sessionId!, dbUrl!, `⚠️ stderr: ${toPost}`, "system", "console");
         }
       });
       proc.on("close", (code) => {
