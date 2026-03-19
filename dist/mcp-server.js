@@ -47,64 +47,75 @@ const task_logs_js_1 = require("./task-logs.js");
 const jira_confluence_js_1 = require("./jira-confluence.js");
 const bootstrap_js_1 = require("./bootstrap.js");
 const deploy_project_js_1 = require("./tools/deploy-project.js");
+function modelCostPerMillion(model) {
+    if (!model)
+        return { input: 3, output: 15 };
+    const m = model.toLowerCase();
+    if (m.includes("haiku"))
+        return { input: 0.25, output: 1.25 };
+    if (m.includes("opus"))
+        return { input: 15, output: 75 };
+    return { input: 3, output: 15 };
+}
 function createMcpServer() {
     const server = new index_js_1.Server({ name: "container-mcp", version: "2.2.0" }, { capabilities: { tools: {} } });
+    const codeTaskEnabled = process.env.CODE_TASK_ENABLED === "true";
     server.setRequestHandler(types_js_1.ListToolsRequestSchema, async () => ({
         tools: [
-            {
-                name: "code_task",
-                description: "Run a coding task via Claude or Cline agent",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        instruction: { type: "string", description: "Task instruction" },
-                        working_dir: { type: "string", description: "Working directory" },
-                        driver: {
-                            type: "string",
-                            enum: ["claude", "cline"],
-                            default: "claude",
-                            description: "Agent driver to use",
+            ...(codeTaskEnabled ? [{
+                    name: "code_task",
+                    description: "Run a coding task via Claude or Cline agent",
+                    inputSchema: {
+                        type: "object",
+                        properties: {
+                            instruction: { type: "string", description: "Task instruction" },
+                            working_dir: { type: "string", description: "Working directory" },
+                            driver: {
+                                type: "string",
+                                enum: ["claude", "cline"],
+                                default: "claude",
+                                description: "Agent driver to use",
+                            },
+                            task_id: { type: "string", description: "Optional task ID (uuid generated if not provided)" },
+                            max_turns: { type: "number", default: 30 },
+                            budget_usd: { type: "number", default: 5.0 },
+                            timeout_seconds: { type: "number", default: 900 },
+                            task_rules: { type: "string", description: "Extra rules to append to system prompt" },
+                            base_rules_path: { type: "string", default: "/home/david/.rules/base.md" },
+                            project_rules_path: { type: "string", default: "/.rules/project.md" },
+                            session_id: { type: "string", description: "ops-db session ID to post execution_update messages to" },
+                            ops_db_url: { type: "string", description: "PostgreSQL connection URL (falls back to OPS_DB_URL env)" },
+                            model: {
+                                type: "string",
+                                description: "Model override (e.g. 'haiku', 'sonnet', 'opus', or full model ID). Defaults to account default.",
+                            },
+                            effort: {
+                                type: "string",
+                                enum: ["low", "medium", "high", "max"],
+                                description: "Effort level (controls reasoning depth). Default: medium.",
+                            },
+                            agents: {
+                                type: "string",
+                                description: "JSON object defining custom sub-agents available to this task.",
+                            },
+                            allowed_tools: {
+                                type: "array",
+                                items: { type: "string" },
+                                description: "Whitelist of tools the CLI may use.",
+                            },
+                            resume_claude_session_id: {
+                                type: "string",
+                                description: "Resume a previous claude CLI session by session ID for context continuity across passes.",
+                            },
+                            add_dirs: {
+                                type: "array",
+                                items: { type: "string" },
+                                description: "Additional directories to allow tool access to (passed as --add-dir).",
+                            },
                         },
-                        task_id: { type: "string", description: "Optional task ID (uuid generated if not provided)" },
-                        max_turns: { type: "number", default: 30 },
-                        budget_usd: { type: "number", default: 5.0 },
-                        timeout_seconds: { type: "number", default: 900 },
-                        task_rules: { type: "string", description: "Extra rules to append to system prompt" },
-                        base_rules_path: { type: "string", default: "/home/david/.rules/base.md" },
-                        project_rules_path: { type: "string", default: "/.rules/project.md" },
-                        session_id: { type: "string", description: "ops-db session ID to post execution_update messages to" },
-                        ops_db_url: { type: "string", description: "PostgreSQL connection URL (falls back to OPS_DB_URL env)" },
-                        model: {
-                            type: "string",
-                            description: "Model override (e.g. 'haiku', 'sonnet', 'opus', or full model ID). Defaults to account default.",
-                        },
-                        effort: {
-                            type: "string",
-                            enum: ["low", "medium", "high", "max"],
-                            description: "Effort level (controls reasoning depth). Default: medium.",
-                        },
-                        agents: {
-                            type: "string",
-                            description: "JSON object defining custom sub-agents available to this task.",
-                        },
-                        allowed_tools: {
-                            type: "array",
-                            items: { type: "string" },
-                            description: "Whitelist of tools the CLI may use.",
-                        },
-                        resume_claude_session_id: {
-                            type: "string",
-                            description: "Resume a previous claude CLI session by session ID for context continuity across passes.",
-                        },
-                        add_dirs: {
-                            type: "array",
-                            items: { type: "string" },
-                            description: "Additional directories to allow tool access to (passed as --add-dir).",
-                        },
+                        required: ["instruction", "working_dir"],
                     },
-                    required: ["instruction", "working_dir"],
-                },
-            },
+                }] : []),
             {
                 name: "get_task_log",
                 description: "Get buffered log lines for a task",
@@ -346,6 +357,7 @@ function createMcpServer() {
                         task_brief: { type: "string", description: "Full task brief content to post as task_brief message" },
                         slack_thread_url: { type: "string", description: "Slack thread URL for notifications (optional)" },
                         jira_keys: { type: "string", description: "Comma-separated Jira issue keys (optional, e.g. ZI-18820)" },
+                        ash_session_key: { type: "string", description: "OpenClaw session key of the spawning Ash session (e.g. agent:main:openai:xxxx) for callback. Defaults to OPENCLAW_SESSION_KEY env var if not provided." },
                     },
                     required: ["title", "repo", "task_brief"],
                 },
@@ -516,13 +528,16 @@ function createMcpServer() {
         try {
             switch (name) {
                 case "code_task": {
+                    if (process.env.CODE_TASK_ENABLED !== "true") {
+                        return { content: [{ type: "text", text: "code_task is disabled on this container (CODE_TASK_ENABLED not set to true)" }], isError: true };
+                    }
                     const { instruction, working_dir, driver = "claude", task_id, max_turns = 30, budget_usd = 5.0, timeout_seconds = 900, task_rules, base_rules_path = "/home/david/.rules/base.md", project_rules_path = "/.rules/project.md", session_id, ops_db_url, model, effort, agents, allowed_tools, resume_claude_session_id, add_dirs, } = args;
                     const dbUrl = ops_db_url || process.env.OPS_DB_URL;
                     const taskId = task_id || (0, crypto_1.randomUUID)();
                     task_logs_js_1.taskLogs.set(taskId, []);
                     const log = (line) => task_logs_js_1.taskLogs.get(taskId).push(line);
                     const debugLogPath = `/tmp/task-${taskId}-debug.log`;
-                    (0, feed_js_1.postToFeed)(session_id, dbUrl, `🚀 Starting \`code_task\` (driver: ${driver}, task_id: ${taskId}${model ? `, model: ${model}` : ""}${resume_claude_session_id ? ", resumed" : ""})\n\nInstruction: ${instruction.slice(0, 400)}`);
+                    (0, feed_js_1.postToFeed)(session_id, dbUrl, `🤖 Model: ${model || "default (account)"} | driver: ${driver} | effort: ${effort || "medium"} | task_id: ${taskId}`);
                     // Compose rules
                     let rules = "";
                     try {
@@ -573,8 +588,16 @@ function createMcpServer() {
                                 const proc = (0, child_process_1.spawn)("claude", claudeArgs, {
                                     cwd: working_dir, env: process.env, stdio: ['ignore', 'pipe', 'pipe'],
                                 });
+                                if (session_id && dbUrl) {
+                                    const resolvedModel = model || "default";
+                                    void (0, db_js_1.withDbClient)(dbUrl, async (client) => {
+                                        await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS model TEXT`).catch(() => { });
+                                        await client.query(`UPDATE sessions SET model = $1 WHERE session_id = $2`, [resolvedModel, session_id]);
+                                    }).catch(() => { });
+                                }
                                 let output = "";
                                 const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeout_seconds * 1000);
+                                const toolUseMap = new Map();
                                 proc.stdout.on("data", (chunk) => {
                                     const lines = chunk.toString().split("\n");
                                     for (const line of lines) {
@@ -597,7 +620,8 @@ function createMcpServer() {
                                                     const inputTokens = usage.input_tokens || 0;
                                                     const outputTokens = usage.output_tokens || 0;
                                                     const totalTokens = inputTokens + outputTokens;
-                                                    const costUsd = (inputTokens / 1_000_000 * 3) + (outputTokens / 1_000_000 * 15);
+                                                    const { input: inputCostPerM, output: outputCostPerM } = modelCostPerMillion(model);
+                                                    const costUsd = (inputTokens / 1_000_000 * inputCostPerM) + (outputTokens / 1_000_000 * outputCostPerM);
                                                     void (0, db_js_1.withDbClient)(dbUrl, async (client) => {
                                                         await client.query(`UPDATE sessions SET token_usage = COALESCE(token_usage, 0) + $1, cost_usd = COALESCE(cost_usd, 0) + $2 WHERE session_id = $3`, [totalTokens, costUsd, session_id]);
                                                     }).catch((err) => console.error('[token-usage] Failed to update token usage:', err));
@@ -607,8 +631,12 @@ function createMcpServer() {
                                                 const content = parsed.message?.content || [];
                                                 for (const block of content) {
                                                     if (block.type === "tool_use") {
+                                                        toolUseMap.set(block.id, block.name);
                                                         const toolInput = JSON.stringify(block.input || {}).slice(0, 500);
                                                         (0, feed_js_1.postToFeed)(session_id, dbUrl, `🔧 \`${block.name}\` ${toolInput}`);
+                                                    }
+                                                    else if (block.type === "thinking" && block.thinking?.trim()) {
+                                                        (0, feed_js_1.postToFeed)(session_id, dbUrl, `🧠 ${block.thinking.trim().slice(0, 600)}`);
                                                     }
                                                     else if (block.type === "text" && block.text?.trim() && !parsed.message?.usage) {
                                                         const text = block.text.trim().slice(0, 1000);
@@ -617,10 +645,20 @@ function createMcpServer() {
                                                     }
                                                 }
                                             }
-                                            else if (parsed.type === "tool_result") {
-                                                const resultText = (parsed.content?.[0]?.text || "").slice(0, 2000);
-                                                if (resultText)
-                                                    (0, feed_js_1.postToFeed)(session_id, dbUrl, `📄 Result: ${resultText}`);
+                                            else if (parsed.type === "user") {
+                                                const content = parsed.message?.content || [];
+                                                for (const block of content) {
+                                                    if (block.type === "tool_result") {
+                                                        const toolName = toolUseMap.get(block.tool_use_id) || block.tool_use_id || "unknown";
+                                                        let resultText = "";
+                                                        if (typeof block.content === "string")
+                                                            resultText = block.content;
+                                                        else if (Array.isArray(block.content))
+                                                            resultText = block.content.map((c) => c.text || "").join("\n");
+                                                        if (resultText)
+                                                            (0, feed_js_1.postToFeed)(session_id, dbUrl, `📄 ${toolName} → ${resultText.slice(0, 800)}`);
+                                                    }
+                                                }
                                             }
                                         }
                                         catch { }
@@ -629,9 +667,7 @@ function createMcpServer() {
                                 proc.stderr.on("data", (chunk) => {
                                     const text = chunk.toString();
                                     log("[stderr] " + text);
-                                    if (text.includes("Error") || text.includes("error") || text.includes("failed")) {
-                                        (0, feed_js_1.postToFeed)(session_id, dbUrl, `⚠️ stderr: ${text.slice(0, 500)}`, "system", "console");
-                                    }
+                                    (0, feed_js_1.postToFeed)(session_id, dbUrl, text.slice(0, 500), "system", "console");
                                 });
                                 proc.on("close", (code) => {
                                     clearTimeout(timer);
@@ -1174,7 +1210,8 @@ function createMcpServer() {
                                             const inputTokens = parsed.usage.input_tokens || 0;
                                             const outputTokens = parsed.usage.output_tokens || 0;
                                             tokensUsed = inputTokens + outputTokens;
-                                            costUsd = (inputTokens / 1_000_000 * 3) + (outputTokens / 1_000_000 * 15);
+                                            const { input: inputCostPerM, output: outputCostPerM } = modelCostPerMillion();
+                                            costUsd = (inputTokens / 1_000_000 * inputCostPerM) + (outputTokens / 1_000_000 * outputCostPerM);
                                         }
                                         const resultText = (parsed.result || parsed.output || "");
                                         if (resultText && chatSessionId && dbUrl) {
@@ -1285,7 +1322,7 @@ function createMcpServer() {
                     }
                 }
                 case "create_session": {
-                    const { title, repo, container: sessionContainer = "dev-david", task_brief, slack_thread_url, jira_keys, } = args;
+                    const { title, repo, container: sessionContainer = "dev-david", task_brief, slack_thread_url, jira_keys, ash_session_key, } = args;
                     const dbUrl = process.env.OPS_DB_URL;
                     if (!dbUrl) {
                         return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "OPS_DB_URL not set" }) }] };
@@ -1336,7 +1373,7 @@ function createMcpServer() {
                                 },
                                 body: JSON.stringify({
                                     tool: "sessions_spawn",
-                                    args: { agentId: "dev-lead", task: await (0, db_js_1.buildSpawnMessage)(sessionId, dbUrl), cwd: "/home/openclaw/agents/dev-lead" },
+                                    args: { agentId: "dev-lead", task: await (0, db_js_1.buildSpawnMessage)(sessionId, dbUrl, ash_session_key), cwd: "/home/openclaw/agents/dev-lead" },
                                 }),
                             });
                             if (!resp.ok) {
