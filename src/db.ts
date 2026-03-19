@@ -29,6 +29,11 @@ export async function ensureMigrations(dbUrl: string): Promise<void> {
   await withDbClient(dbUrl, async (client) => {
     await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS branch TEXT`);
     await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS worktree_path TEXT`);
+    // Observability bridge columns (added for full pipeline tracing)
+    await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS openclaw_session_key TEXT`);
+    await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS active_task_id TEXT`);
+    await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS task_started_at TIMESTAMPTZ`);
+    await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS container_heartbeat_at TIMESTAMPTZ`);
   });
 }
 

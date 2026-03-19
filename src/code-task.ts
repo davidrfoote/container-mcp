@@ -34,6 +34,16 @@ export function spawnCodeTask(params: {
 
   postToFeed(sessionId!, dbUrl!, `🚀 Starting code task (${taskId})${model ? ` [${model}]` : ""}${resumeClaudeSessionId ? " [resumed]" : ""}\n\n${instruction.slice(0, 400)}`);
 
+  // Persist the active task ID so dev-session-app can detect in-flight tasks on restart
+  if (sessionId && dbUrl) {
+    void withDbClient(dbUrl, async (client) => {
+      await client.query(
+        `UPDATE sessions SET active_task_id = $1, task_started_at = now(), updated_at = now() WHERE session_id = $2`,
+        [taskId, sessionId]
+      );
+    }).catch((err: Error) => console.error(`[spawnCodeTask] failed to set active_task_id: ${err.message}`));
+  }
+
   (async () => {
     try {
       // Build rules from base + project + task-specific
@@ -75,6 +85,16 @@ export function spawnCodeTask(params: {
         const msg = `spawn claude failed: ${err.message}`;
         console.error(`[spawnCodeTask] spawn error for task ${taskId}: ${msg}`);
         postToFeed(sessionId!, dbUrl!, `Task ${taskId} spawn error: ${msg}`);
+        // Clear the in-flight task marker on error
+        if (sessionId && dbUrl) {
+          void withDbClient(dbUrl, async (client) => {
+            await client.query(
+              `UPDATE sessions SET active_task_id = NULL, task_started_at = NULL, updated_at = now()
+               WHERE session_id = $1 AND active_task_id = $2`,
+              [sessionId, taskId]
+            );
+          }).catch(() => {});
+        }
         if (sessionId && dbUrl) {
           void withDbClient(dbUrl, async (client) => {
             await client.query(
@@ -147,6 +167,16 @@ export function spawnCodeTask(params: {
         try { fs.unlinkSync(rulesFile); } catch {}
         postToFeed(sessionId!, dbUrl!, `✅ Process ${taskId} exited with code ${code}. Debug log: ${debugLogPath}`);
         console.log(`[spawnCodeTask] task ${taskId} done (code ${code}), debug log at ${debugLogPath}`);
+        // Clear the in-flight task marker
+        if (sessionId && dbUrl) {
+          void withDbClient(dbUrl, async (client) => {
+            await client.query(
+              `UPDATE sessions SET active_task_id = NULL, task_started_at = NULL, updated_at = now()
+               WHERE session_id = $1 AND active_task_id = $2`,
+              [sessionId, taskId]
+            );
+          }).catch((err: Error) => console.error(`[spawnCodeTask] failed to clear active_task_id: ${err.message}`));
+        }
       });
     } catch (err: any) {
       console.error(`[spawnCodeTask] Error: ${err.message}`);

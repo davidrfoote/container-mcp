@@ -1,6 +1,6 @@
 import { randomUUID } from "crypto";
 import { Client } from "pg";
-import { buildSpawnMessage } from "./db.js";
+import { buildSpawnMessage, withDbClient } from "./db.js";
 import { spawnCodeTask } from "./code-task.js";
 import { buildBootstrapInstruction, buildExecutionInstruction, buildCloseoutMessage } from "./bootstrap.js";
 import { logger } from "./logger.js";
@@ -38,6 +38,14 @@ async function runBackfill2(dbUrl: string): Promise<void> {
           const { instruction, workingDir, resumeClaudeSessionId } = await buildExecutionInstruction(row.session_id, dbUrl);
           spawnCodeTask({ instruction, workingDir, sessionId: row.session_id, dbUrl, resumeClaudeSessionId });
           logger.log(`[listen-chain] backfill2 EXECUTION spawned for ${row.session_id}`);
+          // Surface recovery in the session feed so it's visible in the UI
+          void withDbClient(dbUrl, async (c) => {
+            await c.query(
+              `INSERT INTO session_messages (message_id, session_id, role, content, message_type, metadata, created_at)
+               VALUES (gen_random_uuid(), $1, 'system', $2, 'console', $3::jsonb, now())`,
+              [row.session_id, '🔄 Recovery: EXECUTION re-triggered by backfill (missed approval_response notification)', JSON.stringify({ recovery_trigger: true })]
+            );
+          }).catch((e: Error) => logger.warn(`[listen-chain] backfill2 console msg failed: ${e.message}`));
         } catch (e: any) {
           logger.error(`[listen-chain] backfill2 error for ${row.session_id}:`, e.message);
         }
@@ -141,9 +149,9 @@ export async function startListenChain(): Promise<void> {
                     const autoMsgId = `msg-${randomUUID()}`;
                     const nowIso = new Date().toISOString();
                     await autoClient.query(
-                      `INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
-                       VALUES ($1, $2, 'system', 'auto-approved', 'approval_response', NOW())`,
-                      [autoMsgId, sessionId]
+                      `INSERT INTO session_messages (message_id, session_id, role, content, message_type, metadata, created_at)
+                       VALUES ($1, $2, 'system', 'auto-approved', 'approval_response', $3::jsonb, NOW())`,
+                      [autoMsgId, sessionId, JSON.stringify({ auto_approved: true, complexity })]
                     );
                     const notifyPayload = JSON.stringify({
                       id: autoMsgId, message_id: autoMsgId, session_id: sessionId,
@@ -221,7 +229,16 @@ export async function startListenChain(): Promise<void> {
               });
               if (resp.ok) {
                 const parsed = await resp.json().catch(() => ({})) as any;
-                logger.log(`[listen-chain] dev-lead close-out spawned for ${sessionId}, key=${parsed?.childSessionKey ?? "n/a"}`);
+                const childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
+                logger.log(`[listen-chain] dev-lead close-out spawned for ${sessionId}, key=${childSessionKey ?? "n/a"}`);
+                if (childSessionKey) {
+                  void withDbClient(dbUrl, async (client) => {
+                    await client.query(
+                      `UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`,
+                      [childSessionKey, sessionId]
+                    );
+                  }).catch((e: Error) => logger.warn(`[listen-chain] store openclaw_session_key failed: ${e.message}`));
+                }
               } else {
                 const text = await resp.text().catch(() => "");
                 logger.warn(`[listen-chain] dev-lead spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
@@ -246,7 +263,16 @@ export async function startListenChain(): Promise<void> {
               });
               if (resp.ok) {
                 const parsed = await resp.json().catch(() => ({})) as any;
-                logger.log(`[listen-chain] dev-lead spawned for chat ${sessionId}, key=${parsed?.childSessionKey ?? "n/a"}`);
+                const childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
+                logger.log(`[listen-chain] dev-lead spawned for chat ${sessionId}, key=${childSessionKey ?? "n/a"}`);
+                if (childSessionKey) {
+                  void withDbClient(dbUrl, async (client) => {
+                    await client.query(
+                      `UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`,
+                      [childSessionKey, sessionId]
+                    );
+                  }).catch((e: Error) => logger.warn(`[listen-chain] store openclaw_session_key failed: ${e.message}`));
+                }
               } else {
                 const text = await resp.text().catch(() => "");
                 logger.warn(`[listen-chain] dev-lead chat spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
