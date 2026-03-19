@@ -435,10 +435,6 @@ export function createMcpServer() {
               type: "string",
               description: "Build command. Auto-detected from filesystem if omitted.",
             },
-            deploy_cmd: {
-              type: "string",
-              description: "Deploy command. Auto-detected from filesystem if omitted.",
-            },
             smoke_url: {
               type: "string",
               description: "Health-check URL to verify deployment (e.g. https://app.example.com/health)",
