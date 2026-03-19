@@ -1375,7 +1375,7 @@ export function createMcpServer() {
             }
 
             const parsed = await resp.json().catch(() => ({})) as any;
-            const childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
+            const childSessionKey = parsed?.result?.details?.childSessionKey ?? parsed?.details?.childSessionKey ?? parsed?.childSessionKey ?? parsed?.session_key ?? null;
             return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: sessionId, childSessionKey }) }] };
           } catch (fetchErr: any) {
             return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: fetchErr.message }) }] };
@@ -1465,7 +1465,7 @@ export function createMcpServer() {
                 spawnError = `Gateway ${resp.status}: ${text}`;
               } else {
                 const parsed = await resp.json().catch(() => ({})) as any;
-                childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
+                childSessionKey = parsed?.result?.details?.childSessionKey ?? parsed?.details?.childSessionKey ?? parsed?.childSessionKey ?? parsed?.session_key ?? null;
                 spawnOk = true;
               }
             } catch (fetchErr: any) {
