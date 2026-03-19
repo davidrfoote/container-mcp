@@ -1,6 +1,7 @@
 import express from "express";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { withDbClient, notifySessionMessage, ensureMigrations } from "./db.js";
+import { logger } from "./logger.js";
 import { createMcpServer } from "./mcp-server.js";
 import { startListenChain } from "./listen-chain.js";
 
@@ -107,6 +108,19 @@ server.on("error", (err: NodeJS.ErrnoException) => {
 const dbUrl = process.env.OPS_DB_URL;
 if (dbUrl) {
   ensureMigrations(dbUrl).catch((e) => console.warn("[migrations] Failed (non-fatal):", e.message));
+
+  // Heartbeat: stamp container_heartbeat_at on sessions that have an active in-flight task.
+  // dev-session-app can alert if this goes stale (>90s) while active_task_id is set.
+  setInterval(() => {
+    void withDbClient(dbUrl, async (client) => {
+      await client.query(
+        `UPDATE sessions SET container_heartbeat_at = now()
+         WHERE active_task_id IS NOT NULL
+           AND status IN ('active', 'executing', 'pending', 'awaiting_approval', 'planning')`
+      );
+    }).catch((e: Error) => logger.warn(`[heartbeat] failed: ${e.message}`));
+  }, 30_000);
+  logger.log("[container-mcp] heartbeat started (30s interval, stamps active sessions)");
 }
 
 void startListenChain();

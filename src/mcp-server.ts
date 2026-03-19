@@ -1371,7 +1371,18 @@ export function createMcpServer() {
             }
 
             const parsed = await resp.json().catch(() => ({})) as any;
-            const childSessionKey = parsed?.result?.details?.childSessionKey ?? parsed?.details?.childSessionKey ?? parsed?.childSessionKey ?? parsed?.session_key ?? null;
+            const childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
+            if (childSessionKey) {
+              const dbUrl = process.env.OPS_DB_URL;
+              if (dbUrl) {
+                void withDbClient(dbUrl, async (client) => {
+                  await client.query(
+                    `UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`,
+                    [childSessionKey, sessionId]
+                  );
+                }).catch((e: Error) => console.warn(`[spawn_dev_lead] store openclaw_session_key failed: ${e.message}`));
+              }
+            }
             return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: sessionId, childSessionKey }) }] };
           } catch (fetchErr: any) {
             return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: fetchErr.message }) }] };
@@ -1477,6 +1488,16 @@ export function createMcpServer() {
                 );
               }).catch(() => {});
               return { content: [{ type: "text", text: JSON.stringify({ ok: false, session_id: sessionId, session_url: sessionUrl, error: `spawn failed: ${spawnError}` }) }] };
+            }
+
+            // Persist the OpenClaw session key so we can query dev-lead status later
+            if (childSessionKey) {
+              await withDbClient(dbUrl, async (client) => {
+                await client.query(
+                  `UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`,
+                  [childSessionKey, sessionId]
+                );
+              }).catch((e: Error) => console.warn(`[create_session] store openclaw_session_key failed: ${e.message}`));
             }
 
             return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: sessionId, session_url: sessionUrl, childSessionKey }) }] };
