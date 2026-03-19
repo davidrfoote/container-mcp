@@ -15,6 +15,14 @@ import { populateCacheForProject, writeCacheEntry } from "./jira-confluence.js";
 import { bootstrapSession } from "./bootstrap.js";
 import { deployProject } from "./tools/deploy-project.js";
 
+function modelCostPerMillion(model?: string): { input: number; output: number } {
+  if (!model) return { input: 3, output: 15 };
+  const m = model.toLowerCase();
+  if (m.includes("haiku")) return { input: 0.25, output: 1.25 };
+  if (m.includes("opus")) return { input: 15, output: 75 };
+  return { input: 3, output: 15 };
+}
+
 export function createMcpServer() {
   const server = new Server(
     { name: "container-mcp", version: "2.2.0" },
@@ -518,7 +526,7 @@ export function createMcpServer() {
           const log = (line: string) => taskLogs.get(taskId)!.push(line);
           const debugLogPath = `/tmp/task-${taskId}-debug.log`;
 
-          postToFeed(session_id, dbUrl, `🚀 Starting \`code_task\` (driver: ${driver}, task_id: ${taskId}${model ? `, model: ${model}` : ""}${resume_claude_session_id ? ", resumed" : ""})\n\nInstruction: ${instruction.slice(0, 400)}`);
+          postToFeed(session_id, dbUrl, `🤖 Model: ${model || "default (account)"} | driver: ${driver} | effort: ${effort || "medium"} | task_id: ${taskId}`);
 
           // Compose rules
           let rules = "";
@@ -564,8 +572,17 @@ export function createMcpServer() {
                   cwd: working_dir, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] as const,
                 });
 
+                if (session_id && dbUrl) {
+                  const resolvedModel = model || "default";
+                  void withDbClient(dbUrl, async (client) => {
+                    await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS model TEXT`).catch(() => {});
+                    await client.query(`UPDATE sessions SET model = $1 WHERE session_id = $2`, [resolvedModel, session_id]);
+                  }).catch(() => {});
+                }
+
                 let output = "";
                 const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeout_seconds * 1000);
+                const toolUseMap = new Map<string, string>();
 
                 proc.stdout.on("data", (chunk: Buffer) => {
                   const lines = chunk.toString().split("\n");
@@ -591,7 +608,8 @@ export function createMcpServer() {
                           const inputTokens = usage.input_tokens || 0;
                           const outputTokens = usage.output_tokens || 0;
                           const totalTokens = inputTokens + outputTokens;
-                          const costUsd = (inputTokens / 1_000_000 * 3) + (outputTokens / 1_000_000 * 15);
+                          const { input: inputCostPerM, output: outputCostPerM } = modelCostPerMillion(model);
+                          const costUsd = (inputTokens / 1_000_000 * inputCostPerM) + (outputTokens / 1_000_000 * outputCostPerM);
                           void withDbClient(dbUrl, async (client) => {
                             await client.query(
                               `UPDATE sessions SET token_usage = COALESCE(token_usage, 0) + $1, cost_usd = COALESCE(cost_usd, 0) + $2 WHERE session_id = $3`,
@@ -603,16 +621,27 @@ export function createMcpServer() {
                         const content = parsed.message?.content || [];
                         for (const block of content) {
                           if (block.type === "tool_use") {
+                            toolUseMap.set(block.id, block.name);
                             const toolInput = JSON.stringify(block.input || {}).slice(0, 500);
                             postToFeed(session_id, dbUrl, `🔧 \`${block.name}\` ${toolInput}`);
+                          } else if (block.type === "thinking" && block.thinking?.trim()) {
+                            postToFeed(session_id, dbUrl, `🧠 ${block.thinking.trim().slice(0, 600)}`);
                           } else if (block.type === "text" && block.text?.trim() && !parsed.message?.usage) {
                             const text = block.text.trim().slice(0, 1000);
                             if (text.length > 20) postToFeed(session_id, dbUrl, `💭 ${text}`);
                           }
                         }
-                      } else if (parsed.type === "tool_result") {
-                        const resultText = (parsed.content?.[0]?.text || "").slice(0, 2000);
-                        if (resultText) postToFeed(session_id, dbUrl, `📄 Result: ${resultText}`);
+                      } else if (parsed.type === "user") {
+                        const content = parsed.message?.content || [];
+                        for (const block of content) {
+                          if (block.type === "tool_result") {
+                            const toolName = toolUseMap.get(block.tool_use_id) || block.tool_use_id || "unknown";
+                            let resultText = "";
+                            if (typeof block.content === "string") resultText = block.content;
+                            else if (Array.isArray(block.content)) resultText = block.content.map((c: any) => c.text || "").join("\n");
+                            if (resultText) postToFeed(session_id, dbUrl, `📄 ${toolName} → ${resultText.slice(0, 800)}`);
+                          }
+                        }
                       }
                     } catch {}
                   }
@@ -620,9 +649,7 @@ export function createMcpServer() {
                 proc.stderr.on("data", (chunk: Buffer) => {
                   const text = chunk.toString();
                   log("[stderr] " + text);
-                  if (text.includes("Error") || text.includes("error") || text.includes("failed")) {
-                    postToFeed(session_id, dbUrl, `⚠️ stderr: ${text.slice(0, 500)}`, "system", "console");
-                  }
+                  postToFeed(session_id, dbUrl, text.slice(0, 500), "system", "console");
                 });
                 proc.on("close", (code) => {
                   clearTimeout(timer);
@@ -1228,7 +1255,8 @@ export function createMcpServer() {
                       const inputTokens = parsed.usage.input_tokens || 0;
                       const outputTokens = parsed.usage.output_tokens || 0;
                       tokensUsed = inputTokens + outputTokens;
-                      costUsd = (inputTokens / 1_000_000 * 3) + (outputTokens / 1_000_000 * 15);
+                      const { input: inputCostPerM, output: outputCostPerM } = modelCostPerMillion();
+                      costUsd = (inputTokens / 1_000_000 * inputCostPerM) + (outputTokens / 1_000_000 * outputCostPerM);
                     }
                     const resultText = (parsed.result || parsed.output || "") as string;
                     if (resultText && chatSessionId && dbUrl) {
