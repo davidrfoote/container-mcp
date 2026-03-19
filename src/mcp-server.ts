@@ -15,15 +15,26 @@ import { populateCacheForProject, writeCacheEntry } from "./jira-confluence.js";
 import { bootstrapSession } from "./bootstrap.js";
 import { deployProject } from "./tools/deploy-project.js";
 
+function modelCostPerMillion(model?: string): { input: number; output: number } {
+  if (!model) return { input: 3, output: 15 };
+  const m = model.toLowerCase();
+  if (m.includes("haiku")) return { input: 0.25, output: 1.25 };
+  if (m.includes("opus")) return { input: 15, output: 75 };
+  return { input: 3, output: 15 };
+}
+
 export function createMcpServer() {
   const server = new Server(
     { name: "container-mcp", version: "2.2.0" },
     { capabilities: { tools: {} } }
   );
 
+  const codeTaskEnabled = process.env.CODE_TASK_ENABLED === "true";
+
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
-      {
+      ...(codeTaskEnabled ? [{
+      
         name: "code_task",
         description: "Run a coding task via Claude or Cline agent",
         inputSchema: {
@@ -76,7 +87,7 @@ export function createMcpServer() {
           },
           required: ["instruction", "working_dir"],
         },
-      },
+      }] : []),
       {
         name: "get_task_log",
         description: "Get buffered log lines for a task",
@@ -318,6 +329,7 @@ export function createMcpServer() {
             task_brief: { type: "string", description: "Full task brief content to post as task_brief message" },
             slack_thread_url: { type: "string", description: "Slack thread URL for notifications (optional)" },
             jira_keys: { type: "string", description: "Comma-separated Jira issue keys (optional, e.g. ZI-18820)" },
+            ash_session_key: { type: "string", description: "OpenClaw session key of the spawning Ash session (e.g. agent:main:openai:xxxx) for callback. Defaults to OPENCLAW_SESSION_KEY env var if not provided." },
           },
           required: ["title", "repo", "task_brief"],
         },
@@ -395,7 +407,7 @@ export function createMcpServer() {
       },
       {
         name: "create_project",
-        description: "Register a new project in the projects table (or update an existing one). Sets display name, description, build/deploy commands, working directory, default container, Jira keys, Confluence root, and smoke URL. Auto-detects build/deploy commands from the filesystem if not provided.",
+        description: "Register a new project in the projects table (or update an existing one). Sets display name, description, build command, working directory, default container, Jira keys, Confluence root, and smoke URL. Auto-detects build command from the filesystem if not provided. Note: deploy_cmd is deprecated — deployment is handled by the CLI agent via deploy_project.",
         inputSchema: {
           type: "object",
           properties: {
@@ -422,10 +434,6 @@ export function createMcpServer() {
             build_cmd: {
               type: "string",
               description: "Build command. Auto-detected from filesystem if omitted.",
-            },
-            deploy_cmd: {
-              type: "string",
-              description: "Deploy command. Auto-detected from filesystem if omitted.",
             },
             smoke_url: {
               type: "string",
@@ -490,6 +498,9 @@ export function createMcpServer() {
     try {
       switch (name) {
         case "code_task": {
+          if (process.env.CODE_TASK_ENABLED !== "true") {
+            return { content: [{ type: "text", text: "code_task is disabled on this container (CODE_TASK_ENABLED not set to true)" }], isError: true };
+          }
           const {
             instruction,
             working_dir,
@@ -518,7 +529,7 @@ export function createMcpServer() {
           const log = (line: string) => taskLogs.get(taskId)!.push(line);
           const debugLogPath = `/tmp/task-${taskId}-debug.log`;
 
-          postToFeed(session_id, dbUrl, `🚀 Starting \`code_task\` (driver: ${driver}, task_id: ${taskId}${model ? `, model: ${model}` : ""}${resume_claude_session_id ? ", resumed" : ""})\n\nInstruction: ${instruction.slice(0, 400)}`);
+          postToFeed(session_id, dbUrl, `🤖 Model: ${model || "default (account)"} | driver: ${driver} | effort: ${effort || "medium"} | task_id: ${taskId}`);
 
           // Compose rules
           let rules = "";
@@ -564,8 +575,17 @@ export function createMcpServer() {
                   cwd: working_dir, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] as const,
                 });
 
+                if (session_id && dbUrl) {
+                  const resolvedModel = model || "default";
+                  void withDbClient(dbUrl, async (client) => {
+                    await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS model TEXT`).catch(() => {});
+                    await client.query(`UPDATE sessions SET model = $1 WHERE session_id = $2`, [resolvedModel, session_id]);
+                  }).catch(() => {});
+                }
+
                 let output = "";
                 const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeout_seconds * 1000);
+                const toolUseMap = new Map<string, string>();
 
                 proc.stdout.on("data", (chunk: Buffer) => {
                   const lines = chunk.toString().split("\n");
@@ -591,7 +611,8 @@ export function createMcpServer() {
                           const inputTokens = usage.input_tokens || 0;
                           const outputTokens = usage.output_tokens || 0;
                           const totalTokens = inputTokens + outputTokens;
-                          const costUsd = (inputTokens / 1_000_000 * 3) + (outputTokens / 1_000_000 * 15);
+                          const { input: inputCostPerM, output: outputCostPerM } = modelCostPerMillion(model);
+                          const costUsd = (inputTokens / 1_000_000 * inputCostPerM) + (outputTokens / 1_000_000 * outputCostPerM);
                           void withDbClient(dbUrl, async (client) => {
                             await client.query(
                               `UPDATE sessions SET token_usage = COALESCE(token_usage, 0) + $1, cost_usd = COALESCE(cost_usd, 0) + $2 WHERE session_id = $3`,
@@ -603,16 +624,27 @@ export function createMcpServer() {
                         const content = parsed.message?.content || [];
                         for (const block of content) {
                           if (block.type === "tool_use") {
+                            toolUseMap.set(block.id, block.name);
                             const toolInput = JSON.stringify(block.input || {}).slice(0, 500);
                             postToFeed(session_id, dbUrl, `🔧 \`${block.name}\` ${toolInput}`);
+                          } else if (block.type === "thinking" && block.thinking?.trim()) {
+                            postToFeed(session_id, dbUrl, `🧠 ${block.thinking.trim().slice(0, 600)}`);
                           } else if (block.type === "text" && block.text?.trim() && !parsed.message?.usage) {
                             const text = block.text.trim().slice(0, 1000);
                             if (text.length > 20) postToFeed(session_id, dbUrl, `💭 ${text}`);
                           }
                         }
-                      } else if (parsed.type === "tool_result") {
-                        const resultText = (parsed.content?.[0]?.text || "").slice(0, 2000);
-                        if (resultText) postToFeed(session_id, dbUrl, `📄 Result: ${resultText}`);
+                      } else if (parsed.type === "user") {
+                        const content = parsed.message?.content || [];
+                        for (const block of content) {
+                          if (block.type === "tool_result") {
+                            const toolName = toolUseMap.get(block.tool_use_id) || block.tool_use_id || "unknown";
+                            let resultText = "";
+                            if (typeof block.content === "string") resultText = block.content;
+                            else if (Array.isArray(block.content)) resultText = block.content.map((c: any) => c.text || "").join("\n");
+                            if (resultText) postToFeed(session_id, dbUrl, `📄 ${toolName} → ${resultText.slice(0, 800)}`);
+                          }
+                        }
                       }
                     } catch {}
                   }
@@ -620,9 +652,7 @@ export function createMcpServer() {
                 proc.stderr.on("data", (chunk: Buffer) => {
                   const text = chunk.toString();
                   log("[stderr] " + text);
-                  if (text.includes("Error") || text.includes("error") || text.includes("failed")) {
-                    postToFeed(session_id, dbUrl, `⚠️ stderr: ${text.slice(0, 500)}`, "system", "console");
-                  }
+                  postToFeed(session_id, dbUrl, text.slice(0, 500), "system", "console");
                 });
                 proc.on("close", (code) => {
                   clearTimeout(timer);
@@ -1228,7 +1258,8 @@ export function createMcpServer() {
                       const inputTokens = parsed.usage.input_tokens || 0;
                       const outputTokens = parsed.usage.output_tokens || 0;
                       tokensUsed = inputTokens + outputTokens;
-                      costUsd = (inputTokens / 1_000_000 * 3) + (outputTokens / 1_000_000 * 15);
+                      const { input: inputCostPerM, output: outputCostPerM } = modelCostPerMillion();
+                      costUsd = (inputTokens / 1_000_000 * inputCostPerM) + (outputTokens / 1_000_000 * outputCostPerM);
                     }
                     const resultText = (parsed.result || parsed.output || "") as string;
                     if (resultText && chatSessionId && dbUrl) {
@@ -1366,6 +1397,7 @@ export function createMcpServer() {
             task_brief,
             slack_thread_url,
             jira_keys,
+            ash_session_key,
           } = args as any;
 
           const dbUrl = process.env.OPS_DB_URL;
@@ -1432,7 +1464,7 @@ export function createMcpServer() {
                 },
                 body: JSON.stringify({
                   tool: "sessions_spawn",
-                  args: { agentId: "dev-lead", task: await buildSpawnMessage(sessionId, dbUrl), cwd: "/home/openclaw/agents/dev-lead" },
+                  args: { agentId: "dev-lead", task: await buildSpawnMessage(sessionId, dbUrl, ash_session_key), cwd: "/home/openclaw/agents/dev-lead" },
                 }),
               });
               if (!resp.ok) {
@@ -1440,7 +1472,7 @@ export function createMcpServer() {
                 spawnError = `Gateway ${resp.status}: ${text}`;
               } else {
                 const parsed = await resp.json().catch(() => ({})) as any;
-                childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
+                childSessionKey = parsed?.result?.details?.childSessionKey ?? parsed?.details?.childSessionKey ?? parsed?.childSessionKey ?? parsed?.session_key ?? null;
                 spawnOk = true;
               }
             } catch (fetchErr: any) {
@@ -1552,7 +1584,6 @@ export function createMcpServer() {
             working_dir: inputWorkingDir,
             default_container,
             build_cmd: inputBuildCmd,
-            deploy_cmd: inputDeployCmd,
             smoke_url: inputSmokeUrl,
             jira_issue_keys: jiraKeysStr,
             confluence_root_id,
@@ -1571,43 +1602,23 @@ export function createMcpServer() {
           }
 
           let buildCmd = inputBuildCmd || null;
-          let deployCmd = inputDeployCmd || null;
-          if (workingDir && (!buildCmd || !deployCmd)) {
+          const deployCmd: string | null = null; // deprecated — deploy_project uses CLI agent topology detection
+          if (workingDir && !buildCmd) {
             const hasSwarmYml = fs.existsSync(path.join(workingDir, 'swarm.yml'));
             const hasDockerfile = fs.existsSync(path.join(workingDir, 'Dockerfile'));
             const hasPkgJson = fs.existsSync(path.join(workingDir, 'package.json'));
             const hasRequirements = fs.existsSync(path.join(workingDir, 'requirements.txt'));
             const hasPyproject = fs.existsSync(path.join(workingDir, 'pyproject.toml'));
 
-            if (!buildCmd || !deployCmd) {
-              let detectedBuild: string | null = null;
-              let detectedDeploy: string | null = null;
-              if (hasSwarmYml) {
-                detectedBuild = `cd ${workingDir} && docker build -t ${projectId}:latest .`;
-                detectedDeploy = `docker stack deploy -c ${workingDir}/swarm.yml ${projectId}`;
-              } else if (hasDockerfile) {
-                detectedBuild = `cd ${workingDir} && docker build -t ${projectId}:latest .`;
-                detectedDeploy = `docker service update --image ${projectId}:latest prod_${projectId} || docker service update --image ${projectId}:latest ${projectId}`;
-              } else if (hasPkgJson) {
-                let pkgJson: Record<string, unknown> = {};
-                try { pkgJson = JSON.parse(fs.readFileSync(path.join(workingDir, 'package.json'), 'utf8')) as Record<string, unknown>; } catch {}
-                const deps = (pkgJson?.dependencies ?? {}) as Record<string, unknown>;
-                const devDeps = (pkgJson?.devDependencies ?? {}) as Record<string, unknown>;
-                const isNext = Boolean(deps.next ?? devDeps.next);
-                if (isNext) {
-                  detectedBuild = `cd ${workingDir} && docker build -t ${projectId}:latest .`;
-                  detectedDeploy = `docker service update --image ${projectId}:latest prod_${projectId} || docker service update --image ${projectId}:latest ${projectId}`;
-                } else {
-                  detectedBuild = `cd ${workingDir} && npm install && npm run build`;
-                  detectedDeploy = `pkill -f "node dist/index.js" 2>/dev/null || true; nohup node ${workingDir}/dist/index.js > /tmp/${projectId}.log 2>&1 &`;
-                }
-              } else if (hasRequirements || hasPyproject) {
-                detectedBuild = `cd ${workingDir} && pip install -r ${hasRequirements ? 'requirements.txt' : '.'} -q`;
-                detectedDeploy = `pkill -f "${workingDir}/main.py" 2>/dev/null || true; nohup python3 ${workingDir}/main.py > /tmp/${projectId}.log 2>&1 &`;
-              }
-              if (!buildCmd) buildCmd = detectedBuild;
-              if (!deployCmd) deployCmd = detectedDeploy;
+            let detectedBuild: string | null = null;
+            if (hasSwarmYml || hasDockerfile) {
+              detectedBuild = `cd ${workingDir} && docker build -t ${projectId}:latest .`;
+            } else if (hasPkgJson) {
+              detectedBuild = `cd ${workingDir} && npm install && npm run build`;
+            } else if (hasRequirements || hasPyproject) {
+              detectedBuild = `cd ${workingDir} && pip install -r ${hasRequirements ? 'requirements.txt' : '.'} -q`;
             }
+            buildCmd = detectedBuild;
           }
 
           const jiraKeysArr = jiraKeysStr

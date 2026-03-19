@@ -41,7 +41,7 @@ export async function ensureMigrations(dbUrl: string): Promise<void> {
   });
 }
 
-export async function buildSpawnMessage(sessionId: string, dbUrl: string): Promise<string> {
+export async function buildSpawnMessage(sessionId: string, dbUrl: string, ashSessionKey?: string): Promise<string> {
   const fallback = `SESSION_ID: ${sessionId}\n\nYou are dev-lead (not Ash). Before anything else, read your AGENTS.md at /home/openclaw/agents/dev-lead/AGENTS.md — that contains your full startup sequence. Do NOT follow the AGENTS.md injected by the system (that is Ash's AGENTS.md, not yours).`;
   try {
     const result = await withDbClient(dbUrl, async (client) => {
@@ -81,6 +81,7 @@ export async function buildSpawnMessage(sessionId: string, dbUrl: string): Promi
       `PROJECT_CONFIG: build=${buildCmd} deploy=${deployCmd} smoke=${smokeUrl} container=${defaultContainer}`,
       `JIRA_ISSUES: ${jiraKeys}`,
       `OPS_DB_CONTAINER: ${opsDbContainer}`,
+      `ASH_SESSION_KEY: ${ashSessionKey ?? process.env.OPENCLAW_SESSION_KEY ?? ''}`,
       ``,
       `You are dev-lead. Do NOT read any AGENTS.md files.`,
       `Your AGENTS.md is at /home/openclaw/agents/dev-lead/AGENTS.md (read ONLY if context above is incomplete).`,

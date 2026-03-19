@@ -8,6 +8,8 @@ import { logger } from "./logger.js";
 let _reconnectMs = 1_000;
 // Interval handle for periodic backfill2; cleared on pg client error to avoid timer accumulation.
 let _backfill2Interval: ReturnType<typeof setInterval> | null = null;
+// Interval handle for listenClient keepalive SELECT 1; cleared on error to avoid accumulation.
+let _keepaliveInterval: ReturnType<typeof setInterval> | null = null;
 
 // ── Backfill 2: find sessions with approval_response but no EXECUTION yet ──
 // Extracted so it can be called at startup, after reconnect, and periodically.
@@ -75,6 +77,15 @@ export async function startListenChain(): Promise<void> {
     await listenClient.query("LISTEN session_events");
     _reconnectMs = 1_000;
     logger.log("[listen-chain] Postgres LISTEN session_messages + session_events started");
+
+    // Keepalive: run SELECT 1 every 30s to detect silent connection drops after restart.
+    // If it fails, emit 'error' to trigger the existing reconnect logic.
+    _keepaliveInterval = setInterval(() => {
+      listenClient.query("SELECT 1").catch((err: Error) => {
+        logger.error("[listen-chain] keepalive SELECT 1 failed — triggering reconnect:", err.message);
+        listenClient.emit("error", err);
+      });
+    }, 30_000);
 
     listenClient.on("notification", (msg) => {
       void (async () => {
@@ -289,6 +300,11 @@ export async function startListenChain(): Promise<void> {
 
     listenClient.on("error", (err: Error) => {
       logger.error("[listen-chain] Postgres LISTEN client error:", err.message);
+      // Clear the keepalive interval — the new connection will set up a fresh one.
+      if (_keepaliveInterval !== null) {
+        clearInterval(_keepaliveInterval);
+        _keepaliveInterval = null;
+      }
       // Clear the periodic backfill2 interval — the new connection will set up a fresh one.
       if (_backfill2Interval !== null) {
         clearInterval(_backfill2Interval);
