@@ -142,7 +142,7 @@ export function spawnCodeTask(params: {
               postToFeed(
                 sessionId!, dbUrl!,
                 `⚙️ Claude Code v${version ?? "?"} · Model: ${cliModel ?? "?"} · Mode: ${permMode ?? "?"} · MCP: ${mcpStr} · ${tools.length} tools available`,
-                "system", "console"
+                "coding_agent", "console"
               );
 
             // ── assistant turn: tool calls and thinking text ─────────────────
