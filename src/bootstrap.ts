@@ -543,6 +543,30 @@ export async function bootstrapSession(params: {
     }).catch(() => {});
   }
 
+  // Trigger gitnexus indexing for this project (fire-and-forget, non-fatal)
+  if (process.env.GITNEXUS_SERVICE_URL) {
+    try {
+      const githubOrg = process.env.GITHUB_ORG ?? "davidrfoote";
+      const analyzeUrl = `${process.env.GITNEXUS_SERVICE_URL.replace(/\/$/, "")}/analyze`;
+      const body = JSON.stringify({ repo: `${githubOrg}/${projectId}`, branch: sessionBranch });
+      const parsed = new URL(analyzeUrl);
+      const lib = parsed.protocol === "https:" ? https : http;
+      const req = lib.request(analyzeUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+      }, (res) => {
+        let data = "";
+        res.on("data", (c: Buffer) => { data += c; });
+        res.on("end", () => console.log(`[bootstrapSession] gitnexus analyze queued for ${projectId}: ${data.slice(0, 120)}`));
+      });
+      req.on("error", (e: Error) => console.warn(`[bootstrapSession] gitnexus analyze trigger failed (non-fatal): ${e.message}`));
+      req.write(body);
+      req.end();
+    } catch (e: any) {
+      console.warn(`[bootstrapSession] gitnexus analyze trigger failed (non-fatal): ${e.message}`);
+    }
+  }
+
   // Spawn BOOTSTRAP code task (non-fatal on failure)
   try {
     const { instruction, workingDir, allowedTools } = await buildBootstrapInstruction(sessionId, dbUrl);
