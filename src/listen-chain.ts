@@ -1,6 +1,6 @@
 import { randomUUID } from "crypto";
 import { Client } from "pg";
-import { buildSpawnMessage } from "./db.js";
+import { buildSpawnMessage, withDbClient } from "./db.js";
 import { spawnCodeTask } from "./code-task.js";
 import { buildBootstrapInstruction, buildExecutionInstruction, buildCloseoutMessage } from "./bootstrap.js";
 import { logger } from "./logger.js";
@@ -8,6 +8,8 @@ import { logger } from "./logger.js";
 let _reconnectMs = 1_000;
 // Interval handle for periodic backfill2; cleared on pg client error to avoid timer accumulation.
 let _backfill2Interval: ReturnType<typeof setInterval> | null = null;
+// Interval handle for listenClient keepalive SELECT 1; cleared on error to avoid accumulation.
+let _keepaliveInterval: ReturnType<typeof setInterval> | null = null;
 
 // ── Backfill 2: find sessions with approval_response but no EXECUTION yet ──
 // Extracted so it can be called at startup, after reconnect, and periodically.
@@ -67,6 +69,15 @@ export async function startListenChain(): Promise<void> {
     await listenClient.query("LISTEN session_events");
     _reconnectMs = 1_000;
     logger.log("[listen-chain] Postgres LISTEN session_messages + session_events started");
+
+    // Keepalive: run SELECT 1 every 30s to detect silent connection drops after restart.
+    // If it fails, emit 'error' to trigger the existing reconnect logic.
+    _keepaliveInterval = setInterval(() => {
+      listenClient.query("SELECT 1").catch((err: Error) => {
+        logger.error("[listen-chain] keepalive SELECT 1 failed — triggering reconnect:", err.message);
+        listenClient.emit("error", err);
+      });
+    }, 30_000);
 
     listenClient.on("notification", (msg) => {
       void (async () => {
@@ -221,7 +232,20 @@ export async function startListenChain(): Promise<void> {
               });
               if (resp.ok) {
                 const parsed = await resp.json().catch(() => ({})) as any;
-                logger.log(`[listen-chain] dev-lead close-out spawned for ${sessionId}, key=${parsed?.childSessionKey ?? "n/a"}`);
+                const childKey = parsed?.result?.details?.childSessionKey ?? parsed?.details?.childSessionKey ?? parsed?.childSessionKey;
+                logger.log(`[listen-chain] dev-lead close-out spawned for ${sessionId}, key=${childKey ?? "n/a"}`);
+                // Mark session pending_review so it isn't re-processed as active.
+                try {
+                  await withDbClient(dbUrl, async (client) => {
+                    await client.query(
+                      `UPDATE sessions SET status = 'pending_review', updated_at = now() WHERE session_id = $1`,
+                      [sessionId]
+                    );
+                  });
+                  logger.log(`[listen-chain] session ${sessionId} status set to pending_review`);
+                } catch (dbErr: any) {
+                  logger.warn(`[listen-chain] failed to set pending_review for ${sessionId}:`, dbErr.message);
+                }
               } else {
                 const text = await resp.text().catch(() => "");
                 logger.warn(`[listen-chain] dev-lead spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
@@ -246,7 +270,8 @@ export async function startListenChain(): Promise<void> {
               });
               if (resp.ok) {
                 const parsed = await resp.json().catch(() => ({})) as any;
-                logger.log(`[listen-chain] dev-lead spawned for chat ${sessionId}, key=${parsed?.childSessionKey ?? "n/a"}`);
+                const childKey = parsed?.result?.details?.childSessionKey ?? parsed?.details?.childSessionKey ?? parsed?.childSessionKey;
+                logger.log(`[listen-chain] dev-lead spawned for chat ${sessionId}, key=${childKey ?? "n/a"}`);
               } else {
                 const text = await resp.text().catch(() => "");
                 logger.warn(`[listen-chain] dev-lead chat spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
@@ -263,6 +288,11 @@ export async function startListenChain(): Promise<void> {
 
     listenClient.on("error", (err: Error) => {
       logger.error("[listen-chain] Postgres LISTEN client error:", err.message);
+      // Clear the keepalive interval — the new connection will set up a fresh one.
+      if (_keepaliveInterval !== null) {
+        clearInterval(_keepaliveInterval);
+        _keepaliveInterval = null;
+      }
       // Clear the periodic backfill2 interval — the new connection will set up a fresh one.
       if (_backfill2Interval !== null) {
         clearInterval(_backfill2Interval);
