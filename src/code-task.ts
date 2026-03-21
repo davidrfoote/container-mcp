@@ -75,6 +75,20 @@ export function spawnCodeTask(params: {
       if (taskRules) rules += taskRules + "\n";
       fs.writeFileSync(rulesFile, rules);
 
+      // Write MCP config so the CLI agent can query gitnexus at runtime
+      const mcpConfigPath = `/tmp/mcp-config-${taskId}.json`;
+      const mcpConfig: Record<string, unknown> = {};
+      if (process.env.GITNEXUS_SERVICE_URL) {
+        mcpConfig["gitnexus"] = {
+          type: "sse",
+          url: `${process.env.GITNEXUS_SERVICE_URL.replace(/\/$/, "")}/sse`,
+        };
+      }
+      const hasMcpConfig = Object.keys(mcpConfig).length > 0;
+      if (hasMcpConfig) {
+        fs.writeFileSync(mcpConfigPath, JSON.stringify({ mcpServers: mcpConfig }, null, 2));
+      }
+
       const claudeArgs: string[] = [
         "-p", instruction,
         "--output-format", "stream-json",
@@ -87,6 +101,7 @@ export function spawnCodeTask(params: {
         "--debug-file", debugLogPath,
       ];
 
+      if (hasMcpConfig) claudeArgs.push("--mcp-config", mcpConfigPath);
       if (model) claudeArgs.push("--model", model);
       if (effort) claudeArgs.push("--effort", effort);
       if (agents) claudeArgs.push("--agents", agents);
@@ -102,6 +117,7 @@ export function spawnCodeTask(params: {
       proc.on("error", (err: NodeJS.ErrnoException) => {
         clearTimeout(timer);
         try { fs.unlinkSync(rulesFile); } catch {}
+        if (hasMcpConfig) try { fs.unlinkSync(mcpConfigPath); } catch {}
         const msg = `spawn claude failed: ${err.message}`;
         console.error(`[spawnCodeTask] spawn error for task ${taskId}: ${msg}`);
         postToFeed(sessionId!, dbUrl!, `Task ${taskId} spawn error: ${msg}`);
@@ -343,6 +359,7 @@ export function spawnCodeTask(params: {
       proc.on("close", (code) => {
         clearTimeout(timer);
         try { fs.unlinkSync(rulesFile); } catch {}
+        if (hasMcpConfig) try { fs.unlinkSync(mcpConfigPath); } catch {}
         postToFeed(sessionId!, dbUrl!, `✅ Process ${taskId} exited with code ${code}. Debug log: ${debugLogPath}`);
         console.log(`[spawnCodeTask] task ${taskId} done (code ${code}), debug log at ${debugLogPath}`);
         // Clear the in-flight task marker

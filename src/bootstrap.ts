@@ -26,6 +26,37 @@ function httpGetWithTimeout(url: string, timeoutMs: number): Promise<Record<stri
   });
 }
 
+async function fetchGitnexusContext(projectId: string): Promise<string> {
+  if (!process.env.GITNEXUS_SERVICE_URL) return "";
+  try {
+    const githubOrg = process.env.GITHUB_ORG ?? "davidrfoote";
+    const url = new URL(`/context/${githubOrg}/${projectId}`, process.env.GITNEXUS_SERVICE_URL);
+    const res = await httpGetWithTimeout(url.toString(), 5000);
+    if (res?.wiki_summary && typeof res.wiki_summary === "string") return res.wiki_summary;
+  } catch {}
+  return "";
+}
+
+function writeClaudeMd(worktreePath: string, sections: { projectId: string; branch: string | null; wikiSummary: string; cacheSummary: string; buildCmd: string | null }): void {
+  const parts: string[] = [
+    `# ${sections.projectId} — Agent Context`,
+    ``,
+    `**Branch:** ${sections.branch ?? "main"}`,
+    `**Build:** \`${sections.buildCmd ?? "npm run build"}\``,
+  ];
+  if (sections.wikiSummary) {
+    parts.push(``, `## Code Graph`, ``, sections.wikiSummary);
+  }
+  if (sections.cacheSummary) {
+    parts.push(``, `## Project Context (Jira / Confluence)`, ``, sections.cacheSummary);
+  }
+  try {
+    fs.writeFileSync(path.join(worktreePath, "CLAUDE.md"), parts.join("\n") + "\n");
+  } catch (e: any) {
+    console.warn(`[bootstrap] failed to write CLAUDE.md: ${e.message}`);
+  }
+}
+
 const SLACK_USER_MAP: Record<string, string> = {
   U097Q46UX: "David",
   U160P0C7M: "Shane",
@@ -100,14 +131,17 @@ export async function buildBootstrapInstruction(sessionId: string, dbUrl: string
   }
 
   // Fetch gitnexus code graph context (non-fatal)
-  let codeGraphContext = "";
-  try {
-    if (process.env.GITNEXUS_SERVICE_URL) {
-      const url = new URL(`/context/${path.basename(workingDir)}`, process.env.GITNEXUS_SERVICE_URL);
-      const res = await httpGetWithTimeout(url.toString(), 5000);
-      if (res?.wiki_summary) codeGraphContext = `\n\n## Code Graph Context\n${res.wiki_summary}`;
-    }
-  } catch {}
+  const wikiSummary = await fetchGitnexusContext(projectId);
+  const codeGraphContext = wikiSummary ? `\n\n## Code Graph Context\n${wikiSummary}` : "";
+
+  // Write CLAUDE.md into the worktree so the CLI agent picks it up automatically
+  writeClaudeMd(workingDir, {
+    projectId,
+    branch: sessionBranch,
+    wikiSummary,
+    cacheSummary: cacheSummary.trim(),
+    buildCmd: data.session?.build_cmd ?? null,
+  });
 
   const instruction = [
     `## BOOTSTRAP PASS — Session ${sessionId}`,
@@ -192,6 +226,35 @@ export async function buildExecutionInstruction(sessionId: string, dbUrl: string
   const branch = data.session?.branch ?? null;
   const workingDir = worktreePath ?? `/home/david/${projectId}`;
   const resumeClaudeSessionId = data.session?.claude_session_id ?? undefined;
+
+  // Refresh CLAUDE.md for the EXECUTION pass — gitnexus analysis may have completed since BOOTSTRAP
+  const wikiSummary = await fetchGitnexusContext(projectId);
+  {
+    // Always rewrite — even without wiki, cache summaries are valuable
+    const cacheKeys = [
+      ...jiraKeys.map((k) => `jira:${k}`),
+    ];
+    let execCacheSummary = "";
+    for (const key of cacheKeys) {
+      try {
+        const row = await withDbClient(dbUrl, async (client) => {
+          const r = await client.query<{ summary: string }>(
+            "SELECT summary FROM project_context_cache WHERE cache_key = $1",
+            [key]
+          );
+          return r.rows[0] ?? null;
+        });
+        if (row?.summary) execCacheSummary += `\n### ${key}\n${row.summary}\n`;
+      } catch {}
+    }
+    writeClaudeMd(workingDir, {
+      projectId,
+      branch,
+      wikiSummary,
+      cacheSummary: execCacheSummary.trim(),
+      buildCmd: data.session?.build_cmd ?? null,
+    });
+  }
 
   const userMods = (data.approval !== "approved" && data.approval !== "auto-approved")
     ? `\n### User Modifications / Feedback\n${data.approval}\n`
