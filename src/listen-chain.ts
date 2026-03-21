@@ -1,7 +1,7 @@
 import { randomUUID } from "crypto";
 import { Client } from "pg";
 import { buildSpawnMessage, withDbClient } from "./db.js";
-import { spawnCodeTask } from "./code-task.js";
+import { spawnCodeTask, activeTasks } from "./code-task.js";
 import { buildBootstrapInstruction, buildExecutionInstruction, buildCloseoutMessage } from "./bootstrap.js";
 import { logger } from "./logger.js";
 
@@ -107,6 +107,38 @@ export async function startListenChain(): Promise<void> {
           const isChatMessage = messageType === "chat";
           const isApprovalRequest = messageType === "approval_request";
           const isCheckpoint = messageType === "checkpoint" && payload.role === "coding_agent";
+          const isCliInterrupt = messageType === "cli_interrupt";
+          const isCliStdin = messageType === "cli_stdin";
+
+          // ── cli_interrupt → SIGINT the active process ──────────────────
+          if (isCliInterrupt) {
+            let killed = false;
+            for (const [taskId, entry] of activeTasks) {
+              if (entry.sessionId === sessionId) {
+                entry.proc.kill("SIGINT");
+                activeTasks.delete(taskId);
+                killed = true;
+                logger.log(`[listen-chain] cli_interrupt: sent SIGINT to task ${taskId} for session ${sessionId}`);
+              }
+            }
+            if (!killed) {
+              logger.warn(`[listen-chain] cli_interrupt: no active task found for session ${sessionId}`);
+            }
+            return;
+          }
+
+          // ── cli_stdin → write text to the active process's stdin ───────
+          if (isCliStdin) {
+            const text = (payload as any).content as string | undefined;
+            if (!text) return;
+            for (const [taskId, entry] of activeTasks) {
+              if (entry.sessionId === sessionId && entry.proc.stdin) {
+                entry.proc.stdin.write(text + "\n");
+                logger.log(`[listen-chain] cli_stdin: wrote ${text.length} chars to task ${taskId}`);
+              }
+            }
+            return;
+          }
 
           if (!isApprovalResponse && !isChatMessage && !isApprovalRequest && !isCheckpoint) return;
 

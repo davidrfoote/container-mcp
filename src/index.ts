@@ -62,13 +62,16 @@ app.post("/session/:sessionId/message", async (req, res) => {
       if (inserted) {
         // Truncate content to stay well under PostgreSQL's 8000-byte pg_notify limit.
         // The listen-chain only needs session_id + message_type — full content is never read from the payload.
+        // Truncate to stay under Postgres's 8KB pg_notify limit.
+        // cli_context messages carry structured JSON so allow more room.
+        const notifyContentLimit = message_type === "cli_context" ? 5000 : 2000;
         const notifyPayload = JSON.stringify({
           id: inserted.message_id,
           message_id: inserted.message_id,
           session_id: sessionId,
           role,
           message_type,
-          content: typeof content === "string" ? content.slice(0, 500) : "",
+          content: typeof content === "string" ? content.slice(0, notifyContentLimit) : "",
           created_at: inserted.created_at,
         });
         const safeId = sessionId.replace(/-/g, "_");

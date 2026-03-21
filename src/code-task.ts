@@ -1,10 +1,15 @@
 import { randomUUID } from "crypto";
-import { spawn } from "child_process";
+import { spawn, type ChildProcess } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import { withDbClient } from "./db.js";
 import { postToFeed } from "./feed.js";
 import { taskLogs } from "./task-logs.js";
+
+// ── Active process registry ──────────────────────────────────────────────────
+// Maps taskId → { proc, sessionId } so listen-chain and HTTP endpoints
+// can interrupt, send stdin, or query state for any in-flight task.
+export const activeTasks = new Map<string, { proc: ChildProcess; sessionId: string }>();
 
 export function spawnCodeTask(params: {
   instruction: string;
@@ -94,13 +99,17 @@ export function spawnCodeTask(params: {
       if (resumeClaudeSessionId) claudeArgs.push("--resume", resumeClaudeSessionId);
 
       const proc = spawn("claude", claudeArgs, {
-        cwd: workingDir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined }, stdio: ["ignore", "pipe", "pipe"] as const,
+        cwd: workingDir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined }, stdio: ["pipe", "pipe", "pipe"] as const,
       });
+
+      // Register so listen-chain and HTTP endpoints can reach this process
+      if (sessionId) activeTasks.set(taskId, { proc, sessionId });
 
       const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeoutSeconds * 1000);
 
       proc.on("error", (err: NodeJS.ErrnoException) => {
         clearTimeout(timer);
+        activeTasks.delete(taskId);
         try { fs.unlinkSync(rulesFile); } catch {}
         const msg = `spawn claude failed: ${err.message}`;
         console.error(`[spawnCodeTask] spawn error for task ${taskId}: ${msg}`);
@@ -211,6 +220,10 @@ export function spawnCodeTask(params: {
                       prompt: ((block.input as Record<string, unknown>)?.prompt as string ?? "").slice(0, 500),
                     }), "system", "cli_context");
                   }
+                } else if (block.type === "thinking" && (block.thinking as string)?.trim()) {
+                  // Extended thinking block — prefix with 🧠 so ExecutionLogCard collapses it
+                  const thinking = (block.thinking as string).trim().slice(0, 2000);
+                  postToFeed(sessionId!, dbUrl!, `🧠 ${thinking}`, "coding_agent", "execution_log");
                 } else if (block.type === "text" && block.text?.trim()) {
                   const text = (block.text as string).trim().slice(0, 1500);
                   if (text.length > 20) postToFeed(sessionId!, dbUrl!, `💭 ${text}`, "coding_agent", "execution_log");
@@ -342,6 +355,7 @@ export function spawnCodeTask(params: {
       });
       proc.on("close", (code) => {
         clearTimeout(timer);
+        activeTasks.delete(taskId);
         try { fs.unlinkSync(rulesFile); } catch {}
         postToFeed(sessionId!, dbUrl!, `✅ Process ${taskId} exited with code ${code}. Debug log: ${debugLogPath}`);
         console.log(`[spawnCodeTask] task ${taskId} done (code ${code}), debug log at ${debugLogPath}`);

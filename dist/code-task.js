@@ -33,6 +33,7 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.activeTasks = void 0;
 exports.spawnCodeTask = spawnCodeTask;
 const crypto_1 = require("crypto");
 const child_process_1 = require("child_process");
@@ -41,6 +42,10 @@ const path = __importStar(require("path"));
 const db_js_1 = require("./db.js");
 const feed_js_1 = require("./feed.js");
 const task_logs_js_1 = require("./task-logs.js");
+// ── Active process registry ──────────────────────────────────────────────────
+// Maps taskId → { proc, sessionId } so listen-chain and HTTP endpoints
+// can interrupt, send stdin, or query state for any in-flight task.
+exports.activeTasks = new Map();
 function spawnCodeTask(params) {
     const { instruction, workingDir, sessionId, dbUrl, maxTurns = 40, budgetUsd = 8.0, timeoutSeconds = 1200, model, effort, agents, allowedTools, resumeClaudeSessionId, taskRules, } = params;
     const taskId = (0, crypto_1.randomUUID)();
@@ -123,11 +128,15 @@ function spawnCodeTask(params) {
             if (resumeClaudeSessionId)
                 claudeArgs.push("--resume", resumeClaudeSessionId);
             const proc = (0, child_process_1.spawn)("claude", claudeArgs, {
-                cwd: workingDir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined }, stdio: ["ignore", "pipe", "pipe"],
+                cwd: workingDir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined }, stdio: ["pipe", "pipe", "pipe"],
             });
+            // Register so listen-chain and HTTP endpoints can reach this process
+            if (sessionId)
+                exports.activeTasks.set(taskId, { proc, sessionId });
             const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeoutSeconds * 1000);
             proc.on("error", (err) => {
                 clearTimeout(timer);
+                exports.activeTasks.delete(taskId);
                 try {
                     fs.unlinkSync(rulesFile);
                 }
@@ -221,6 +230,11 @@ function spawnCodeTask(params) {
                                             prompt: (block.input?.prompt ?? "").slice(0, 500),
                                         }), "system", "cli_context");
                                     }
+                                }
+                                else if (block.type === "thinking" && block.thinking?.trim()) {
+                                    // Extended thinking block — prefix with 🧠 so ExecutionLogCard collapses it
+                                    const thinking = block.thinking.trim().slice(0, 2000);
+                                    (0, feed_js_1.postToFeed)(sessionId, dbUrl, `🧠 ${thinking}`, "coding_agent", "execution_log");
                                 }
                                 else if (block.type === "text" && block.text?.trim()) {
                                     const text = block.text.trim().slice(0, 1500);
@@ -341,6 +355,7 @@ function spawnCodeTask(params) {
             });
             proc.on("close", (code) => {
                 clearTimeout(timer);
+                exports.activeTasks.delete(taskId);
                 try {
                     fs.unlinkSync(rulesFile);
                 }

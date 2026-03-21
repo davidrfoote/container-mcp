@@ -97,6 +97,37 @@ async function startListenChain() {
                     const isChatMessage = messageType === "chat";
                     const isApprovalRequest = messageType === "approval_request";
                     const isCheckpoint = messageType === "checkpoint" && payload.role === "coding_agent";
+                    const isCliInterrupt = messageType === "cli_interrupt";
+                    const isCliStdin = messageType === "cli_stdin";
+                    // ── cli_interrupt → SIGINT the active process ──────────────────
+                    if (isCliInterrupt) {
+                        let killed = false;
+                        for (const [taskId, entry] of code_task_js_1.activeTasks) {
+                            if (entry.sessionId === sessionId) {
+                                entry.proc.kill("SIGINT");
+                                code_task_js_1.activeTasks.delete(taskId);
+                                killed = true;
+                                logger_js_1.logger.log(`[listen-chain] cli_interrupt: sent SIGINT to task ${taskId} for session ${sessionId}`);
+                            }
+                        }
+                        if (!killed) {
+                            logger_js_1.logger.warn(`[listen-chain] cli_interrupt: no active task found for session ${sessionId}`);
+                        }
+                        return;
+                    }
+                    // ── cli_stdin → write text to the active process's stdin ───────
+                    if (isCliStdin) {
+                        const text = payload.content;
+                        if (!text)
+                            return;
+                        for (const [taskId, entry] of code_task_js_1.activeTasks) {
+                            if (entry.sessionId === sessionId && entry.proc.stdin) {
+                                entry.proc.stdin.write(text + "\n");
+                                logger_js_1.logger.log(`[listen-chain] cli_stdin: wrote ${text.length} chars to task ${taskId}`);
+                            }
+                        }
+                        return;
+                    }
                     if (!isApprovalResponse && !isChatMessage && !isApprovalRequest && !isCheckpoint)
                         return;
                     // ── Auto-approve countdown for low/medium approval_requests ──────
