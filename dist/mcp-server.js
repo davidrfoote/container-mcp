@@ -435,7 +435,7 @@ function createMcpServer() {
             },
             {
                 name: "create_project",
-                description: "Register a new project in the projects table (or update an existing one). Sets display name, description, build/deploy commands, working directory, default container, Jira keys, Confluence root, and smoke URL. Auto-detects build/deploy commands from the filesystem if not provided.",
+                description: "Register a new project in the projects table (or update an existing one). Sets display name, description, build command, working directory, default container, Jira keys, Confluence root, and smoke URL. Auto-detects build command from the filesystem if not provided. Note: deploy_cmd is deprecated — deployment is handled by the CLI agent via deploy_project.",
                 inputSchema: {
                     type: "object",
                     properties: {
@@ -462,10 +462,6 @@ function createMcpServer() {
                         build_cmd: {
                             type: "string",
                             description: "Build command. Auto-detected from filesystem if omitted.",
-                        },
-                        deploy_cmd: {
-                            type: "string",
-                            description: "Deploy command. Auto-detected from filesystem if omitted.",
                         },
                         smoke_url: {
                             type: "string",
@@ -1315,6 +1311,14 @@ function createMcpServer() {
                         }
                         const parsed = await resp.json().catch(() => ({}));
                         const childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
+                        if (childSessionKey) {
+                            const dbUrl = process.env.OPS_DB_URL;
+                            if (dbUrl) {
+                                void (0, db_js_1.withDbClient)(dbUrl, async (client) => {
+                                    await client.query(`UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`, [childSessionKey, sessionId]);
+                                }).catch((e) => console.warn(`[spawn_dev_lead] store openclaw_session_key failed: ${e.message}`));
+                            }
+                        }
                         return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: sessionId, childSessionKey }) }] };
                     }
                     catch (fetchErr) {
@@ -1382,7 +1386,7 @@ function createMcpServer() {
                             }
                             else {
                                 const parsed = await resp.json().catch(() => ({}));
-                                childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
+                                childSessionKey = parsed?.result?.details?.childSessionKey ?? parsed?.details?.childSessionKey ?? parsed?.childSessionKey ?? parsed?.session_key ?? null;
                                 spawnOk = true;
                             }
                         }
@@ -1395,6 +1399,12 @@ function createMcpServer() {
                    VALUES (gen_random_uuid(), $1, 'dev_lead', $2, 'console', now())`, [sessionId, `⚠️ Session created but spawn_dev_lead failed: ${spawnError}`]);
                             }).catch(() => { });
                             return { content: [{ type: "text", text: JSON.stringify({ ok: false, session_id: sessionId, session_url: sessionUrl, error: `spawn failed: ${spawnError}` }) }] };
+                        }
+                        // Persist the OpenClaw session key so we can query dev-lead status later
+                        if (childSessionKey) {
+                            await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
+                                await client.query(`UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`, [childSessionKey, sessionId]);
+                            }).catch((e) => console.warn(`[create_session] store openclaw_session_key failed: ${e.message}`));
                         }
                         return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: sessionId, session_url: sessionUrl, childSessionKey }) }] };
                     }
@@ -1464,7 +1474,7 @@ function createMcpServer() {
                     return { content: [{ type: "text", text: JSON.stringify({ ok: true, message_id: row?.message_id }) }] };
                 }
                 case "create_project": {
-                    const { project_id: projectId, display_name, description: projDescription, working_dir: inputWorkingDir, default_container, build_cmd: inputBuildCmd, deploy_cmd: inputDeployCmd, smoke_url: inputSmokeUrl, jira_issue_keys: jiraKeysStr, confluence_root_id, } = args;
+                    const { project_id: projectId, display_name, description: projDescription, working_dir: inputWorkingDir, default_container, build_cmd: inputBuildCmd, smoke_url: inputSmokeUrl, jira_issue_keys: jiraKeysStr, confluence_root_id, } = args;
                     const dbUrl = process.env.OPS_DB_URL;
                     if (!dbUrl) {
                         return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "OPS_DB_URL not set" }) }] };
@@ -1479,51 +1489,24 @@ function createMcpServer() {
                         }
                     }
                     let buildCmd = inputBuildCmd || null;
-                    let deployCmd = inputDeployCmd || null;
-                    if (workingDir && (!buildCmd || !deployCmd)) {
+                    const deployCmd = null; // deprecated — deploy_project uses CLI agent topology detection
+                    if (workingDir && !buildCmd) {
                         const hasSwarmYml = fs.existsSync(path.join(workingDir, 'swarm.yml'));
                         const hasDockerfile = fs.existsSync(path.join(workingDir, 'Dockerfile'));
                         const hasPkgJson = fs.existsSync(path.join(workingDir, 'package.json'));
                         const hasRequirements = fs.existsSync(path.join(workingDir, 'requirements.txt'));
                         const hasPyproject = fs.existsSync(path.join(workingDir, 'pyproject.toml'));
-                        if (!buildCmd || !deployCmd) {
-                            let detectedBuild = null;
-                            let detectedDeploy = null;
-                            if (hasSwarmYml) {
-                                detectedBuild = `cd ${workingDir} && docker build -t ${projectId}:latest .`;
-                                detectedDeploy = `docker stack deploy -c ${workingDir}/swarm.yml ${projectId}`;
-                            }
-                            else if (hasDockerfile) {
-                                detectedBuild = `cd ${workingDir} && docker build -t ${projectId}:latest .`;
-                                detectedDeploy = `docker service update --image ${projectId}:latest prod_${projectId} || docker service update --image ${projectId}:latest ${projectId}`;
-                            }
-                            else if (hasPkgJson) {
-                                let pkgJson = {};
-                                try {
-                                    pkgJson = JSON.parse(fs.readFileSync(path.join(workingDir, 'package.json'), 'utf8'));
-                                }
-                                catch { }
-                                const deps = (pkgJson?.dependencies ?? {});
-                                const devDeps = (pkgJson?.devDependencies ?? {});
-                                const isNext = Boolean(deps.next ?? devDeps.next);
-                                if (isNext) {
-                                    detectedBuild = `cd ${workingDir} && docker build -t ${projectId}:latest .`;
-                                    detectedDeploy = `docker service update --image ${projectId}:latest prod_${projectId} || docker service update --image ${projectId}:latest ${projectId}`;
-                                }
-                                else {
-                                    detectedBuild = `cd ${workingDir} && npm install && npm run build`;
-                                    detectedDeploy = `pkill -f "node dist/index.js" 2>/dev/null || true; nohup node ${workingDir}/dist/index.js > /tmp/${projectId}.log 2>&1 &`;
-                                }
-                            }
-                            else if (hasRequirements || hasPyproject) {
-                                detectedBuild = `cd ${workingDir} && pip install -r ${hasRequirements ? 'requirements.txt' : '.'} -q`;
-                                detectedDeploy = `pkill -f "${workingDir}/main.py" 2>/dev/null || true; nohup python3 ${workingDir}/main.py > /tmp/${projectId}.log 2>&1 &`;
-                            }
-                            if (!buildCmd)
-                                buildCmd = detectedBuild;
-                            if (!deployCmd)
-                                deployCmd = detectedDeploy;
+                        let detectedBuild = null;
+                        if (hasSwarmYml || hasDockerfile) {
+                            detectedBuild = `cd ${workingDir} && docker build -t ${projectId}:latest .`;
                         }
+                        else if (hasPkgJson) {
+                            detectedBuild = `cd ${workingDir} && npm install && npm run build`;
+                        }
+                        else if (hasRequirements || hasPyproject) {
+                            detectedBuild = `cd ${workingDir} && pip install -r ${hasRequirements ? 'requirements.txt' : '.'} -q`;
+                        }
+                        buildCmd = detectedBuild;
                     }
                     const jiraKeysArr = jiraKeysStr
                         ? `{${jiraKeysStr.split(",").map((k) => k.trim()).filter(Boolean).join(",")}}`

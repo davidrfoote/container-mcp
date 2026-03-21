@@ -7,6 +7,7 @@ exports.bootstrapSession = void 0;
 const express_1 = __importDefault(require("express"));
 const sse_js_1 = require("@modelcontextprotocol/sdk/server/sse.js");
 const db_js_1 = require("./db.js");
+const logger_js_1 = require("./logger.js");
 const mcp_server_js_1 = require("./mcp-server.js");
 const listen_chain_js_1 = require("./listen-chain.js");
 // Re-export for external consumers
@@ -99,5 +100,15 @@ server.on("error", (err) => {
 const dbUrl = process.env.OPS_DB_URL;
 if (dbUrl) {
     (0, db_js_1.ensureMigrations)(dbUrl).catch((e) => console.warn("[migrations] Failed (non-fatal):", e.message));
+    // Heartbeat: stamp container_heartbeat_at on sessions that have an active in-flight task.
+    // dev-session-app can alert if this goes stale (>90s) while active_task_id is set.
+    setInterval(() => {
+        void (0, db_js_1.withDbClient)(dbUrl, async (client) => {
+            await client.query(`UPDATE sessions SET container_heartbeat_at = now()
+         WHERE active_task_id IS NOT NULL
+           AND status IN ('active', 'executing', 'pending', 'awaiting_approval', 'planning')`);
+        }).catch((e) => logger_js_1.logger.warn(`[heartbeat] failed: ${e.message}`));
+    }, 30_000);
+    logger_js_1.logger.log("[container-mcp] heartbeat started (30s interval, stamps active sessions)");
 }
 void (0, listen_chain_js_1.startListenChain)();

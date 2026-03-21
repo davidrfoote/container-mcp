@@ -10,6 +10,8 @@ const logger_js_1 = require("./logger.js");
 let _reconnectMs = 1_000;
 // Interval handle for periodic backfill2; cleared on pg client error to avoid timer accumulation.
 let _backfill2Interval = null;
+// Interval handle for listenClient keepalive SELECT 1; cleared on error to avoid accumulation.
+let _keepaliveInterval = null;
 // ── Backfill 2: find sessions with approval_response but no EXECUTION yet ──
 // Extracted so it can be called at startup, after reconnect, and periodically.
 async function runBackfill2(dbUrl) {
@@ -37,6 +39,11 @@ async function runBackfill2(dbUrl) {
                     const { instruction, workingDir, resumeClaudeSessionId } = await (0, bootstrap_js_1.buildExecutionInstruction)(row.session_id, dbUrl);
                     (0, code_task_js_1.spawnCodeTask)({ instruction, workingDir, sessionId: row.session_id, dbUrl, resumeClaudeSessionId });
                     logger_js_1.logger.log(`[listen-chain] backfill2 EXECUTION spawned for ${row.session_id}`);
+                    // Surface recovery in the session feed so it's visible in the UI
+                    void (0, db_js_1.withDbClient)(dbUrl, async (c) => {
+                        await c.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, metadata, created_at)
+               VALUES (gen_random_uuid(), $1, 'system', $2, 'console', $3::jsonb, now())`, [row.session_id, '🔄 Recovery: EXECUTION re-triggered by backfill (missed approval_response notification)', JSON.stringify({ recovery_trigger: true })]);
+                    }).catch((e) => logger_js_1.logger.warn(`[listen-chain] backfill2 console msg failed: ${e.message}`));
                 }
                 catch (e) {
                     logger_js_1.logger.error(`[listen-chain] backfill2 error for ${row.session_id}:`, e.message);
@@ -66,6 +73,14 @@ async function startListenChain() {
         await listenClient.query("LISTEN session_events");
         _reconnectMs = 1_000;
         logger_js_1.logger.log("[listen-chain] Postgres LISTEN session_messages + session_events started");
+        // Keepalive: run SELECT 1 every 30s to detect silent connection drops after restart.
+        // If it fails, emit 'error' to trigger the existing reconnect logic.
+        _keepaliveInterval = setInterval(() => {
+            listenClient.query("SELECT 1").catch((err) => {
+                logger_js_1.logger.error("[listen-chain] keepalive SELECT 1 failed — triggering reconnect:", err.message);
+                listenClient.emit("error", err);
+            });
+        }, 30_000);
         listenClient.on("notification", (msg) => {
             void (async () => {
                 try {
@@ -120,8 +135,8 @@ async function startListenChain() {
                                         }
                                         const autoMsgId = `msg-${(0, crypto_1.randomUUID)()}`;
                                         const nowIso = new Date().toISOString();
-                                        await autoClient.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
-                       VALUES ($1, $2, 'system', 'auto-approved', 'approval_response', NOW())`, [autoMsgId, sessionId]);
+                                        await autoClient.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, metadata, created_at)
+                       VALUES ($1, $2, 'system', 'auto-approved', 'approval_response', $3::jsonb, NOW())`, [autoMsgId, sessionId, JSON.stringify({ auto_approved: true, complexity })]);
                                         const notifyPayload = JSON.stringify({
                                             id: autoMsgId, message_id: autoMsgId, session_id: sessionId,
                                             role: "system", message_type: "approval_response",
@@ -196,7 +211,13 @@ async function startListenChain() {
                             });
                             if (resp.ok) {
                                 const parsed = await resp.json().catch(() => ({}));
-                                logger_js_1.logger.log(`[listen-chain] dev-lead close-out spawned for ${sessionId}, key=${parsed?.childSessionKey ?? "n/a"}`);
+                                const childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
+                                logger_js_1.logger.log(`[listen-chain] dev-lead close-out spawned for ${sessionId}, key=${childSessionKey ?? "n/a"}`);
+                                if (childSessionKey) {
+                                    void (0, db_js_1.withDbClient)(dbUrl, async (client) => {
+                                        await client.query(`UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`, [childSessionKey, sessionId]);
+                                    }).catch((e) => logger_js_1.logger.warn(`[listen-chain] store openclaw_session_key failed: ${e.message}`));
+                                }
                             }
                             else {
                                 const text = await resp.text().catch(() => "");
@@ -222,7 +243,13 @@ async function startListenChain() {
                             });
                             if (resp.ok) {
                                 const parsed = await resp.json().catch(() => ({}));
-                                logger_js_1.logger.log(`[listen-chain] dev-lead spawned for chat ${sessionId}, key=${parsed?.childSessionKey ?? "n/a"}`);
+                                const childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
+                                logger_js_1.logger.log(`[listen-chain] dev-lead spawned for chat ${sessionId}, key=${childSessionKey ?? "n/a"}`);
+                                if (childSessionKey) {
+                                    void (0, db_js_1.withDbClient)(dbUrl, async (client) => {
+                                        await client.query(`UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`, [childSessionKey, sessionId]);
+                                    }).catch((e) => logger_js_1.logger.warn(`[listen-chain] store openclaw_session_key failed: ${e.message}`));
+                                }
                             }
                             else {
                                 const text = await resp.text().catch(() => "");
@@ -241,6 +268,11 @@ async function startListenChain() {
         });
         listenClient.on("error", (err) => {
             logger_js_1.logger.error("[listen-chain] Postgres LISTEN client error:", err.message);
+            // Clear the keepalive interval — the new connection will set up a fresh one.
+            if (_keepaliveInterval !== null) {
+                clearInterval(_keepaliveInterval);
+                _keepaliveInterval = null;
+            }
             // Clear the periodic backfill2 interval — the new connection will set up a fresh one.
             if (_backfill2Interval !== null) {
                 clearInterval(_backfill2Interval);

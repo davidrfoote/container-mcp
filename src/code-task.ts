@@ -34,6 +34,27 @@ export function spawnCodeTask(params: {
 
   postToFeed(sessionId!, dbUrl!, `🚀 Starting code task (${taskId})${model ? ` [${model}]` : ""}${resumeClaudeSessionId ? " [resumed]" : ""}\n\n${instruction.slice(0, 400)}`);
 
+  // Emit structured cli_context so the session view can show full agent visibility
+  if (sessionId && dbUrl) {
+    // Read rules files now so we can surface them in the UI before the process starts
+    let rulesPreview = "";
+    try { rulesPreview += fs.readFileSync("/home/david/.rules/base.md", "utf8"); } catch {}
+    try { rulesPreview += "\n" + fs.readFileSync(path.join(workingDir, ".rules/project.md"), "utf8"); } catch {}
+    if (taskRules) rulesPreview += "\n" + taskRules;
+
+    void postToFeed(sessionId, dbUrl, JSON.stringify({
+      kind: "task_start",
+      taskId,
+      model: model ?? null,
+      effort: effort ?? null,
+      allowedTools: allowedTools ?? [],
+      agents: agents ? (() => { try { return JSON.parse(agents); } catch { return agents; } })() : null,
+      isResumed: !!resumeClaudeSessionId,
+      workingDir,
+      rules: rulesPreview.trim().slice(0, 4000),
+    }), "system", "cli_context");
+  }
+
   // Persist the active task ID so dev-session-app can detect in-flight tasks on restart
   if (sessionId && dbUrl) {
     void withDbClient(dbUrl, async (client) => {
@@ -128,13 +149,20 @@ export function spawnCodeTask(params: {
               const mcpServers = (parsed.mcp_servers as string[]) ?? [];
               const tools = (parsed.tools as string[]) ?? [];
 
-              // Persist model name into sessions table
+              // Persist model name into sessions table, then push a session_update
+              // notification so the browser header badge refreshes immediately
+              // (without waiting for the 15s polling refetch).
               if (cliModel && sessionId && dbUrl) {
+                const safeSessionId = sessionId.replace(/-/g, "_");
                 void withDbClient(dbUrl, async (client) => {
                   await client.query(
                     `UPDATE sessions SET model = $1, updated_at = now() WHERE session_id = $2`,
                     [cliModel, sessionId]
                   );
+                  await client.query("SELECT pg_notify($1, $2)", [
+                    `session_status_${safeSessionId}`,
+                    JSON.stringify({ session_id: sessionId, model: cliModel }),
+                  ]);
                 }).catch((e: Error) => console.error(`[spawnCodeTask] model write failed: ${e.message}`));
               }
 
@@ -145,6 +173,17 @@ export function spawnCodeTask(params: {
                 "coding_agent", "console"
               );
 
+              // Emit structured runtime info for full CLI visibility panel
+              void postToFeed(sessionId!, dbUrl!, JSON.stringify({
+                kind: "runtime_init",
+                taskId,
+                model: cliModel ?? null,
+                version: version ?? null,
+                permissionMode: permMode ?? null,
+                mcpServers,
+                tools,
+              }), "system", "cli_context");
+
             // ── assistant turn: tool calls and thinking text ─────────────────
             } else if (evType === "assistant") {
               const content = (parsed.message as any)?.content ?? [];
@@ -152,6 +191,26 @@ export function spawnCodeTask(params: {
                 if (block.type === "tool_use") {
                   const argsStr = JSON.stringify(block.input ?? {}).slice(0, 600);
                   postToFeed(sessionId!, dbUrl!, `🔧 \`${block.name}\` ${argsStr}`, "coding_agent", "execution_log");
+
+                  // Emit tool_active for live visibility of current tool
+                  void postToFeed(sessionId!, dbUrl!, JSON.stringify({
+                    kind: "tool_active",
+                    taskId,
+                    toolName: block.name,
+                    toolId: block.id ?? null,
+                    inputSummary: JSON.stringify(block.input ?? {}).slice(0, 300),
+                  }), "system", "cli_context");
+
+                  // Detect subagent spawning (Task tool in Claude Code = spawning an agent)
+                  if (block.name === "Task") {
+                    void postToFeed(sessionId!, dbUrl!, JSON.stringify({
+                      kind: "subagent_spawn",
+                      taskId,
+                      toolId: block.id ?? null,
+                      description: (block.input as Record<string, unknown>)?.description as string ?? "",
+                      prompt: ((block.input as Record<string, unknown>)?.prompt as string ?? "").slice(0, 500),
+                    }), "system", "cli_context");
+                  }
                 } else if (block.type === "text" && block.text?.trim()) {
                   const text = (block.text as string).trim().slice(0, 1500);
                   if (text.length > 20) postToFeed(sessionId!, dbUrl!, `💭 ${text}`, "coding_agent", "execution_log");
