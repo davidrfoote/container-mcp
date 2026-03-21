@@ -17,9 +17,12 @@ export async function withDbClient<T>(connectionString: string | undefined, fn: 
 export async function notifySessionMessage(client: Client, sessionId: string, payload: Record<string, unknown>): Promise<void> {
   const safeId = sessionId.replace(/-/g, "_");
   // Truncate content to avoid exceeding PostgreSQL's 8000-byte pg_notify limit.
+  // cli_context messages carry structured JSON — limit them more conservatively so
+  // the rest of the envelope (keys + session_id + message_id etc.) fits comfortably.
   const truncated = { ...payload };
   if (typeof truncated.content === "string") {
-    truncated.content = truncated.content.slice(0, 500);
+    const isStructured = truncated.message_type === "cli_context";
+    truncated.content = truncated.content.slice(0, isStructured ? 5000 : 2000);
   }
   const text = JSON.stringify(truncated);
   await client.query("SELECT pg_notify($1, $2)", [`session_messages_${safeId}`, text]);

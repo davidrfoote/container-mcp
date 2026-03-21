@@ -51,7 +51,7 @@ export function spawnCodeTask(params: {
       agents: agents ? (() => { try { return JSON.parse(agents); } catch { return agents; } })() : null,
       isResumed: !!resumeClaudeSessionId,
       workingDir,
-      rules: rulesPreview.trim().slice(0, 8000),
+      rules: rulesPreview.trim().slice(0, 4000),
     }), "system", "cli_context");
   }
 
@@ -149,13 +149,20 @@ export function spawnCodeTask(params: {
               const mcpServers = (parsed.mcp_servers as string[]) ?? [];
               const tools = (parsed.tools as string[]) ?? [];
 
-              // Persist model name into sessions table
+              // Persist model name into sessions table, then push a session_update
+              // notification so the browser header badge refreshes immediately
+              // (without waiting for the 15s polling refetch).
               if (cliModel && sessionId && dbUrl) {
+                const safeSessionId = sessionId.replace(/-/g, "_");
                 void withDbClient(dbUrl, async (client) => {
                   await client.query(
                     `UPDATE sessions SET model = $1, updated_at = now() WHERE session_id = $2`,
                     [cliModel, sessionId]
                   );
+                  await client.query("SELECT pg_notify($1, $2)", [
+                    `session_status_${safeSessionId}`,
+                    JSON.stringify({ session_id: sessionId, model: cliModel }),
+                  ]);
                 }).catch((e: Error) => console.error(`[spawnCodeTask] model write failed: ${e.message}`));
               }
 
