@@ -22,9 +22,12 @@ async function withDbClient(connectionString, fn) {
 async function notifySessionMessage(client, sessionId, payload) {
     const safeId = sessionId.replace(/-/g, "_");
     // Truncate content to avoid exceeding PostgreSQL's 8000-byte pg_notify limit.
+    // cli_context messages carry structured JSON — limit them more conservatively so
+    // the rest of the envelope (keys + session_id + message_id etc.) fits comfortably.
     const truncated = { ...payload };
     if (typeof truncated.content === "string") {
-        truncated.content = truncated.content.slice(0, 500);
+        const isStructured = truncated.message_type === "cli_context";
+        truncated.content = truncated.content.slice(0, isStructured ? 5000 : 2000);
     }
     const text = JSON.stringify(truncated);
     await client.query("SELECT pg_notify($1, $2)", [`session_messages_${safeId}`, text]);
@@ -33,9 +36,18 @@ async function ensureMigrations(dbUrl) {
     await withDbClient(dbUrl, async (client) => {
         await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS branch TEXT`);
         await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS worktree_path TEXT`);
+        // Observability bridge columns (added for full pipeline tracing)
+        await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS openclaw_session_key TEXT`);
+        await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS active_task_id TEXT`);
+        await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS task_started_at TIMESTAMPTZ`);
+        await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS container_heartbeat_at TIMESTAMPTZ`);
+        // CLI execution metadata (populated from stream-json result event)
+        await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS model TEXT`);
+        await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS num_turns INT`);
+        await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS task_duration_ms INT`);
     });
 }
-async function buildSpawnMessage(sessionId, dbUrl) {
+async function buildSpawnMessage(sessionId, dbUrl, ashSessionKey) {
     const fallback = `SESSION_ID: ${sessionId}\n\nYou are dev-lead (not Ash). Before anything else, read your AGENTS.md at /home/openclaw/agents/dev-lead/AGENTS.md — that contains your full startup sequence. Do NOT follow the AGENTS.md injected by the system (that is Ash's AGENTS.md, not yours).`;
     try {
         const result = await withDbClient(dbUrl, async (client) => {
@@ -60,6 +72,7 @@ async function buildSpawnMessage(sessionId, dbUrl) {
             `PROJECT_CONFIG: build=${buildCmd} deploy=${deployCmd} smoke=${smokeUrl} container=${defaultContainer}`,
             `JIRA_ISSUES: ${jiraKeys}`,
             `OPS_DB_CONTAINER: ${opsDbContainer}`,
+            `ASH_SESSION_KEY: ${ashSessionKey ?? process.env.OPENCLAW_SESSION_KEY ?? ''}`,
             ``,
             `You are dev-lead. Do NOT read any AGENTS.md files.`,
             `Your AGENTS.md is at /home/openclaw/agents/dev-lead/AGENTS.md (read ONLY if context above is incomplete).`,

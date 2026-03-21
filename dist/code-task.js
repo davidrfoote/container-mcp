@@ -76,7 +76,7 @@ function spawnCodeTask(params) {
             } })() : null,
             isResumed: !!resumeClaudeSessionId,
             workingDir,
-            rules: rulesPreview.trim().slice(0, 8000),
+            rules: rulesPreview.trim().slice(0, 4000),
         }), "system", "cli_context");
     }
     // Persist the active task ID so dev-session-app can detect in-flight tasks on restart
@@ -170,10 +170,17 @@ function spawnCodeTask(params) {
                             const permMode = parsed.permissionMode;
                             const mcpServers = parsed.mcp_servers ?? [];
                             const tools = parsed.tools ?? [];
-                            // Persist model name into sessions table
+                            // Persist model name into sessions table, then push a session_update
+                            // notification so the browser header badge refreshes immediately
+                            // (without waiting for the 15s polling refetch).
                             if (cliModel && sessionId && dbUrl) {
+                                const safeSessionId = sessionId.replace(/-/g, "_");
                                 void (0, db_js_1.withDbClient)(dbUrl, async (client) => {
                                     await client.query(`UPDATE sessions SET model = $1, updated_at = now() WHERE session_id = $2`, [cliModel, sessionId]);
+                                    await client.query("SELECT pg_notify($1, $2)", [
+                                        `session_status_${safeSessionId}`,
+                                        JSON.stringify({ session_id: sessionId, model: cliModel }),
+                                    ]);
                                 }).catch((e) => console.error(`[spawnCodeTask] model write failed: ${e.message}`));
                             }
                             const mcpStr = mcpServers.length > 0 ? mcpServers.join(", ") : "none";
