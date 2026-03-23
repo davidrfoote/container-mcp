@@ -318,8 +318,9 @@ export async function buildCloseoutMessage(sessionId: string, checkpointContent:
         deploy_cmd: string | null;
         smoke_url: string | null;
         default_container: string | null;
+        gateway_parent_key: string | null;
       }>(
-        `SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.smoke_url, p.default_container
+        `SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.smoke_url, p.default_container, s.gateway_parent_key
          FROM sessions s LEFT JOIN projects p ON p.project_id = s.project_id
          WHERE s.session_id = $1`,
         [sessionId]
@@ -336,6 +337,7 @@ export async function buildCloseoutMessage(sessionId: string, checkpointContent:
       `BUILD: ${config.build_cmd ?? "none"}`,
       `DEPLOY: ${config.deploy_cmd ?? "none"}`,
       `SMOKE: ${config.smoke_url ?? "none"}`,
+      `ASH_SESSION_KEY: ${config.gateway_parent_key ?? process.env.OPENCLAW_SESSION_KEY ?? ""}`,
       ``,
       `You are dev-lead. The coding agent has finished. Your job is close-out only.`,
       `Read /home/openclaw/agents/dev-lead/AGENTS.md for the full procedure.`,

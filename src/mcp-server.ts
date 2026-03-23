@@ -1420,11 +1420,12 @@ export function createMcpServer() {
             : null;
 
           try {
+            const resolvedAshKey = ash_session_key || process.env.OPENCLAW_SESSION_KEY || null;
             await withDbClient(dbUrl, async (client) => {
               await client.query(
-                `INSERT INTO sessions (session_id, project_id, container, repo, status, session_type, title, prompt_preview, jira_issue_keys, slack_thread_url, created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, 'active', 'dev', $5, $6, $7::text[], $8, now(), now())`,
-                [sessionId, repo, sessionContainer, repo, title, task_brief.slice(0, 500), jiraKeysArr, slack_thread_url || null]
+                `INSERT INTO sessions (session_id, project_id, container, repo, status, session_type, title, prompt_preview, jira_issue_keys, slack_thread_url, gateway_parent_key, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, 'active', 'dev', $5, $6, $7::text[], $8, $9, now(), now())`,
+                [sessionId, repo, sessionContainer, repo, title, task_brief.slice(0, 500), jiraKeysArr, slack_thread_url || null, resolvedAshKey]
               );
 
               const msgId = `msg-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
