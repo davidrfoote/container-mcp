@@ -233,12 +233,18 @@ async function startListenChain() {
                     if (isChatMessage) {
                         logger_js_1.logger.log(`[listen-chain] chat for ${sessionId} — spawning dev-lead`);
                         try {
+                            // Resolve Ash's session key: prefer stored gateway_parent_key, fall back to env
+                            const parentKeyRow = await (0, db_js_1.withDbClient)(dbUrl, async (c) => {
+                                const r = await c.query(`SELECT gateway_parent_key FROM sessions WHERE session_id = $1`, [sessionId]);
+                                return r.rows[0] ?? null;
+                            }).catch(() => null);
+                            const ashKey = parentKeyRow?.gateway_parent_key ?? undefined;
                             const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
                                 method: "POST",
                                 headers: { "Content-Type": "application/json", "Authorization": `Bearer ${gatewayToken}` },
                                 body: JSON.stringify({
                                     tool: "sessions_spawn",
-                                    args: { agentId: "dev-lead", task: await (0, db_js_1.buildSpawnMessage)(sessionId, dbUrl), cwd: "/home/openclaw/agents/dev-lead" },
+                                    args: { agentId: "dev-lead", task: await (0, db_js_1.buildSpawnMessage)(sessionId, dbUrl, ashKey), cwd: "/home/openclaw/agents/dev-lead" },
                                 }),
                             });
                             if (resp.ok) {

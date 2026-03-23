@@ -68,6 +68,39 @@ function httpGetWithTimeout(url, timeoutMs) {
         req.on("error", () => resolve(null));
     });
 }
+async function fetchGitnexusContext(projectId) {
+    if (!process.env.GITNEXUS_SERVICE_URL)
+        return "";
+    try {
+        const githubOrg = process.env.GITHUB_ORG ?? "davidrfoote";
+        const url = new URL(`/context/${githubOrg}/${projectId}`, process.env.GITNEXUS_SERVICE_URL);
+        const res = await httpGetWithTimeout(url.toString(), 5000);
+        if (res?.wiki_summary && typeof res.wiki_summary === "string")
+            return res.wiki_summary;
+    }
+    catch { }
+    return "";
+}
+function writeClaudeMd(worktreePath, sections) {
+    const parts = [
+        `# ${sections.projectId} — Agent Context`,
+        ``,
+        `**Branch:** ${sections.branch ?? "main"}`,
+        `**Build:** \`${sections.buildCmd ?? "npm run build"}\``,
+    ];
+    if (sections.wikiSummary) {
+        parts.push(``, `## Code Graph`, ``, sections.wikiSummary);
+    }
+    if (sections.cacheSummary) {
+        parts.push(``, `## Project Context (Jira / Confluence)`, ``, sections.cacheSummary);
+    }
+    try {
+        fs.writeFileSync(path.join(worktreePath, "CLAUDE.md"), parts.join("\n") + "\n");
+    }
+    catch (e) {
+        console.warn(`[bootstrap] failed to write CLAUDE.md: ${e.message}`);
+    }
+}
 const SLACK_USER_MAP = {
     U097Q46UX: "David",
     U160P0C7M: "Shane",
@@ -119,16 +152,16 @@ async function buildBootstrapInstruction(sessionId, dbUrl) {
         catch { }
     }
     // Fetch gitnexus code graph context (non-fatal)
-    let codeGraphContext = "";
-    try {
-        if (process.env.GITNEXUS_SERVICE_URL) {
-            const url = new URL(`/context/${path.basename(workingDir)}`, process.env.GITNEXUS_SERVICE_URL);
-            const res = await httpGetWithTimeout(url.toString(), 5000);
-            if (res?.wiki_summary)
-                codeGraphContext = `\n\n## Code Graph Context\n${res.wiki_summary}`;
-        }
-    }
-    catch { }
+    const wikiSummary = await fetchGitnexusContext(projectId);
+    const codeGraphContext = wikiSummary ? `\n\n## Code Graph Context\n${wikiSummary}` : "";
+    // Write CLAUDE.md into the worktree so the CLI agent picks it up automatically
+    writeClaudeMd(workingDir, {
+        projectId,
+        branch: sessionBranch,
+        wikiSummary,
+        cacheSummary: cacheSummary.trim(),
+        buildCmd: data.session?.build_cmd ?? null,
+    });
     const instruction = [
         `## BOOTSTRAP PASS — Session ${sessionId}`,
         ``,
@@ -189,6 +222,33 @@ async function buildExecutionInstruction(sessionId, dbUrl) {
     const branch = data.session?.branch ?? null;
     const workingDir = worktreePath ?? `/home/david/${projectId}`;
     const resumeClaudeSessionId = data.session?.claude_session_id ?? undefined;
+    // Refresh CLAUDE.md for the EXECUTION pass — gitnexus analysis may have completed since BOOTSTRAP
+    const wikiSummary = await fetchGitnexusContext(projectId);
+    {
+        // Always rewrite — even without wiki, cache summaries are valuable
+        const cacheKeys = [
+            ...jiraKeys.map((k) => `jira:${k}`),
+        ];
+        let execCacheSummary = "";
+        for (const key of cacheKeys) {
+            try {
+                const row = await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
+                    const r = await client.query("SELECT summary FROM project_context_cache WHERE cache_key = $1", [key]);
+                    return r.rows[0] ?? null;
+                });
+                if (row?.summary)
+                    execCacheSummary += `\n### ${key}\n${row.summary}\n`;
+            }
+            catch { }
+        }
+        writeClaudeMd(workingDir, {
+            projectId,
+            branch,
+            wikiSummary,
+            cacheSummary: execCacheSummary.trim(),
+            buildCmd: data.session?.build_cmd ?? null,
+        });
+    }
     const userMods = (data.approval !== "approved" && data.approval !== "auto-approved")
         ? `\n### User Modifications / Feedback\n${data.approval}\n`
         : "";
@@ -240,7 +300,7 @@ async function buildCloseoutMessage(sessionId, checkpointContent, dbUrl) {
     const fallback = `SESSION_ID: ${sessionId}\nROLE: close-out\nCHECKPOINT: ${checkpointContent}\n\nYou are dev-lead performing session close-out. Read AGENTS.md at /home/openclaw/agents/dev-lead/AGENTS.md.`;
     try {
         const config = await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-            const r = await client.query(`SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.smoke_url, p.default_container
+            const r = await client.query(`SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.smoke_url, p.default_container, s.gateway_parent_key
          FROM sessions s LEFT JOIN projects p ON p.project_id = s.project_id
          WHERE s.session_id = $1`, [sessionId]);
             return r.rows[0] ?? null;
@@ -256,6 +316,7 @@ async function buildCloseoutMessage(sessionId, checkpointContent, dbUrl) {
             `BUILD: ${config.build_cmd ?? "none"}`,
             `DEPLOY: ${config.deploy_cmd ?? "none"}`,
             `SMOKE: ${config.smoke_url ?? "none"}`,
+            `ASH_SESSION_KEY: ${config.gateway_parent_key ?? process.env.OPENCLAW_SESSION_KEY ?? ""}`,
             ``,
             `You are dev-lead. The coding agent has finished. Your job is close-out only.`,
             `Read /home/openclaw/agents/dev-lead/AGENTS.md for the full procedure.`,

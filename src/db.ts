@@ -41,6 +41,8 @@ export async function ensureMigrations(dbUrl: string): Promise<void> {
     await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS model TEXT`);
     await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS num_turns INT`);
     await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS task_duration_ms INT`);
+    // Parent gateway session key — Ash's session that spawned this work (for callback routing)
+    await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS gateway_parent_key TEXT`);
   });
 }
 
