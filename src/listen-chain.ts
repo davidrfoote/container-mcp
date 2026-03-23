@@ -226,11 +226,41 @@ export async function startListenChain(): Promise<void> {
 
           // ── checkpoint (coding_agent) → dev-lead close-out ────────────
           if (isCheckpoint) {
-            logger.log(`[listen-chain] checkpoint from coding_agent for ${sessionId} — spawning dev-lead close-out`);
+            logger.log(`[listen-chain] checkpoint from coding_agent for ${sessionId} — triggering dev-lead close-out`);
             const checkpointContent = (payload as any).content ?? "(no checkpoint content)";
             try {
               const task = await buildCloseoutMessage(sessionId, checkpointContent, dbUrl);
-              const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
+
+              // Prefer sessions_send into the existing dev-lead session so it retains full
+              // conversation context with Ash. Fall back to sessions_spawn if no session exists yet.
+              const existingKey = await withDbClient(dbUrl, async (c) => {
+                const r = await c.query<{ openclaw_session_key: string | null }>(
+                  `SELECT openclaw_session_key FROM sessions WHERE session_id = $1`,
+                  [sessionId]
+                );
+                return r.rows[0]?.openclaw_session_key ?? null;
+              }).catch(() => null);
+
+              if (existingKey) {
+                logger.log(`[listen-chain] sessions_send to existing dev-lead session ${existingKey} for ${sessionId}`);
+                const sendResp = await fetch(`${gatewayUrl}/tools/invoke`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json", "Authorization": `Bearer ${gatewayToken}` },
+                  body: JSON.stringify({
+                    tool: "sessions_send",
+                    args: { sessionKey: existingKey, message: task, timeoutSeconds: 0 },
+                  }),
+                });
+                if (sendResp.ok) {
+                  logger.log(`[listen-chain] sessions_send accepted for ${sessionId}`);
+                  return;
+                }
+                const text = await sendResp.text().catch(() => "");
+                logger.warn(`[listen-chain] sessions_send failed (${sendResp.status} ${text.slice(0, 200)}) — falling back to sessions_spawn for ${sessionId}`);
+              }
+
+              // No existing session (or sessions_send failed) — spawn a fresh dev-lead close-out
+              const spawnResp = await fetch(`${gatewayUrl}/tools/invoke`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json", "Authorization": `Bearer ${gatewayToken}` },
                 body: JSON.stringify({
@@ -238,8 +268,8 @@ export async function startListenChain(): Promise<void> {
                   args: { agentId: "dev-lead", task, cwd: "/home/openclaw/agents/dev-lead" },
                 }),
               });
-              if (resp.ok) {
-                const parsed = await resp.json().catch(() => ({})) as any;
+              if (spawnResp.ok) {
+                const parsed = await spawnResp.json().catch(() => ({})) as any;
                 const childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
                 logger.log(`[listen-chain] dev-lead close-out spawned for ${sessionId}, key=${childSessionKey ?? "n/a"}`);
                 if (childSessionKey) {
@@ -251,11 +281,11 @@ export async function startListenChain(): Promise<void> {
                   }).catch((e: Error) => logger.warn(`[listen-chain] store openclaw_session_key failed: ${e.message}`));
                 }
               } else {
-                const text = await resp.text().catch(() => "");
-                logger.warn(`[listen-chain] dev-lead spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
+                const text = await spawnResp.text().catch(() => "");
+                logger.warn(`[listen-chain] dev-lead spawn failed for ${sessionId}: ${spawnResp.status} ${text.slice(0, 200)}`);
               }
             } catch (e: any) {
-              logger.error(`[listen-chain] close-out spawn error for ${sessionId}:`, e.message);
+              logger.error(`[listen-chain] close-out error for ${sessionId}:`, e.message);
             }
             return;
           }
