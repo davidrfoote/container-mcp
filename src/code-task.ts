@@ -6,6 +6,8 @@ import { withDbClient } from "./db.js";
 import { postToFeed } from "./feed.js";
 import { taskLogs } from "./task-logs.js";
 
+const DEFAULT_MODEL = process.env.DEFAULT_MODEL ?? "claude-sonnet-4-6";
+
 export function spawnCodeTask(params: {
   instruction: string;
   workingDir: string;
@@ -32,7 +34,8 @@ export function spawnCodeTask(params: {
   const log = (line: string) => taskLogs.get(taskId)!.push(line);
   const debugLogPath = `/tmp/task-${taskId}-debug.log`;
 
-  postToFeed(sessionId!, dbUrl!, `🚀 Starting code task (${taskId})${model ? ` [${model}]` : ""}${resumeClaudeSessionId ? " [resumed]" : ""}\n\n${instruction.slice(0, 400)}`);
+  const resolvedModel = model || DEFAULT_MODEL;
+  postToFeed(sessionId!, dbUrl!, `🚀 Starting code task (${taskId}) [${resolvedModel}]${resumeClaudeSessionId ? " [resumed]" : ""}\n\n${instruction.slice(0, 400)}`);
 
   // Emit structured cli_context so the session view can show full agent visibility
   if (sessionId && dbUrl) {
@@ -45,7 +48,7 @@ export function spawnCodeTask(params: {
     void postToFeed(sessionId, dbUrl, JSON.stringify({
       kind: "task_start",
       taskId,
-      model: model ?? null,
+      model: model || DEFAULT_MODEL,
       effort: effort ?? null,
       allowedTools: allowedTools ?? [],
       agents: agents ? (() => { try { return JSON.parse(agents); } catch { return agents; } })() : null,
@@ -102,7 +105,7 @@ export function spawnCodeTask(params: {
       ];
 
       if (hasMcpConfig) claudeArgs.push("--mcp-config", mcpConfigPath);
-      if (model) claudeArgs.push("--model", model);
+      claudeArgs.push("--model", model || DEFAULT_MODEL);
       if (effort) claudeArgs.push("--effort", effort);
       if (agents) claudeArgs.push("--agents", agents);
       if (allowedTools && allowedTools.length > 0) claudeArgs.push("--allowed-tools", allowedTools.join(","));

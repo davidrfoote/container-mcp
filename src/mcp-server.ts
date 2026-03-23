@@ -15,6 +15,8 @@ import { populateCacheForProject, writeCacheEntry } from "./jira-confluence.js";
 import { bootstrapSession } from "./bootstrap.js";
 import { deployProject } from "./tools/deploy-project.js";
 
+const DEFAULT_MODEL = process.env.DEFAULT_MODEL ?? "claude-sonnet-4-6";
+
 function modelCostPerMillion(model?: string): { input: number; output: number } {
   if (!model) return { input: 3, output: 15 };
   const m = model.toLowerCase();
@@ -560,7 +562,7 @@ export function createMcpServer() {
                   "--debug-file", debugLogPath,
                 ];
 
-                if (model) claudeArgs.push("--model", model);
+                claudeArgs.push("--model", model || DEFAULT_MODEL);
                 if (effort) claudeArgs.push("--effort", effort);
                 if (agents) claudeArgs.push("--agents", typeof agents === "string" ? agents : JSON.stringify(agents));
                 if (allowed_tools && Array.isArray(allowed_tools) && allowed_tools.length > 0) {
@@ -1172,6 +1174,7 @@ export function createMcpServer() {
             "--output-format", "stream-json",
             "--verbose",
             "--dangerously-skip-permissions",
+            "--model", DEFAULT_MODEL,
           ];
 
           if (existingClaudeSessionId) {
