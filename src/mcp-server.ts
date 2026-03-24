@@ -14,6 +14,7 @@ import { taskLogs } from "./task-logs.js";
 import { populateCacheForProject, writeCacheEntry } from "./jira-confluence.js";
 import { bootstrapSession } from "./bootstrap.js";
 import { deployProject } from "./tools/deploy-project.js";
+import { transitionSession, nextAllowedActions, SESSION_TRANSITIONS, type SessionStatus } from "./state-machine.js";
 
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL ?? "claude-sonnet-4-6";
 
@@ -489,6 +490,42 @@ export function createMcpServer() {
             },
           },
           required: ["user_request", "user_id"],
+        },
+      },
+      {
+        name: "transition_session",
+        description: "Atomically transition a session's status with graph validation. Rejects invalid transitions (e.g. completed → executing). Uses optimistic concurrency to prevent races.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: { type: "string", description: "The ops-db session ID" },
+            to_status: {
+              type: "string",
+              enum: ["pending", "active", "executing", "awaiting_approval", "planning", "paused", "completed", "failed"],
+              description: "Target status",
+            },
+          },
+          required: ["session_id", "to_status"],
+        },
+      },
+      {
+        name: "get_session_provenance",
+        description: "Get full provenance and timeline for a session: status, next allowed transitions, branch, worktree, Jira keys, cost, turn count, and message timeline.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: { type: "string", description: "The ops-db session ID" },
+          },
+          required: ["session_id"],
+        },
+      },
+      {
+        name: "get_container_inventory",
+        description: "Get a full inventory of this container: version, active sessions, worktrees, tool registry, and health checks.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+          required: [],
         },
       },
     ],
@@ -1675,6 +1712,126 @@ export function createMcpServer() {
           };
           const result = await bootstrapSession({ user_request, user_id, project_id: bsProjectId, project_hint, display_name: bsDisplayName, description: bsDescription, slack_thread_url: bsSlackThreadUrl });
           return { content: [{ type: "text", text: JSON.stringify(result) }] };
+        }
+
+        case "transition_session": {
+          const { session_id: tsSessionId, to_status } = args as { session_id: string; to_status: string };
+          const dbUrl = process.env.OPS_DB_URL;
+          if (!dbUrl) return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "OPS_DB_URL not set" }) }], isError: true };
+          const result = await transitionSession(dbUrl, tsSessionId, to_status as SessionStatus);
+          return { content: [{ type: "text", text: JSON.stringify(result) }], isError: !result.ok };
+        }
+
+        case "get_session_provenance": {
+          const { session_id: provSessionId } = args as { session_id: string };
+          const dbUrl = process.env.OPS_DB_URL;
+          if (!dbUrl) return { content: [{ type: "text", text: JSON.stringify({ error: "OPS_DB_URL not set" }) }], isError: true };
+
+          const data = await withDbClient(dbUrl, async (client) => {
+            const sessionRes = await client.query<{
+              session_id: string; project_id: string; status: string;
+              branch: string | null; worktree_path: string | null;
+              jira_issue_keys: string[] | null; model: string | null;
+              num_turns: number | null; cost_usd: string | null; created_at: string;
+            }>(
+              `SELECT session_id, project_id, status, branch, worktree_path,
+                      jira_issue_keys, model, num_turns, cost_usd, created_at
+               FROM sessions WHERE session_id = $1`,
+              [provSessionId],
+            );
+            if (sessionRes.rows.length === 0) return null;
+
+            const messagesRes = await client.query<{
+              message_type: string; role: string; created_at: string; content: string;
+            }>(
+              `SELECT message_type, role, created_at, content
+               FROM session_messages WHERE session_id = $1
+               ORDER BY created_at ASC LIMIT 100`,
+              [provSessionId],
+            );
+            return { session: sessionRes.rows[0], messages: messagesRes.rows };
+          });
+
+          if (!data) return { content: [{ type: "text", text: JSON.stringify({ error: `Session not found: ${provSessionId}` }) }], isError: true };
+
+          const allowed = await nextAllowedActions(dbUrl, provSessionId);
+          const timeline = data.messages.map((m) => ({
+            message_type: m.message_type, role: m.role,
+            created_at: m.created_at, content_preview: m.content.slice(0, 200),
+          }));
+
+          return { content: [{ type: "text", text: JSON.stringify({
+            ...data.session,
+            cost_usd: data.session.cost_usd ? parseFloat(data.session.cost_usd) : null,
+            next_allowed_transitions: allowed,
+            timeline,
+          }) }] };
+        }
+
+        case "get_container_inventory": {
+          const dbUrl = process.env.OPS_DB_URL;
+
+          // Build lightweight tool registry from the tool list
+          const toolNames = [
+            "code_task", "get_task_log", "run_tests", "run_build",
+            "git_status", "git_checkout", "git_add", "git_commit", "git_push", "git_merge", "git_pull",
+            "create_git_worktree", "delete_git_worktree", "list_git_worktrees", "get_diff", "get_repo_state",
+            "create_session", "bootstrap_session", "spawn_dev_lead", "chat_session", "listen_for_approval", "post_message",
+            "create_project", "deploy_project", "warm_cache_for_repos",
+            "cache_read", "cache_write",
+            "transition_session", "get_session_provenance", "get_container_inventory",
+          ];
+
+          let active_sessions: unknown[] = [];
+          let worktrees: unknown[] = [];
+          let db_health: "ok" | "error" = "error";
+
+          if (dbUrl) {
+            try {
+              const result = await withDbClient(dbUrl, async (client) => {
+                await client.query("SELECT 1");
+                db_health = "ok";
+                const sessRes = await client.query<{
+                  session_id: string; project_id: string; status: string;
+                  active_task_id: string | null; branch: string | null;
+                }>(
+                  `SELECT session_id, project_id, status, active_task_id, branch
+                   FROM sessions WHERE active_task_id IS NOT NULL
+                   ORDER BY updated_at DESC LIMIT 20`,
+                );
+                const wtRes = await client.query<{
+                  session_id: string; worktree_path: string; branch: string;
+                }>(
+                  `SELECT session_id, worktree_path, branch
+                   FROM sessions WHERE worktree_path IS NOT NULL AND status NOT IN ('completed', 'failed')
+                   ORDER BY updated_at DESC LIMIT 50`,
+                );
+                return { sessions: sessRes.rows, worktrees: wtRes.rows };
+              });
+              active_sessions = result.sessions;
+              worktrees = result.worktrees;
+            } catch {
+              db_health = "error";
+            }
+          }
+
+          let gateway_health: "ok" | "error" = "error";
+          const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
+          try {
+            const resp = await fetch(`${gatewayUrl}/health`, { signal: AbortSignal.timeout(3000) });
+            gateway_health = resp.ok ? "ok" : "error";
+          } catch {
+            gateway_health = "error";
+          }
+
+          return { content: [{ type: "text", text: JSON.stringify({
+            container_version: "2.2.0",
+            tool_count: toolNames.length,
+            tools: toolNames,
+            active_sessions,
+            worktrees,
+            health: { db: db_health, gateway: gateway_health },
+          }) }] };
         }
 
         default:
