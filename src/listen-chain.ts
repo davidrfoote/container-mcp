@@ -242,6 +242,14 @@ export async function startListenChain(): Promise<void> {
               }).catch(() => null);
 
               if (existingKey) {
+                // Post ash_callback message to session feed before sending
+                const callbackPreview = checkpointContent.slice(0, 200);
+                void postToFeed(
+                  sessionId, dbUrl,
+                  `code_task completed. Result: ${callbackPreview}`,
+                  "system", "ash_callback"
+                );
+
                 logger.log(`[listen-chain] sessions_send to existing dev-lead session ${existingKey} for ${sessionId}`);
                 const sendResp = await fetch(`${gatewayUrl}/tools/invoke`, {
                   method: "POST",
