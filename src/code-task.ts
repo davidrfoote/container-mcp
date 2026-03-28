@@ -174,8 +174,9 @@ export function spawnCodeTask(params: {
               if (cliModel && sessionId && dbUrl) {
                 const safeSessionId = sessionId.replace(/-/g, "_");
                 void withDbClient(dbUrl, async (client) => {
+                  // Write to both model (existing) and cli_model (new observability column)
                   await client.query(
-                    `UPDATE sessions SET model = $1, updated_at = now() WHERE session_id = $2`,
+                    `UPDATE sessions SET model = $1, cli_model = $1, updated_at = now() WHERE session_id = $2`,
                     [cliModel, sessionId]
                   );
                   await client.query("SELECT pg_notify($1, $2)", [

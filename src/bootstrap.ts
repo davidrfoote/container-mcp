@@ -568,13 +568,17 @@ export async function bootstrapSession(params: {
 
   try {
     await withDbClient(dbUrl, async (client) => {
+      // Derive auth_hint from environment
+      const authHint = process.env.ANTHROPIC_API_KEY
+        ? `${triggeredByName} ANTHROPIC_API_KEY (container env)`
+        : null;
       await client.query(
-        `INSERT INTO sessions (session_id, project_id, container, repo, status, session_type, title, prompt_preview, jira_issue_keys, user_id, triggered_by_name, triggered_by_slack_user_id, slack_thread_url, branch, worktree_path, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'pending', 'dev', $5, $6, $7::text[], $8, $9, $10, $11, $12, $13, now(), now())`,
+        `INSERT INTO sessions (session_id, project_id, container, repo, status, session_type, title, prompt_preview, jira_issue_keys, user_id, triggered_by_name, triggered_by_slack_user_id, slack_thread_url, branch, worktree_path, auth_hint, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'pending', 'dev', $5, $6, $7::text[], $8, $9, $10, $11, $12, $13, $14, now(), now())`,
         [sessionId, projectId, projConfig!.default_container ?? "dev-david", projectId,
           user_request.slice(0, 100), taskBrief.slice(0, 500), jiraKeysArr, user_id,
           triggeredByName, triggeredBySlackUserId, slack_thread_url ?? null,
-          sessionBranch, sessionWorktreePath]
+          sessionBranch, sessionWorktreePath, authHint]
       );
       const msgId = `msg-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
       await client.query(
