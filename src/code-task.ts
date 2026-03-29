@@ -165,7 +165,11 @@ export function spawnCodeTask(params: {
               const cliModel = parsed.model as string | undefined;
               const version = parsed.claude_code_version as string | undefined;
               const permMode = parsed.permissionMode as string | undefined;
-              const mcpServers = (parsed.mcp_servers as string[]) ?? [];
+              // mcp_servers may be an array of objects {name, status, ...} or plain strings
+              const mcpServersRaw = (parsed.mcp_servers as (string | Record<string, unknown>)[]) ?? [];
+              const mcpServers = mcpServersRaw.map((s) =>
+                typeof s === "string" ? s : ((s as any).name ?? (s as any).id ?? String(s))
+              );
               const tools = (parsed.tools as string[]) ?? [];
 
               // Persist model name into sessions table, then push a session_update
