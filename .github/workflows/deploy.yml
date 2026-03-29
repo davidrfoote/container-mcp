@@ -36,8 +36,10 @@ jobs:
 
       - name: Trigger deploy agent
         run: |
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST https://dev-sessions.ash.zennya.app/api/deployments \
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST https://dev-sessions.ash.zennya.app/api/trigger-deploy \
             -H "Authorization: Bearer ${{ secrets.DEPLOY_TOKEN }}" \
+            -H "CF-Access-Client-Id: ${{ secrets.CF_CLIENT_ID }}" \
+            -H "CF-Access-Client-Secret: ${{ secrets.CF_CLIENT_SECRET }}" \
             -H "Content-Type: application/json" \
             -d '{
               "repo": "${{ github.repository }}",
@@ -53,7 +55,6 @@ jobs:
             echo "Deploy API call failed with status $HTTP_STATUS"
             exit 1
           fi
-
       - name: Mark deployment success
         if: success()
         uses: actions/github-script@v7

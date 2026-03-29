@@ -18,3 +18,7 @@ jobs:
           cache: 'npm'
       - name: Run integration tests
         run: chmod +x integration_tests.sh && ./integration_tests.sh
+        env:
+          INTEGRATION_TEST_URL: https://dev-sessions.ash.zennya.app
+          CF_CLIENT_ID: ${{ secrets.CF_CLIENT_ID }}
+          CF_CLIENT_SECRET: ${{ secrets.CF_CLIENT_SECRET }}
