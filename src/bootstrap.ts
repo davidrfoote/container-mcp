@@ -4,9 +4,8 @@ import * as fs from "fs";
 import * as path from "path";
 import * as http from "http";
 import * as https from "https";
-import { withDbClient } from "./db.js";
+import { withDbClient, buildSpawnMessage } from "./db.js";
 import { postToFeed } from "./feed.js";
-import { spawnCodeTask } from "./code-task.js";
 import { populateCacheForProject, searchJiraForIssue, createJiraTaskIssue } from "./jira-confluence.js";
 
 function httpGetWithTimeout(url: string, timeoutMs: number): Promise<Record<string, unknown> | null> {
@@ -636,23 +635,79 @@ export async function bootstrapSession(params: {
     }
   }
 
-  // Spawn BOOTSTRAP code task (non-fatal on failure)
-  try {
-    const { instruction, workingDir, allowedTools } = await buildBootstrapInstruction(sessionId, dbUrl);
-    spawnCodeTask({ instruction, workingDir, sessionId, dbUrl, allowedTools });
-    console.log(`[bootstrapSession] BOOTSTRAP code task spawned for session ${sessionId}`);
-    const { transitionSession } = await import("./state-machine.js");
-    const tr = await transitionSession(dbUrl, sessionId, "active");
-    if (!tr.ok) console.warn(`[bootstrapSession] transition to active failed: ${tr.error}`);
-  } catch (e: any) {
-    console.warn(`[bootstrapSession] BOOTSTRAP spawn error (non-fatal): ${e.message}`);
-    await withDbClient(dbUrl, async (client) => {
-      await client.query(
-        `INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
-         VALUES (gen_random_uuid(), $1, 'system', $2, 'console', now())`,
-        [sessionId, `⚠️ Session created but BOOTSTRAP spawn failed: ${e.message}`]
-      );
-    }).catch(() => {});
+  // Spawn dev-lead via OpenClaw gateway /hooks/agent
+  {
+    const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
+    const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
+    const ashSessionKey = process.env.OPENCLAW_SESSION_KEY;
+    let spawnOk = false;
+    let spawnError = "";
+    let childSessionKey: string | null = null;
+    try {
+      const spawnMessage = await buildSpawnMessage(sessionId, dbUrl, ashSessionKey);
+      const resp = await fetch(`${gatewayUrl}/hooks/agent`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${gatewayToken}`,
+        },
+        body: JSON.stringify({
+          agentId: "dev-lead",
+          message: spawnMessage,
+          cwd: "/home/openclaw/agents/dev-lead",
+        }),
+      });
+      if (!resp.ok) {
+        const text = await resp.text();
+        spawnError = `Gateway ${resp.status}: ${text}`;
+      } else {
+        const parsed = await resp.json().catch(() => ({})) as any;
+        childSessionKey = parsed?.result?.details?.childSessionKey ?? parsed?.details?.childSessionKey ?? parsed?.childSessionKey ?? parsed?.session_key ?? null;
+        spawnOk = true;
+      }
+    } catch (fetchErr: any) {
+      spawnError = fetchErr.message;
+    }
+
+    if (!spawnOk) {
+      console.warn(`[bootstrapSession] BOOTSTRAP spawn error (non-fatal): ${spawnError}`);
+      await withDbClient(dbUrl, async (client) => {
+        await client.query(
+          `INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
+           VALUES (gen_random_uuid(), $1, 'system', $2, 'console', now())`,
+          [sessionId, `⚠️ Session created but BOOTSTRAP spawn failed: ${spawnError}`]
+        );
+      }).catch(() => {});
+    } else {
+      console.log(`[bootstrapSession] dev-lead spawned via gateway for session ${sessionId}`);
+      // Store openclaw_session_key, then transition to active via state machine
+      await withDbClient(dbUrl, async (client) => {
+        await client.query(
+          `UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`,
+          [childSessionKey, sessionId]
+        );
+      }).catch((e: any) => console.warn('[bootstrapSession] failed to store openclaw_session_key: ' + e.message));
+      const { transitionSession } = await import("./state-machine.js");
+      const tr = await transitionSession(dbUrl, sessionId, "active");
+      if (!tr.ok) console.warn(`[bootstrapSession] transition to active failed: ${tr.error}`);
+
+      // Register parent-child subscription for A2A callbacks (non-fatal)
+      if (childSessionKey) {
+        try {
+          await fetch("https://dev-sessions.ash.zennya.app/api/sessions/link", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              sessionId,
+              childSessionKey,
+              parentSessionKey: gatewayToken,
+            }),
+          });
+        } catch (linkErr: any) {
+          console.warn(`[bootstrapSession] sessions/link failed (non-fatal): ${linkErr.message}`);
+        }
+      }
+    }
   }
 
   console.log(`[bootstrapSession] created session ${sessionId} for user ${user_id} / project ${projectId}`);

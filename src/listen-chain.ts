@@ -1,6 +1,7 @@
 import { randomUUID } from "crypto";
 import { Client } from "pg";
 import { buildSpawnMessage, withDbClient } from "./db.js";
+import { postToFeed } from "./feed.js";
 import { spawnCodeTask } from "./code-task.js";
 import { buildBootstrapInstruction, buildExecutionInstruction, buildCloseoutMessage } from "./bootstrap.js";
 import { logger } from "./logger.js";
