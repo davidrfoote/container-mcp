@@ -68,6 +68,45 @@ export function spawnCodeTask(params: {
     }).catch((err: Error) => console.error(`[spawnCodeTask] failed to set active_task_id: ${err.message}`));
   }
 
+  // Read actual model from ~/.claude/settings.json and persist to sessions table
+  // (fallback in case CLI doesn't emit system/init event or emits it late)
+  if (sessionId && dbUrl) {
+    let actualModel: string | undefined;
+    try {
+      const settingsPath = "/home/david/.claude/settings.json";
+      const settingsRaw = fs.readFileSync(settingsPath, "utf8");
+      const settings = JSON.parse(settingsRaw) as { env?: Record<string, string> };
+      const env = settings.env ?? {};
+
+      // Map resolvedModel to the actual model in settings
+      const lowerResolved = resolvedModel.toLowerCase();
+      if (lowerResolved.includes("haiku") || lowerResolved.includes("3")) {
+        actualModel = env.ANTHROPIC_DEFAULT_HAIKU_MODEL;
+      } else if (lowerResolved.includes("opus") || lowerResolved.includes("4-6") || lowerResolved.includes("4-5")) {
+        actualModel = env.ANTHROPIC_DEFAULT_OPUS_MODEL;
+      } else {
+        // Default to sonnet
+        actualModel = env.ANTHROPIC_DEFAULT_SONNET_MODEL;
+      }
+
+      // If no model found in env, use the resolvedModel as-is
+      if (!actualModel) actualModel = resolvedModel;
+    } catch (err) {
+      // Settings file doesn't exist or is invalid, use resolvedModel
+      actualModel = resolvedModel;
+    }
+
+    // Write the model to sessions table immediately
+    if (actualModel) {
+      void withDbClient(dbUrl, async (client) => {
+        await client.query(
+          `UPDATE sessions SET model = $1, updated_at = now() WHERE session_id = $2`,
+          [actualModel, sessionId]
+        );
+      }).catch((err: Error) => console.error(`[spawnCodeTask] failed to set model from settings: ${err.message}`));
+    }
+  }
+
   (async () => {
     try {
       // Build rules from base + project + task-specific
@@ -370,15 +409,21 @@ export function spawnCodeTask(params: {
         if (hasMcpConfig) try { fs.unlinkSync(mcpConfigPath); } catch {}
         postToFeed(sessionId!, dbUrl!, `✅ Process ${taskId} exited with code ${code}. Debug log: ${debugLogPath}`);
         console.log(`[spawnCodeTask] task ${taskId} done (code ${code}), debug log at ${debugLogPath}`);
-        // Clear the in-flight task marker
+        // Clear the in-flight task marker and update session status
         if (sessionId && dbUrl) {
+          const newStatus = code === 0 ? "completed" : "failed";
+          const safeSessionId = sessionId.replace(/-/g, "_");
           void withDbClient(dbUrl, async (client) => {
             await client.query(
-              `UPDATE sessions SET active_task_id = NULL, task_started_at = NULL, updated_at = now()
-               WHERE session_id = $1 AND active_task_id = $2`,
-              [sessionId, taskId]
+              `UPDATE sessions SET active_task_id = NULL, task_started_at = NULL, status = $1, updated_at = now()
+               WHERE session_id = $2 AND active_task_id = $3`,
+              [newStatus, sessionId, taskId]
             );
-          }).catch((err: Error) => console.error(`[spawnCodeTask] failed to clear active_task_id: ${err.message}`));
+            await client.query("SELECT pg_notify($1, $2)", [
+              `session_status_${safeSessionId}`,
+              JSON.stringify({ session_id: sessionId, status: newStatus }),
+            ]);
+          }).catch((err: Error) => console.error(`[spawnCodeTask] failed to update session status: ${err.message}`));
         }
       });
     } catch (err: any) {

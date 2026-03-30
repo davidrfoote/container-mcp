@@ -46,7 +46,6 @@ const path = __importStar(require("path"));
 const http = __importStar(require("http"));
 const https = __importStar(require("https"));
 const db_js_1 = require("./db.js");
-const code_task_js_1 = require("./code-task.js");
 const jira_confluence_js_1 = require("./jira-confluence.js");
 function httpGetWithTimeout(url, timeoutMs) {
     return new Promise((resolve) => {
@@ -486,11 +485,15 @@ async function bootstrapSession(params) {
     const sessionWorktreePath = `/home/david/worktrees/${projectId}/${sessionBranch.replace(/\//g, "-")}`;
     try {
         await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-            await client.query(`INSERT INTO sessions (session_id, project_id, container, repo, status, session_type, title, prompt_preview, jira_issue_keys, user_id, triggered_by_name, triggered_by_slack_user_id, slack_thread_url, branch, worktree_path, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'pending', 'dev', $5, $6, $7::text[], $8, $9, $10, $11, $12, $13, now(), now())`, [sessionId, projectId, projConfig.default_container ?? "dev-david", projectId,
+            // Derive auth_hint from environment
+            const authHint = process.env.ANTHROPIC_API_KEY
+                ? `${triggeredByName} ANTHROPIC_API_KEY (container env)`
+                : null;
+            await client.query(`INSERT INTO sessions (session_id, project_id, container, repo, status, session_type, title, prompt_preview, jira_issue_keys, user_id, triggered_by_name, triggered_by_slack_user_id, slack_thread_url, branch, worktree_path, auth_hint, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'pending', 'dev', $5, $6, $7::text[], $8, $9, $10, $11, $12, $13, $14, now(), now())`, [sessionId, projectId, projConfig.default_container ?? "dev-david", projectId,
                 user_request.slice(0, 100), taskBrief.slice(0, 500), jiraKeysArr, user_id,
                 triggeredByName, triggeredBySlackUserId, slack_thread_url ?? null,
-                sessionBranch, sessionWorktreePath]);
+                sessionBranch, sessionWorktreePath, authHint]);
             const msgId = `msg-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
             await client.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
          VALUES ($1, $2, 'user', $3, 'task_brief', now())`, [msgId, sessionId, taskBrief]);
@@ -538,21 +541,76 @@ async function bootstrapSession(params) {
             console.warn(`[bootstrapSession] gitnexus analyze trigger failed (non-fatal): ${e.message}`);
         }
     }
-    // Spawn BOOTSTRAP code task (non-fatal on failure)
-    try {
-        const { instruction, workingDir, allowedTools } = await buildBootstrapInstruction(sessionId, dbUrl);
-        (0, code_task_js_1.spawnCodeTask)({ instruction, workingDir, sessionId, dbUrl, allowedTools });
-        console.log(`[bootstrapSession] BOOTSTRAP code task spawned for session ${sessionId}`);
-        await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-            await client.query("UPDATE sessions SET status = 'active', updated_at = now() WHERE session_id = $1", [sessionId]);
-        }).catch((e) => console.warn('[bootstrapSession] failed to set status=active: ' + e.message));
-    }
-    catch (e) {
-        console.warn(`[bootstrapSession] BOOTSTRAP spawn error (non-fatal): ${e.message}`);
-        await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-            await client.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
-         VALUES (gen_random_uuid(), $1, 'system', $2, 'console', now())`, [sessionId, `⚠️ Session created but BOOTSTRAP spawn failed: ${e.message}`]);
-        }).catch(() => { });
+    // Spawn dev-lead via OpenClaw gateway /hooks/agent
+    {
+        const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
+        const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
+        const ashSessionKey = process.env.OPENCLAW_SESSION_KEY;
+        let spawnOk = false;
+        let spawnError = "";
+        let childSessionKey = null;
+        try {
+            const spawnMessage = await (0, db_js_1.buildSpawnMessage)(sessionId, dbUrl, ashSessionKey);
+            const resp = await fetch(`${gatewayUrl}/hooks/agent`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${gatewayToken}`,
+                },
+                body: JSON.stringify({
+                    agentId: "dev-lead",
+                    message: spawnMessage,
+                    cwd: "/home/openclaw/agents/dev-lead",
+                }),
+            });
+            if (!resp.ok) {
+                const text = await resp.text();
+                spawnError = `Gateway ${resp.status}: ${text}`;
+            }
+            else {
+                const parsed = await resp.json().catch(() => ({}));
+                childSessionKey = parsed?.result?.details?.childSessionKey ?? parsed?.details?.childSessionKey ?? parsed?.childSessionKey ?? parsed?.session_key ?? null;
+                spawnOk = true;
+            }
+        }
+        catch (fetchErr) {
+            spawnError = fetchErr.message;
+        }
+        if (!spawnOk) {
+            console.warn(`[bootstrapSession] BOOTSTRAP spawn error (non-fatal): ${spawnError}`);
+            await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
+                await client.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
+           VALUES (gen_random_uuid(), $1, 'system', $2, 'console', now())`, [sessionId, `⚠️ Session created but BOOTSTRAP spawn failed: ${spawnError}`]);
+            }).catch(() => { });
+        }
+        else {
+            console.log(`[bootstrapSession] dev-lead spawned via gateway for session ${sessionId}`);
+            // Store openclaw_session_key, then transition to active via state machine
+            await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
+                await client.query(`UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`, [childSessionKey, sessionId]);
+            }).catch((e) => console.warn('[bootstrapSession] failed to store openclaw_session_key: ' + e.message));
+            const { transitionSession } = await Promise.resolve().then(() => __importStar(require("./state-machine.js")));
+            const tr = await transitionSession(dbUrl, sessionId, "active");
+            if (!tr.ok)
+                console.warn(`[bootstrapSession] transition to active failed: ${tr.error}`);
+            // Register parent-child subscription for A2A callbacks (non-fatal)
+            if (childSessionKey) {
+                try {
+                    await fetch("https://dev-sessions.ash.zennya.app/api/sessions/link", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            sessionId,
+                            childSessionKey,
+                            parentSessionKey: gatewayToken,
+                        }),
+                    });
+                }
+                catch (linkErr) {
+                    console.warn(`[bootstrapSession] sessions/link failed (non-fatal): ${linkErr.message}`);
+                }
+            }
+        }
     }
     console.log(`[bootstrapSession] created session ${sessionId} for user ${user_id} / project ${projectId}`);
     return { ok: true, session_id: sessionId, session_url: sessionUrl };

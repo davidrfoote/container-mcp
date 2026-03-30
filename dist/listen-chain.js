@@ -4,6 +4,7 @@ exports.startListenChain = startListenChain;
 const crypto_1 = require("crypto");
 const pg_1 = require("pg");
 const db_js_1 = require("./db.js");
+const feed_js_1 = require("./feed.js");
 const code_task_js_1 = require("./code-task.js");
 const bootstrap_js_1 = require("./bootstrap.js");
 const logger_js_1 = require("./logger.js");
@@ -197,11 +198,38 @@ async function startListenChain() {
                     }
                     // ── checkpoint (coding_agent) → dev-lead close-out ────────────
                     if (isCheckpoint) {
-                        logger_js_1.logger.log(`[listen-chain] checkpoint from coding_agent for ${sessionId} — spawning dev-lead close-out`);
+                        logger_js_1.logger.log(`[listen-chain] checkpoint from coding_agent for ${sessionId} — triggering dev-lead close-out`);
                         const checkpointContent = payload.content ?? "(no checkpoint content)";
                         try {
                             const task = await (0, bootstrap_js_1.buildCloseoutMessage)(sessionId, checkpointContent, dbUrl);
-                            const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
+                            // Prefer sessions_send into the existing dev-lead session so it retains full
+                            // conversation context with Ash. Fall back to sessions_spawn if no session exists yet.
+                            const existingKey = await (0, db_js_1.withDbClient)(dbUrl, async (c) => {
+                                const r = await c.query(`SELECT openclaw_session_key FROM sessions WHERE session_id = $1`, [sessionId]);
+                                return r.rows[0]?.openclaw_session_key ?? null;
+                            }).catch(() => null);
+                            if (existingKey) {
+                                // Post ash_callback message to session feed before sending
+                                const callbackPreview = checkpointContent.slice(0, 200);
+                                void (0, feed_js_1.postToFeed)(sessionId, dbUrl, `code_task completed. Result: ${callbackPreview}`, "system", "ash_callback");
+                                logger_js_1.logger.log(`[listen-chain] sessions_send to existing dev-lead session ${existingKey} for ${sessionId}`);
+                                const sendResp = await fetch(`${gatewayUrl}/tools/invoke`, {
+                                    method: "POST",
+                                    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${gatewayToken}` },
+                                    body: JSON.stringify({
+                                        tool: "sessions_send",
+                                        args: { sessionKey: existingKey, message: task, timeoutSeconds: 0 },
+                                    }),
+                                });
+                                if (sendResp.ok) {
+                                    logger_js_1.logger.log(`[listen-chain] sessions_send accepted for ${sessionId}`);
+                                    return;
+                                }
+                                const text = await sendResp.text().catch(() => "");
+                                logger_js_1.logger.warn(`[listen-chain] sessions_send failed (${sendResp.status} ${text.slice(0, 200)}) — falling back to sessions_spawn for ${sessionId}`);
+                            }
+                            // No existing session (or sessions_send failed) — spawn a fresh dev-lead close-out
+                            const spawnResp = await fetch(`${gatewayUrl}/tools/invoke`, {
                                 method: "POST",
                                 headers: { "Content-Type": "application/json", "Authorization": `Bearer ${gatewayToken}` },
                                 body: JSON.stringify({
@@ -209,8 +237,8 @@ async function startListenChain() {
                                     args: { agentId: "dev-lead", task, cwd: "/home/openclaw/agents/dev-lead" },
                                 }),
                             });
-                            if (resp.ok) {
-                                const parsed = await resp.json().catch(() => ({}));
+                            if (spawnResp.ok) {
+                                const parsed = await spawnResp.json().catch(() => ({}));
                                 const childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
                                 logger_js_1.logger.log(`[listen-chain] dev-lead close-out spawned for ${sessionId}, key=${childSessionKey ?? "n/a"}`);
                                 if (childSessionKey) {
@@ -220,12 +248,12 @@ async function startListenChain() {
                                 }
                             }
                             else {
-                                const text = await resp.text().catch(() => "");
-                                logger_js_1.logger.warn(`[listen-chain] dev-lead spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);
+                                const text = await spawnResp.text().catch(() => "");
+                                logger_js_1.logger.warn(`[listen-chain] dev-lead spawn failed for ${sessionId}: ${spawnResp.status} ${text.slice(0, 200)}`);
                             }
                         }
                         catch (e) {
-                            logger_js_1.logger.error(`[listen-chain] close-out spawn error for ${sessionId}:`, e.message);
+                            logger_js_1.logger.error(`[listen-chain] close-out error for ${sessionId}:`, e.message);
                         }
                         return;
                     }

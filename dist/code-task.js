@@ -41,13 +41,15 @@ const path = __importStar(require("path"));
 const db_js_1 = require("./db.js");
 const feed_js_1 = require("./feed.js");
 const task_logs_js_1 = require("./task-logs.js");
+const DEFAULT_MODEL = process.env.DEFAULT_MODEL ?? "claude-sonnet-4-6";
 function spawnCodeTask(params) {
     const { instruction, workingDir, sessionId, dbUrl, maxTurns = 40, budgetUsd = 8.0, timeoutSeconds = 1200, model, effort, agents, allowedTools, resumeClaudeSessionId, taskRules, } = params;
     const taskId = (0, crypto_1.randomUUID)();
     task_logs_js_1.taskLogs.set(taskId, []);
     const log = (line) => task_logs_js_1.taskLogs.get(taskId).push(line);
     const debugLogPath = `/tmp/task-${taskId}-debug.log`;
-    (0, feed_js_1.postToFeed)(sessionId, dbUrl, `🚀 Starting code task (${taskId})${model ? ` [${model}]` : ""}${resumeClaudeSessionId ? " [resumed]" : ""}\n\n${instruction.slice(0, 400)}`);
+    const resolvedModel = model || DEFAULT_MODEL;
+    (0, feed_js_1.postToFeed)(sessionId, dbUrl, `🚀 Starting code task (${taskId}) [${resolvedModel}]${resumeClaudeSessionId ? " [resumed]" : ""}\n\n${instruction.slice(0, 400)}`);
     // Emit structured cli_context so the session view can show full agent visibility
     if (sessionId && dbUrl) {
         // Read rules files now so we can surface them in the UI before the process starts
@@ -65,7 +67,7 @@ function spawnCodeTask(params) {
         void (0, feed_js_1.postToFeed)(sessionId, dbUrl, JSON.stringify({
             kind: "task_start",
             taskId,
-            model: model ?? null,
+            model: model || DEFAULT_MODEL,
             effort: effort ?? null,
             allowedTools: allowedTools ?? [],
             agents: agents ? (() => { try {
@@ -85,6 +87,42 @@ function spawnCodeTask(params) {
             await client.query(`UPDATE sessions SET active_task_id = $1, task_started_at = now(), updated_at = now() WHERE session_id = $2`, [taskId, sessionId]);
         }).catch((err) => console.error(`[spawnCodeTask] failed to set active_task_id: ${err.message}`));
     }
+    // Read actual model from ~/.claude/settings.json and persist to sessions table
+    // (fallback in case CLI doesn't emit system/init event or emits it late)
+    if (sessionId && dbUrl) {
+        let actualModel;
+        try {
+            const settingsPath = "/home/david/.claude/settings.json";
+            const settingsRaw = fs.readFileSync(settingsPath, "utf8");
+            const settings = JSON.parse(settingsRaw);
+            const env = settings.env ?? {};
+            // Map resolvedModel to the actual model in settings
+            const lowerResolved = resolvedModel.toLowerCase();
+            if (lowerResolved.includes("haiku") || lowerResolved.includes("3")) {
+                actualModel = env.ANTHROPIC_DEFAULT_HAIKU_MODEL;
+            }
+            else if (lowerResolved.includes("opus") || lowerResolved.includes("4-6") || lowerResolved.includes("4-5")) {
+                actualModel = env.ANTHROPIC_DEFAULT_OPUS_MODEL;
+            }
+            else {
+                // Default to sonnet
+                actualModel = env.ANTHROPIC_DEFAULT_SONNET_MODEL;
+            }
+            // If no model found in env, use the resolvedModel as-is
+            if (!actualModel)
+                actualModel = resolvedModel;
+        }
+        catch (err) {
+            // Settings file doesn't exist or is invalid, use resolvedModel
+            actualModel = resolvedModel;
+        }
+        // Write the model to sessions table immediately
+        if (actualModel) {
+            void (0, db_js_1.withDbClient)(dbUrl, async (client) => {
+                await client.query(`UPDATE sessions SET model = $1, updated_at = now() WHERE session_id = $2`, [actualModel, sessionId]);
+            }).catch((err) => console.error(`[spawnCodeTask] failed to set model from settings: ${err.message}`));
+        }
+    }
     (async () => {
         try {
             // Build rules from base + project + task-specific
@@ -101,6 +139,19 @@ function spawnCodeTask(params) {
             if (taskRules)
                 rules += taskRules + "\n";
             fs.writeFileSync(rulesFile, rules);
+            // Write MCP config so the CLI agent can query gitnexus at runtime
+            const mcpConfigPath = `/tmp/mcp-config-${taskId}.json`;
+            const mcpConfig = {};
+            if (process.env.GITNEXUS_SERVICE_URL) {
+                mcpConfig["gitnexus"] = {
+                    type: "sse",
+                    url: `${process.env.GITNEXUS_SERVICE_URL.replace(/\/$/, "")}/sse`,
+                };
+            }
+            const hasMcpConfig = Object.keys(mcpConfig).length > 0;
+            if (hasMcpConfig) {
+                fs.writeFileSync(mcpConfigPath, JSON.stringify({ mcpServers: mcpConfig }, null, 2));
+            }
             const claudeArgs = [
                 "-p", instruction,
                 "--output-format", "stream-json",
@@ -112,8 +163,9 @@ function spawnCodeTask(params) {
                 "--dangerously-skip-permissions",
                 "--debug-file", debugLogPath,
             ];
-            if (model)
-                claudeArgs.push("--model", model);
+            if (hasMcpConfig)
+                claudeArgs.push("--mcp-config", mcpConfigPath);
+            claudeArgs.push("--model", model || DEFAULT_MODEL);
             if (effort)
                 claudeArgs.push("--effort", effort);
             if (agents)
@@ -132,6 +184,11 @@ function spawnCodeTask(params) {
                     fs.unlinkSync(rulesFile);
                 }
                 catch { }
+                if (hasMcpConfig)
+                    try {
+                        fs.unlinkSync(mcpConfigPath);
+                    }
+                    catch { }
                 const msg = `spawn claude failed: ${err.message}`;
                 console.error(`[spawnCodeTask] spawn error for task ${taskId}: ${msg}`);
                 (0, feed_js_1.postToFeed)(sessionId, dbUrl, `Task ${taskId} spawn error: ${msg}`);
@@ -168,7 +225,9 @@ function spawnCodeTask(params) {
                             const cliModel = parsed.model;
                             const version = parsed.claude_code_version;
                             const permMode = parsed.permissionMode;
-                            const mcpServers = parsed.mcp_servers ?? [];
+                            // mcp_servers may be an array of objects {name, status, ...} or plain strings
+                            const mcpServersRaw = parsed.mcp_servers ?? [];
+                            const mcpServers = mcpServersRaw.map((s) => typeof s === "string" ? s : (s.name ?? s.id ?? String(s)));
                             const tools = parsed.tools ?? [];
                             // Persist model name into sessions table, then push a session_update
                             // notification so the browser header badge refreshes immediately
@@ -176,7 +235,8 @@ function spawnCodeTask(params) {
                             if (cliModel && sessionId && dbUrl) {
                                 const safeSessionId = sessionId.replace(/-/g, "_");
                                 void (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-                                    await client.query(`UPDATE sessions SET model = $1, updated_at = now() WHERE session_id = $2`, [cliModel, sessionId]);
+                                    // Write to both model (existing) and cli_model (new observability column)
+                                    await client.query(`UPDATE sessions SET model = $1, cli_model = $1, updated_at = now() WHERE session_id = $2`, [cliModel, sessionId]);
                                     await client.query("SELECT pg_notify($1, $2)", [
                                         `session_status_${safeSessionId}`,
                                         JSON.stringify({ session_id: sessionId, model: cliModel }),
@@ -345,14 +405,25 @@ function spawnCodeTask(params) {
                     fs.unlinkSync(rulesFile);
                 }
                 catch { }
+                if (hasMcpConfig)
+                    try {
+                        fs.unlinkSync(mcpConfigPath);
+                    }
+                    catch { }
                 (0, feed_js_1.postToFeed)(sessionId, dbUrl, `✅ Process ${taskId} exited with code ${code}. Debug log: ${debugLogPath}`);
                 console.log(`[spawnCodeTask] task ${taskId} done (code ${code}), debug log at ${debugLogPath}`);
-                // Clear the in-flight task marker
+                // Clear the in-flight task marker and update session status
                 if (sessionId && dbUrl) {
+                    const newStatus = code === 0 ? "completed" : "failed";
+                    const safeSessionId = sessionId.replace(/-/g, "_");
                     void (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-                        await client.query(`UPDATE sessions SET active_task_id = NULL, task_started_at = NULL, updated_at = now()
-               WHERE session_id = $1 AND active_task_id = $2`, [sessionId, taskId]);
-                    }).catch((err) => console.error(`[spawnCodeTask] failed to clear active_task_id: ${err.message}`));
+                        await client.query(`UPDATE sessions SET active_task_id = NULL, task_started_at = NULL, status = $1, updated_at = now()
+               WHERE session_id = $2 AND active_task_id = $3`, [newStatus, sessionId, taskId]);
+                        await client.query("SELECT pg_notify($1, $2)", [
+                            `session_status_${safeSessionId}`,
+                            JSON.stringify({ session_id: sessionId, status: newStatus }),
+                        ]);
+                    }).catch((err) => console.error(`[spawnCodeTask] failed to update session status: ${err.message}`));
                 }
             });
         }
