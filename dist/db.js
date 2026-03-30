@@ -58,7 +58,7 @@ async function buildSpawnMessage(sessionId, dbUrl, ashSessionKey) {
     try {
         const result = await withDbClient(dbUrl, async (client) => {
             const briefRes = await client.query(`SELECT content FROM session_messages WHERE session_id=$1 AND message_type='task_brief' ORDER BY created_at LIMIT 1`, [sessionId]);
-            const configRes = await client.query(`SELECT s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.smoke_url, p.default_container
+            const configRes = await client.query(`SELECT s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.smoke_url, p.default_container, s.user_id, s.gateway_parent_key
          FROM sessions s LEFT JOIN projects p ON s.project_id = p.project_id
          WHERE s.session_id = $1`, [sessionId]);
             return { brief: briefRes.rows[0] ?? null, config: configRes.rows[0] ?? null };
@@ -72,13 +72,16 @@ async function buildSpawnMessage(sessionId, dbUrl, ashSessionKey) {
         const deployCmd = cfg?.deploy_cmd ?? '(none)';
         const smokeUrl = cfg?.smoke_url ?? '(none)';
         const defaultContainer = cfg?.default_container ?? '(none)';
+        const resolvedAshSessionKey = ashSessionKey ?? cfg?.gateway_parent_key ?? process.env.OPENCLAW_SESSION_KEY ?? '';
+        const userId = cfg?.user_id ?? '';
         return [
             `SESSION_ID: ${sessionId}`,
+            `USER_ID: ${userId}`,
             `TASK_BRIEF: ${taskBrief}`,
             `PROJECT_CONFIG: build=${buildCmd} deploy=${deployCmd} smoke=${smokeUrl} container=${defaultContainer}`,
             `JIRA_ISSUES: ${jiraKeys}`,
             `OPS_DB_CONTAINER: ${opsDbContainer}`,
-            `ASH_SESSION_KEY: ${ashSessionKey ?? process.env.OPENCLAW_SESSION_KEY ?? ''}`,
+            `ASH_SESSION_KEY: ${resolvedAshSessionKey}`,
             ``,
             `You are dev-lead. Do NOT read any AGENTS.md files.`,
             `Your AGENTS.md is at /home/openclaw/agents/dev-lead/AGENTS.md (read ONLY if context above is incomplete).`,

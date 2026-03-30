@@ -635,26 +635,31 @@ export async function bootstrapSession(params: {
     }
   }
 
-  // Spawn dev-lead via OpenClaw gateway /hooks/agent
+  // Spawn dev-lead via OpenClaw gateway /tools/invoke (sessions_spawn)
+  // NOTE: /hooks/agent tags content as EXTERNAL/UNTRUSTED — dev-lead refuses to process it.
+  // Use /tools/invoke with sessions_spawn instead, same pattern as listen-chain.ts.
   {
     const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
     const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
-    const ashSessionKey = process.env.OPENCLAW_SESSION_KEY;
+    // Pass undefined so buildSpawnMessage resolves from gateway_parent_key in DB first
     let spawnOk = false;
     let spawnError = "";
     let childSessionKey: string | null = null;
     try {
-      const spawnMessage = await buildSpawnMessage(sessionId, dbUrl, ashSessionKey);
-      const resp = await fetch(`${gatewayUrl}/hooks/agent`, {
+      const spawnMessage = await buildSpawnMessage(sessionId, dbUrl, undefined);
+      const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${gatewayToken}`,
         },
         body: JSON.stringify({
-          agentId: "dev-lead",
-          message: spawnMessage,
-          cwd: "/home/openclaw/agents/dev-lead",
+          tool: "sessions_spawn",
+          args: {
+            agentId: "dev-lead",
+            task: spawnMessage,
+            cwd: "/home/openclaw/agents/dev-lead",
+          },
         }),
       });
       if (!resp.ok) {
@@ -662,7 +667,7 @@ export async function bootstrapSession(params: {
         spawnError = `Gateway ${resp.status}: ${text}`;
       } else {
         const parsed = await resp.json().catch(() => ({})) as any;
-        childSessionKey = parsed?.result?.details?.childSessionKey ?? parsed?.details?.childSessionKey ?? parsed?.childSessionKey ?? parsed?.session_key ?? null;
+        childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? parsed?.result?.childSessionKey ?? null;
         spawnOk = true;
       }
     } catch (fetchErr: any) {
