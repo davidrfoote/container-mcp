@@ -5,6 +5,7 @@ import * as path from "path";
 import * as http from "http";
 import * as https from "https";
 import { withDbClient, buildSpawnMessage } from "./db.js";
+import { spawnCodeTask } from "./code-task.js";
 import { postToFeed } from "./feed.js";
 import { populateCacheForProject, searchJiraForIssue, createJiraTaskIssue } from "./jira-confluence.js";
 
@@ -588,6 +589,15 @@ export async function bootstrapSession(params: {
     });
   } catch (e: any) {
     return { ok: false, error: `Session creation failed: ${e.message}` };
+  }
+
+  // Step 4b: Spawn BOOTSTRAP coding agent immediately (not via listen-chain backfill)
+  try {
+    const { instruction, workingDir, allowedTools } = await buildBootstrapInstruction(sessionId, dbUrl);
+    spawnCodeTask({ instruction, workingDir, sessionId, dbUrl, allowedTools });
+    console.log(`[bootstrapSession] BOOTSTRAP coding agent spawned for ${sessionId}`);
+  } catch (e: any) {
+    console.error(`[bootstrapSession] BOOTSTRAP spawn error (non-fatal): ${e.message}`);
   }
 
   // Step 5: Warm cache (non-fatal on failure)

@@ -595,7 +595,6 @@ export function createMcpServer() {
                   "--max-turns", String(max_turns),
                   "--max-budget-usd", String(budget_usd),
                   "--session-id", taskId,
-                  "--dangerously-skip-permissions",
                   "--debug-file", debugLogPath,
                 ];
 
@@ -1210,7 +1209,6 @@ export function createMcpServer() {
             "-p", message,
             "--output-format", "stream-json",
             "--verbose",
-            "--dangerously-skip-permissions",
             "--model", DEFAULT_MODEL,
           ];
 
