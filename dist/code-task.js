@@ -391,6 +391,10 @@ function spawnCodeTask(params) {
                     proc = (0, child_process_1.spawn)("claude", claudeArgs, {
                         cwd: workingDir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDECODE_ENTRYPOINT: undefined, SHELL: "/bin/bash" }, stdio: ["ignore", "pipe", "pipe"],
                     });
+                    proc.on("error", (err) => {
+                        console.error(`[spawnCodeTask] fallback spawn error for task ${taskId}:`, err.message);
+                        (0, feed_js_1.postToFeed)(sessionId, dbUrl, `❌ Fallback spawn failed: ${err.message}`);
+                    });
                     timer.refresh();
                     return;
                 }

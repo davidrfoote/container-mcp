@@ -9,6 +9,8 @@ ENV PORT=3200
 ENV SHELL=/bin/bash
 ENV DEFAULT_MODEL=claude-sonnet-4-6
 ENV FALLBACK_MODEL=claude-haiku-4-5
+ENV PATH="/home/david/.npm-local/bin:/home/david/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 RUN apk add --no-cache bash
 COPY claude-settings.json /root/.claude/settings.json
+ENTRYPOINT []
 CMD ["node", "dist/index.js"]
