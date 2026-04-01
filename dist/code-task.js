@@ -143,10 +143,12 @@ function spawnCodeTask(params) {
             let fallbackSpawned = false;
             // Run as david user if we are root (prevents Claude CLI root-detection blocking bash)
             const isRoot = process.getuid?.() === 0;
-            const spawnCmd = isRoot ? "sudo" : "claude";
-            const spawnArgs = isRoot ? ["-u", "david", "-E", "--", "env",
-                `HOME=/home/david`, `SHELL=/bin/bash`, `PATH=/home/david/.npm-local/bin:/usr/local/bin:/usr/bin:/bin`,
-                "claude", ...claudeArgs] : claudeArgs;
+            const claudePath = "/home/david/.npm-local/bin/claude";
+            const spawnCmd = isRoot ? "su" : claudePath;
+            const spawnArgs = isRoot
+                ? ["-s", "/bin/sh", "david", "-c",
+                    `HOME=/home/david SHELL=/bin/bash PATH=/home/david/.npm-local/bin:/usr/local/bin:/usr/bin:/bin ${claudePath} ${claudeArgs.map(a => JSON.stringify(a)).join(" ")}`]
+                : claudeArgs;
             let proc = (0, child_process_1.spawn)(spawnCmd, spawnArgs, {
                 cwd: workingDir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined, SHELL: "/bin/bash", HOME: "/home/david" }, stdio: ["ignore", "pipe", "pipe"],
             });
