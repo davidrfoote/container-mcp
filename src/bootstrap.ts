@@ -490,8 +490,22 @@ export async function bootstrapSession(params: {
     });
     if (existing) {
       const sessionUrl = `https://dev-sessions.ash.zennya.app/sessions/${existing.session_id}`;
-      console.log(`[bootstrapSession] returning existing session ${existing.session_id}`);
-      return { ok: true, session_id: existing.session_id, session_url: sessionUrl };
+      console.log(`[bootstrapSession] existing session ${existing.session_id} found — checking if coding agent is running`);
+      // Check if a coding agent message exists (BOOTSTRAP role) for this session
+      const agentRunning = await withDbClient(dbUrl, async (client) => {
+        const r2 = await client.query(
+          `SELECT 1 FROM session_messages WHERE session_id = $1 AND role = 'coding_agent' LIMIT 1`,
+          [existing.session_id]
+        );
+        return (r2.rowCount ?? 0) > 0;
+      });
+      if (!agentRunning) {
+        console.log(`[bootstrapSession] no coding agent found for ${existing.session_id}, spawning one`);
+        // Fall through to spawn a fresh agent for this session
+        // (reuse existing session_id so the UI works)
+      } else {
+        return { ok: true, session_id: existing.session_id, session_url: sessionUrl };
+      }
     }
   } catch (e: any) {
     return { ok: false, error: `Session check failed: ${e.message}` };
