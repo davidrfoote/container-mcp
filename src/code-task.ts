@@ -103,7 +103,7 @@ export function spawnCodeTask(params: {
         "--output-format", "stream-json",
         "--verbose",
         "--append-system-prompt-file", rulesFile,
-        "--permission-mode", "bypassPermissions",
+        "--permission-mode", "acceptEdits",
         "--max-turns", String(maxTurns),
         "--max-budget-usd", String(budgetUsd),
         "--debug-file", debugLogPath,
@@ -117,8 +117,14 @@ export function spawnCodeTask(params: {
       if (resumeClaudeSessionId) claudeArgs.push("--resume", resumeClaudeSessionId);
 
       let fallbackSpawned = false;
-      let proc = spawn("claude", claudeArgs, {
-        cwd: workingDir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined, SHELL: "/bin/bash" }, stdio: ["ignore", "pipe", "pipe"] as const,
+      // Run as david user if we are root (prevents Claude CLI root-detection blocking bash)
+      const isRoot = process.getuid?.() === 0;
+      const spawnCmd = isRoot ? "sudo" : "claude";
+      const spawnArgs = isRoot ? ["-u", "david", "-E", "--", "env",
+        `HOME=/home/david`, `SHELL=/bin/bash`, `PATH=/home/david/.npm-local/bin:/usr/local/bin:/usr/bin:/bin`,
+        "claude", ...claudeArgs] : claudeArgs;
+      let proc = spawn(spawnCmd, spawnArgs, {
+        cwd: workingDir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined, SHELL: "/bin/bash", HOME: "/home/david" }, stdio: ["ignore", "pipe", "pipe"] as const,
       });
 
       const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeoutSeconds * 1000);
