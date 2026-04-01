@@ -100,7 +100,6 @@ export function spawnCodeTask(params: {
         "--permission-mode", "acceptEdits",
         "--max-turns", String(maxTurns),
         "--max-budget-usd", String(budgetUsd),
-        "--dangerously-skip-permissions",
         "--debug-file", debugLogPath,
       ];
 
