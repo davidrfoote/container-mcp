@@ -22,11 +22,13 @@ export function spawnCodeTask(params: {
   allowedTools?: string[];
   resumeClaudeSessionId?: string;
   taskRules?: string;
+  permissionMode?: string;
 }): string {
   const {
     instruction, workingDir, sessionId, dbUrl,
     maxTurns = 40, budgetUsd = 8.0, timeoutSeconds = 1200,
     model, effort, agents, allowedTools, resumeClaudeSessionId, taskRules,
+    permissionMode,
   } = params;
 
   const taskId = randomUUID();
@@ -97,10 +99,9 @@ export function spawnCodeTask(params: {
         "--output-format", "stream-json",
         "--verbose",
         "--append-system-prompt-file", rulesFile,
-        "--permission-mode", "acceptEdits",
+        "--permission-mode", "allow",
         "--max-turns", String(maxTurns),
         "--max-budget-usd", String(budgetUsd),
-        "--dangerously-skip-permissions",
         "--debug-file", debugLogPath,
       ];
 
@@ -112,7 +113,7 @@ export function spawnCodeTask(params: {
       if (resumeClaudeSessionId) claudeArgs.push("--resume", resumeClaudeSessionId);
 
       const proc = spawn("claude", claudeArgs, {
-        cwd: workingDir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined }, stdio: ["ignore", "pipe", "pipe"] as const,
+        cwd: workingDir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined, SHELL: "/bin/bash" }, stdio: ["ignore", "pipe", "pipe"] as const,
       });
 
       const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeoutSeconds * 1000);

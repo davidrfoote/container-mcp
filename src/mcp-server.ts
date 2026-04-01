@@ -595,7 +595,6 @@ export function createMcpServer() {
                   "--max-turns", String(max_turns),
                   "--max-budget-usd", String(budget_usd),
                   "--session-id", taskId,
-                  "--dangerously-skip-permissions",
                   "--debug-file", debugLogPath,
                 ];
 
@@ -611,7 +610,7 @@ export function createMcpServer() {
                 }
 
                 const proc = spawn("claude", claudeArgs, {
-                  cwd: working_dir, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] as const,
+                  cwd: working_dir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined }, stdio: ['ignore', 'pipe', 'pipe'] as const,
                 });
 
                 if (session_id && dbUrl) {
@@ -1210,7 +1209,6 @@ export function createMcpServer() {
             "-p", message,
             "--output-format", "stream-json",
             "--verbose",
-            "--dangerously-skip-permissions",
             "--model", DEFAULT_MODEL,
           ];
 
@@ -1393,15 +1391,16 @@ export function createMcpServer() {
           const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
 
           try {
-            const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
+            const resp = await fetch(`${gatewayUrl}/hooks/agent`, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
                 "Authorization": `Bearer ${gatewayToken}`,
               },
               body: JSON.stringify({
-                tool: "sessions_spawn",
-                args: { agentId: "dev-lead", task: await buildSpawnMessage(sessionId, process.env.OPS_DB_URL ?? ''), cwd: "/home/openclaw/agents/dev-lead" },
+                agentId: "dev-lead",
+                message: await buildSpawnMessage(sessionId, process.env.OPS_DB_URL ?? ''),
+                cwd: "/home/openclaw/agents/dev-lead",
               }),
             });
 
@@ -1497,15 +1496,16 @@ export function createMcpServer() {
             let spawnError = "";
             let childSessionKey: string | null = null;
             try {
-              const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
+              const resp = await fetch(`${gatewayUrl}/hooks/agent`, {
                 method: "POST",
                 headers: {
                   "Content-Type": "application/json",
                   "Authorization": `Bearer ${gatewayToken}`,
                 },
                 body: JSON.stringify({
-                  tool: "sessions_spawn",
-                  args: { agentId: "dev-lead", task: await buildSpawnMessage(sessionId, dbUrl, ash_session_key), cwd: "/home/openclaw/agents/dev-lead" },
+                  agentId: "dev-lead",
+                  message: await buildSpawnMessage(sessionId, dbUrl, ash_session_key),
+                  cwd: "/home/openclaw/agents/dev-lead",
                 }),
               });
               if (!resp.ok) {

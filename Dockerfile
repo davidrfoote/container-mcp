@@ -6,4 +6,7 @@ COPY src ./src
 RUN npm run build
 EXPOSE 3200
 ENV PORT=3200
+ENV SHELL=/bin/bash
+RUN apk add --no-cache bash
+COPY claude-settings.json /root/.claude/settings.json
 CMD ["node", "dist/index.js"]
