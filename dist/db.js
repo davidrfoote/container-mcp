@@ -47,6 +47,10 @@ async function ensureMigrations(dbUrl) {
         await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS task_duration_ms INT`);
         // Parent gateway session key — Ash's session that spawned this work (for callback routing)
         await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS gateway_parent_key TEXT`);
+        // Observability overhaul columns
+        await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS cli_model VARCHAR(100)`);
+        await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS auth_hint VARCHAR(200)`);
+        await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS interactive BOOLEAN DEFAULT false`);
     });
 }
 async function buildSpawnMessage(sessionId, dbUrl, ashSessionKey) {

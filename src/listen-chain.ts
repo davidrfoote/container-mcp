@@ -3,7 +3,7 @@ import { Client } from "pg";
 import { buildSpawnMessage, withDbClient } from "./db.js";
 import { postToFeed } from "./feed.js";
 import { spawnCodeTask } from "./code-task.js";
-import { buildBootstrapInstruction, buildExecutionInstruction, buildCloseoutMessage } from "./bootstrap.js";
+import { buildExecutionInstruction, buildCloseoutMessage } from "./bootstrap.js";
 import { logger } from "./logger.js";
 
 let _reconnectMs = 1_000;
@@ -372,44 +372,15 @@ export async function startListenChain(): Promise<void> {
     return;
   }
 
-  // Backfill 1: find stuck pending sessions (BOOTSTRAP never ran)
-  void (async () => {
-    const backfillClient = new Client({ connectionString: dbUrl });
-    try {
-      await backfillClient.connect();
-      const res = await backfillClient.query<{ session_id: string }>(
-        `SELECT DISTINCT s.session_id
-         FROM sessions s
-         JOIN session_messages sm ON sm.session_id = s.session_id
-         WHERE s.status = 'pending'
-           AND sm.message_type = 'task_brief'
-           AND sm.role = 'user'
-           AND s.session_type != 'interactive'
-           AND NOT EXISTS (
-             SELECT 1 FROM session_messages sm2
-             WHERE sm2.session_id = s.session_id
-               AND sm2.role IN ('coding_agent', 'assistant')
-           )
-         ORDER BY s.session_id`
-      );
-      if (res.rows.length > 0) {
-        logger.log(`[listen-chain] backfill: ${res.rows.length} pending session(s) found — spawning BOOTSTRAP`);
-        for (const row of res.rows) {
-          try {
-            const { instruction, workingDir, allowedTools } = await buildBootstrapInstruction(row.session_id, dbUrl);
-            spawnCodeTask({ instruction, workingDir, sessionId: row.session_id, dbUrl, allowedTools });
-            logger.log(`[listen-chain] backfill BOOTSTRAP spawned for ${row.session_id}`);
-          } catch (e: any) {
-            logger.error(`[listen-chain] backfill error for ${row.session_id}:`, e.message);
-          }
-        }
-      }
-    } catch (err: any) {
-      logger.error("[listen-chain] backfill error:", err.message);
-    } finally {
-      await backfillClient.end().catch(() => {});
-    }
-  })();
+  // Backfill 1: DISABLED — BOOTSTRAP is now spawned directly by bootstrapSession (Step 4b).
+  // Keeping the query logic as a no-op comment for reference:
+  // SELECT DISTINCT s.session_id FROM sessions s
+  //   JOIN session_messages sm ON sm.session_id = s.session_id
+  //   WHERE s.status = 'pending' AND sm.message_type = 'task_brief'
+  //     AND sm.role = 'user' AND s.session_type != 'interactive'
+  //     AND NOT EXISTS (SELECT 1 FROM session_messages sm2
+  //       WHERE sm2.session_id = s.session_id AND sm2.role IN ('coding_agent', 'assistant'))
+  // GAP-13 fix: Removed BOOTSTRAP spawn here to prevent dual orchestration race with bootstrapSession.
 
   // Backfill 2: run immediately on (re)connect, then every 60 seconds as a safety net.
   // This catches any approval_response notifications that were missed during a reconnect gap.

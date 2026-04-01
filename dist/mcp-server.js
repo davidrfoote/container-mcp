@@ -47,6 +47,7 @@ const task_logs_js_1 = require("./task-logs.js");
 const jira_confluence_js_1 = require("./jira-confluence.js");
 const bootstrap_js_1 = require("./bootstrap.js");
 const deploy_project_js_1 = require("./tools/deploy-project.js");
+const state_machine_js_1 = require("./state-machine.js");
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL ?? "claude-sonnet-4-6";
 function modelCostPerMillion(model) {
     if (!model)
@@ -518,6 +519,42 @@ function createMcpServer() {
                     required: ["user_request", "user_id"],
                 },
             },
+            {
+                name: "transition_session",
+                description: "Atomically transition a session's status with graph validation. Rejects invalid transitions (e.g. completed → executing). Uses optimistic concurrency to prevent races.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        session_id: { type: "string", description: "The ops-db session ID" },
+                        to_status: {
+                            type: "string",
+                            enum: ["pending", "active", "executing", "awaiting_approval", "planning", "paused", "completed", "failed"],
+                            description: "Target status",
+                        },
+                    },
+                    required: ["session_id", "to_status"],
+                },
+            },
+            {
+                name: "get_session_provenance",
+                description: "Get full provenance and timeline for a session: status, next allowed transitions, branch, worktree, Jira keys, cost, turn count, and message timeline.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        session_id: { type: "string", description: "The ops-db session ID" },
+                    },
+                    required: ["session_id"],
+                },
+            },
+            {
+                name: "get_container_inventory",
+                description: "Get a full inventory of this container: version, active sessions, worktrees, tool registry, and health checks.",
+                inputSchema: {
+                    type: "object",
+                    properties: {},
+                    required: [],
+                },
+            },
         ],
     }));
     server.setRequestHandler(types_js_1.CallToolRequestSchema, async (req) => {
@@ -564,7 +601,6 @@ function createMcpServer() {
                                     "--max-turns", String(max_turns),
                                     "--max-budget-usd", String(budget_usd),
                                     "--session-id", taskId,
-                                    "--dangerously-skip-permissions",
                                     "--debug-file", debugLogPath,
                                 ];
                                 claudeArgs.push("--model", model || DEFAULT_MODEL);
@@ -582,7 +618,7 @@ function createMcpServer() {
                                         claudeArgs.push("--add-dir", dir);
                                 }
                                 const proc = (0, child_process_1.spawn)("claude", claudeArgs, {
-                                    cwd: working_dir, env: process.env, stdio: ['ignore', 'pipe', 'pipe'],
+                                    cwd: working_dir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined }, stdio: ['ignore', 'pipe', 'pipe'],
                                 });
                                 if (session_id && dbUrl) {
                                     const resolvedModel = model || "default";
@@ -1128,7 +1164,6 @@ function createMcpServer() {
                         "-p", message,
                         "--output-format", "stream-json",
                         "--verbose",
-                        "--dangerously-skip-permissions",
                         "--model", DEFAULT_MODEL,
                     ];
                     if (existingClaudeSessionId) {
@@ -1295,15 +1330,16 @@ function createMcpServer() {
                     const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
                     const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
                     try {
-                        const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
+                        const resp = await fetch(`${gatewayUrl}/hooks/agent`, {
                             method: "POST",
                             headers: {
                                 "Content-Type": "application/json",
                                 "Authorization": `Bearer ${gatewayToken}`,
                             },
                             body: JSON.stringify({
-                                tool: "sessions_spawn",
-                                args: { agentId: "dev-lead", task: await (0, db_js_1.buildSpawnMessage)(sessionId, process.env.OPS_DB_URL ?? ''), cwd: "/home/openclaw/agents/dev-lead" },
+                                agentId: "dev-lead",
+                                message: await (0, db_js_1.buildSpawnMessage)(sessionId, process.env.OPS_DB_URL ?? ''),
+                                cwd: "/home/openclaw/agents/dev-lead",
                             }),
                         });
                         if (!resp.ok) {
@@ -1371,15 +1407,16 @@ function createMcpServer() {
                         let spawnError = "";
                         let childSessionKey = null;
                         try {
-                            const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
+                            const resp = await fetch(`${gatewayUrl}/hooks/agent`, {
                                 method: "POST",
                                 headers: {
                                     "Content-Type": "application/json",
                                     "Authorization": `Bearer ${gatewayToken}`,
                                 },
                                 body: JSON.stringify({
-                                    tool: "sessions_spawn",
-                                    args: { agentId: "dev-lead", task: await (0, db_js_1.buildSpawnMessage)(sessionId, dbUrl, ash_session_key), cwd: "/home/openclaw/agents/dev-lead" },
+                                    agentId: "dev-lead",
+                                    message: await (0, db_js_1.buildSpawnMessage)(sessionId, dbUrl, ash_session_key),
+                                    cwd: "/home/openclaw/agents/dev-lead",
                                 }),
                             });
                             if (!resp.ok) {
@@ -1543,6 +1580,97 @@ function createMcpServer() {
                     const { user_request, user_id, project_id: bsProjectId, project_hint, display_name: bsDisplayName, description: bsDescription, slack_thread_url: bsSlackThreadUrl } = args;
                     const result = await (0, bootstrap_js_1.bootstrapSession)({ user_request, user_id, project_id: bsProjectId, project_hint, display_name: bsDisplayName, description: bsDescription, slack_thread_url: bsSlackThreadUrl });
                     return { content: [{ type: "text", text: JSON.stringify(result) }] };
+                }
+                case "transition_session": {
+                    const { session_id: tsSessionId, to_status } = args;
+                    const dbUrl = process.env.OPS_DB_URL;
+                    if (!dbUrl)
+                        return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "OPS_DB_URL not set" }) }], isError: true };
+                    const result = await (0, state_machine_js_1.transitionSession)(dbUrl, tsSessionId, to_status);
+                    return { content: [{ type: "text", text: JSON.stringify(result) }], isError: !result.ok };
+                }
+                case "get_session_provenance": {
+                    const { session_id: provSessionId } = args;
+                    const dbUrl = process.env.OPS_DB_URL;
+                    if (!dbUrl)
+                        return { content: [{ type: "text", text: JSON.stringify({ error: "OPS_DB_URL not set" }) }], isError: true };
+                    const data = await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
+                        const sessionRes = await client.query(`SELECT session_id, project_id, status, branch, worktree_path,
+                      jira_issue_keys, model, num_turns, cost_usd, created_at
+               FROM sessions WHERE session_id = $1`, [provSessionId]);
+                        if (sessionRes.rows.length === 0)
+                            return null;
+                        const messagesRes = await client.query(`SELECT message_type, role, created_at, content
+               FROM session_messages WHERE session_id = $1
+               ORDER BY created_at ASC LIMIT 100`, [provSessionId]);
+                        return { session: sessionRes.rows[0], messages: messagesRes.rows };
+                    });
+                    if (!data)
+                        return { content: [{ type: "text", text: JSON.stringify({ error: `Session not found: ${provSessionId}` }) }], isError: true };
+                    const allowed = await (0, state_machine_js_1.nextAllowedActions)(dbUrl, provSessionId);
+                    const timeline = data.messages.map((m) => ({
+                        message_type: m.message_type, role: m.role,
+                        created_at: m.created_at, content_preview: m.content.slice(0, 200),
+                    }));
+                    return { content: [{ type: "text", text: JSON.stringify({
+                                    ...data.session,
+                                    cost_usd: data.session.cost_usd ? parseFloat(data.session.cost_usd) : null,
+                                    next_allowed_transitions: allowed,
+                                    timeline,
+                                }) }] };
+                }
+                case "get_container_inventory": {
+                    const dbUrl = process.env.OPS_DB_URL;
+                    // Build lightweight tool registry from the tool list
+                    const toolNames = [
+                        "code_task", "get_task_log", "run_tests", "run_build",
+                        "git_status", "git_checkout", "git_add", "git_commit", "git_push", "git_merge", "git_pull",
+                        "create_git_worktree", "delete_git_worktree", "list_git_worktrees", "get_diff", "get_repo_state",
+                        "create_session", "bootstrap_session", "spawn_dev_lead", "chat_session", "listen_for_approval", "post_message",
+                        "create_project", "deploy_project", "warm_cache_for_repos",
+                        "cache_read", "cache_write",
+                        "transition_session", "get_session_provenance", "get_container_inventory",
+                    ];
+                    let active_sessions = [];
+                    let worktrees = [];
+                    let db_health = "error";
+                    if (dbUrl) {
+                        try {
+                            const result = await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
+                                await client.query("SELECT 1");
+                                db_health = "ok";
+                                const sessRes = await client.query(`SELECT session_id, project_id, status, active_task_id, branch
+                   FROM sessions WHERE active_task_id IS NOT NULL
+                   ORDER BY updated_at DESC LIMIT 20`);
+                                const wtRes = await client.query(`SELECT session_id, worktree_path, branch
+                   FROM sessions WHERE worktree_path IS NOT NULL AND status NOT IN ('completed', 'failed')
+                   ORDER BY updated_at DESC LIMIT 50`);
+                                return { sessions: sessRes.rows, worktrees: wtRes.rows };
+                            });
+                            active_sessions = result.sessions;
+                            worktrees = result.worktrees;
+                        }
+                        catch {
+                            db_health = "error";
+                        }
+                    }
+                    let gateway_health = "error";
+                    const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
+                    try {
+                        const resp = await fetch(`${gatewayUrl}/health`, { signal: AbortSignal.timeout(3000) });
+                        gateway_health = resp.ok ? "ok" : "error";
+                    }
+                    catch {
+                        gateway_health = "error";
+                    }
+                    return { content: [{ type: "text", text: JSON.stringify({
+                                    container_version: "2.2.0",
+                                    tool_count: toolNames.length,
+                                    tools: toolNames,
+                                    active_sessions,
+                                    worktrees,
+                                    health: { db: db_health, gateway: gateway_health },
+                                }) }] };
                 }
                 default:
                     throw new Error(`Unknown tool: ${name}`);
