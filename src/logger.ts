@@ -1,3 +1,9 @@
+/**
+ * Logger utility for container-mcp.
+ * Provides structured logging (INFO/WARN/ERROR) with ISO timestamps.
+ * Logs are written to stdout and appended to a rotating log file
+ * (max 10 MB per file, single backup rotation).
+ */
 import { appendFileSync, renameSync, statSync } from "fs";
 
 const LOG_FILE = process.env.LOG_FILE ?? "/home/david/container-mcp.log";
