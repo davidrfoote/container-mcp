@@ -41,13 +41,18 @@ const path = __importStar(require("path"));
 const db_js_1 = require("./db.js");
 const feed_js_1 = require("./feed.js");
 const task_logs_js_1 = require("./task-logs.js");
+const DEFAULT_MODEL = process.env.DEFAULT_MODEL ?? "claude-sonnet-4-6";
+const FALLBACK_MODEL = process.env.FALLBACK_MODEL ?? "claude-haiku-4-5";
 function spawnCodeTask(params) {
-    const { instruction, workingDir, sessionId, dbUrl, maxTurns = 40, budgetUsd = 8.0, timeoutSeconds = 1200, model, effort, agents, allowedTools, resumeClaudeSessionId, taskRules, } = params;
+    const { instruction, workingDir, sessionId, dbUrl, maxTurns = 40, budgetUsd = 8.0, timeoutSeconds = 1200, model, effort, agents, allowedTools, resumeClaudeSessionId, taskRules, permissionMode, fallbackModel, } = params;
     const taskId = (0, crypto_1.randomUUID)();
     task_logs_js_1.taskLogs.set(taskId, []);
     const log = (line) => task_logs_js_1.taskLogs.get(taskId).push(line);
     const debugLogPath = `/tmp/task-${taskId}-debug.log`;
-    (0, feed_js_1.postToFeed)(sessionId, dbUrl, `🚀 Starting code task (${taskId})${model ? ` [${model}]` : ""}${resumeClaudeSessionId ? " [resumed]" : ""}\n\n${instruction.slice(0, 400)}`);
+    const primaryModel = model || DEFAULT_MODEL;
+    const resolvedModel = primaryModel;
+    const finalFallback = fallbackModel || FALLBACK_MODEL;
+    (0, feed_js_1.postToFeed)(sessionId, dbUrl, `🚀 Starting code task (${taskId}) [${resolvedModel}]${resumeClaudeSessionId ? " [resumed]" : ""}\n\n${instruction.slice(0, 400)}`);
     // Emit structured cli_context so the session view can show full agent visibility
     if (sessionId && dbUrl) {
         // Read rules files now so we can surface them in the UI before the process starts
@@ -65,7 +70,7 @@ function spawnCodeTask(params) {
         void (0, feed_js_1.postToFeed)(sessionId, dbUrl, JSON.stringify({
             kind: "task_start",
             taskId,
-            model: model ?? null,
+            model: model || DEFAULT_MODEL,
             effort: effort ?? null,
             allowedTools: allowedTools ?? [],
             agents: agents ? (() => { try {
@@ -101,19 +106,32 @@ function spawnCodeTask(params) {
             if (taskRules)
                 rules += taskRules + "\n";
             fs.writeFileSync(rulesFile, rules);
+            // Write MCP config so the CLI agent can query gitnexus at runtime
+            const mcpConfigPath = `/tmp/mcp-config-${taskId}.json`;
+            const mcpConfig = {};
+            if (process.env.GITNEXUS_SERVICE_URL) {
+                mcpConfig["gitnexus"] = {
+                    type: "sse",
+                    url: `${process.env.GITNEXUS_SERVICE_URL.replace(/\/$/, "")}/sse`,
+                };
+            }
+            const hasMcpConfig = Object.keys(mcpConfig).length > 0;
+            if (hasMcpConfig) {
+                fs.writeFileSync(mcpConfigPath, JSON.stringify({ mcpServers: mcpConfig }, null, 2));
+            }
             const claudeArgs = [
                 "-p", instruction,
                 "--output-format", "stream-json",
                 "--verbose",
                 "--append-system-prompt-file", rulesFile,
-                "--permission-mode", "acceptEdits",
+                "--permission-mode", "allow",
                 "--max-turns", String(maxTurns),
                 "--max-budget-usd", String(budgetUsd),
-                "--dangerously-skip-permissions",
                 "--debug-file", debugLogPath,
             ];
-            if (model)
-                claudeArgs.push("--model", model);
+            if (hasMcpConfig)
+                claudeArgs.push("--mcp-config", mcpConfigPath);
+            claudeArgs.push("--model", model || DEFAULT_MODEL);
             if (effort)
                 claudeArgs.push("--effort", effort);
             if (agents)
@@ -122,8 +140,9 @@ function spawnCodeTask(params) {
                 claudeArgs.push("--allowed-tools", allowedTools.join(","));
             if (resumeClaudeSessionId)
                 claudeArgs.push("--resume", resumeClaudeSessionId);
-            const proc = (0, child_process_1.spawn)("claude", claudeArgs, {
-                cwd: workingDir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined }, stdio: ["ignore", "pipe", "pipe"],
+            let fallbackSpawned = false;
+            let proc = (0, child_process_1.spawn)("claude", claudeArgs, {
+                cwd: workingDir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined, SHELL: "/bin/bash" }, stdio: ["ignore", "pipe", "pipe"],
             });
             const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeoutSeconds * 1000);
             proc.on("error", (err) => {
@@ -132,6 +151,11 @@ function spawnCodeTask(params) {
                     fs.unlinkSync(rulesFile);
                 }
                 catch { }
+                if (hasMcpConfig)
+                    try {
+                        fs.unlinkSync(mcpConfigPath);
+                    }
+                    catch { }
                 const msg = `spawn claude failed: ${err.message}`;
                 console.error(`[spawnCodeTask] spawn error for task ${taskId}: ${msg}`);
                 (0, feed_js_1.postToFeed)(sessionId, dbUrl, `Task ${taskId} spawn error: ${msg}`);
@@ -168,7 +192,9 @@ function spawnCodeTask(params) {
                             const cliModel = parsed.model;
                             const version = parsed.claude_code_version;
                             const permMode = parsed.permissionMode;
-                            const mcpServers = parsed.mcp_servers ?? [];
+                            // mcp_servers may be an array of objects {name, status, ...} or plain strings
+                            const mcpServersRaw = parsed.mcp_servers ?? [];
+                            const mcpServers = mcpServersRaw.map((s) => typeof s === "string" ? s : (s.name ?? s.id ?? String(s)));
                             const tools = parsed.tools ?? [];
                             // Persist model name into sessions table, then push a session_update
                             // notification so the browser header badge refreshes immediately
@@ -176,7 +202,8 @@ function spawnCodeTask(params) {
                             if (cliModel && sessionId && dbUrl) {
                                 const safeSessionId = sessionId.replace(/-/g, "_");
                                 void (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-                                    await client.query(`UPDATE sessions SET model = $1, updated_at = now() WHERE session_id = $2`, [cliModel, sessionId]);
+                                    // Write to both model (existing) and cli_model (new observability column)
+                                    await client.query(`UPDATE sessions SET model = $1, cli_model = $1, updated_at = now() WHERE session_id = $2`, [cliModel, sessionId]);
                                     await client.query("SELECT pg_notify($1, $2)", [
                                         `session_status_${safeSessionId}`,
                                         JSON.stringify({ session_id: sessionId, model: cliModel }),
@@ -345,8 +372,28 @@ function spawnCodeTask(params) {
                     fs.unlinkSync(rulesFile);
                 }
                 catch { }
+                if (hasMcpConfig)
+                    try {
+                        fs.unlinkSync(mcpConfigPath);
+                    }
+                    catch { }
                 (0, feed_js_1.postToFeed)(sessionId, dbUrl, `✅ Process ${taskId} exited with code ${code}. Debug log: ${debugLogPath}`);
                 console.log(`[spawnCodeTask] task ${taskId} done (code ${code}), debug log at ${debugLogPath}`);
+                if (!fallbackSpawned && finalFallback && code !== 0) {
+                    fallbackSpawned = true;
+                    const modelIdx = claudeArgs.findIndex((a, i) => i > 0 && claudeArgs[i - 1] === "--model");
+                    if (modelIdx >= 0)
+                        claudeArgs[modelIdx] = finalFallback;
+                    else
+                        claudeArgs.push("--model", finalFallback);
+                    console.log(`[spawnCodeTask] retrying with fallback model ${finalFallback}`);
+                    (0, feed_js_1.postToFeed)(sessionId, dbUrl, `⚠️ Model ${primaryModel} failed (code ${code}), retrying with ${finalFallback}...`);
+                    proc = (0, child_process_1.spawn)("claude", claudeArgs, {
+                        cwd: workingDir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDECODE_ENTRYPOINT: undefined, SHELL: "/bin/bash" }, stdio: ["ignore", "pipe", "pipe"],
+                    });
+                    timer.refresh();
+                    return;
+                }
                 // Clear the in-flight task marker
                 if (sessionId && dbUrl) {
                     void (0, db_js_1.withDbClient)(dbUrl, async (client) => {
