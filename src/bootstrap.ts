@@ -65,7 +65,7 @@ const SLACK_USER_MAP: Record<string, string> = {
 // ─── Instruction builders ──────────────────────────────────────────────────
 
 export async function buildBootstrapInstruction(sessionId: string, dbUrl: string): Promise<{ instruction: string; workingDir: string; allowedTools: string[] }> {
-  const PORT = process.env.PORT ?? "9000";
+  const PORT = process.env.PORT ?? "9100";
 
   const data = await withDbClient(dbUrl, async (client) => {
     const sessionRes = await client.query<{
@@ -185,7 +185,7 @@ export async function buildBootstrapInstruction(sessionId: string, dbUrl: string
 }
 
 export async function buildExecutionInstruction(sessionId: string, dbUrl: string): Promise<{ instruction: string; workingDir: string; resumeClaudeSessionId?: string }> {
-  const PORT = process.env.PORT ?? "9000";
+  const PORT = process.env.PORT ?? "9100";
 
   const data = await withDbClient(dbUrl, async (client) => {
     const sessionRes = await client.query<{

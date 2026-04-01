@@ -269,12 +269,13 @@ export async function startListenChain(): Promise<void> {
               }
 
               // No existing session (or sessions_send failed) — spawn a fresh dev-lead close-out
-              const spawnResp = await fetch(`${gatewayUrl}/tools/invoke`, {
+              const spawnResp = await fetch(`${gatewayUrl}/hooks/agent`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json", "Authorization": `Bearer ${gatewayToken}` },
                 body: JSON.stringify({
-                  tool: "sessions_spawn",
-                  args: { agentId: "dev-lead", task, cwd: "/home/openclaw/agents/dev-lead" },
+                  agentId: "dev-lead",
+                  message: task,
+                  cwd: "/home/openclaw/agents/dev-lead",
                 }),
               });
               if (spawnResp.ok) {
@@ -312,12 +313,13 @@ export async function startListenChain(): Promise<void> {
                 return r.rows[0] ?? null;
               }).catch(() => null);
               const ashKey = parentKeyRow?.gateway_parent_key ?? undefined;
-              const resp = await fetch(`${gatewayUrl}/tools/invoke`, {
+              const resp = await fetch(`${gatewayUrl}/hooks/agent`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json", "Authorization": `Bearer ${gatewayToken}` },
                 body: JSON.stringify({
-                  tool: "sessions_spawn",
-                  args: { agentId: "dev-lead", task: await buildSpawnMessage(sessionId, dbUrl, ashKey), cwd: "/home/openclaw/agents/dev-lead" },
+                  agentId: "dev-lead",
+                  message: await buildSpawnMessage(sessionId, dbUrl, ashKey),
+                  cwd: "/home/openclaw/agents/dev-lead",
                 }),
               });
               if (resp.ok) {
