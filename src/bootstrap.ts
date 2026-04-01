@@ -608,7 +608,7 @@ export async function bootstrapSession(params: {
   // Step 4b: Spawn BOOTSTRAP coding agent immediately (not via listen-chain backfill)
   try {
     const { instruction, workingDir, allowedTools } = await buildBootstrapInstruction(sessionId, dbUrl);
-    spawnCodeTask({ instruction, workingDir, sessionId, dbUrl, allowedTools, permissionMode: 'acceptEdits' });
+    spawnCodeTask({ instruction, workingDir, sessionId, dbUrl, allowedTools, permissionMode: 'bypassPermissions' });
     console.log(`[bootstrapSession] BOOTSTRAP coding agent spawned for ${sessionId}`);
   } catch (e: any) {
     console.error(`[bootstrapSession] BOOTSTRAP spawn error (non-fatal): ${e.message}`);

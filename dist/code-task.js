@@ -124,7 +124,7 @@ function spawnCodeTask(params) {
                 "--output-format", "stream-json",
                 "--verbose",
                 "--append-system-prompt-file", rulesFile,
-                "--permission-mode", "allow",
+                "--permission-mode", "bypassPermissions",
                 "--max-turns", String(maxTurns),
                 "--max-budget-usd", String(budgetUsd),
                 "--debug-file", debugLogPath,
