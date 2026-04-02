@@ -6,6 +6,7 @@ import * as http from "http";
 import * as https from "https";
 import { withDbClient, buildSpawnMessage } from "./db.js";
 import { spawnCodeTask } from "./code-task.js";
+import { DEFAULT_MODEL, isValidModel, listModelIds } from "./model-registry.js";
 import { postToFeed } from "./feed.js";
 import { populateCacheForProject, searchJiraForIssue, createJiraTaskIssue } from "./jira-confluence.js";
 
@@ -63,9 +64,43 @@ const SLACK_USER_MAP: Record<string, string> = {
   U1AT2UF9V: "Jan",
 };
 
+// Map webchat/email identity to Slack user IDs for bootstrap_session user resolution.
+// When a webchat user passes their email as user_id (e.g. from CF_Authorization JWT),
+// this map resolves it to the canonical Slack user ID used throughout ops-db.
+const EMAIL_TO_USER_ID_MAP: Record<string, string> = {
+  "david@zennya.com": "U097Q46UX",
+  "davidrfoote@gmail.com": "U097Q46UX",
+  "shane@zennya.com": "U160P0C7M",
+  "jan@zennya.com": "U1AT2UF9V",
+  "ash@fbmosoftware.com": "ash",
+  "ash@fbmsoftware.com": "ash",
+};
+
+/**
+ * Resolve a user_id that may be a Slack ID or an email address.
+ * Webchat users authenticated via Cloudflare Access or local JWT pass their
+ * email as user_id. This function normalises both formats to a consistent ID
+ * that can be stored in sessions.user_id and looked up by SLACK_USER_MAP.
+ */
+function resolveUserId(rawUserId: string): { userId: string; displayName: string } {
+  // Already a Slack-style ID (uppercase U + digits, or "ash")
+  if (/^U[A-Z0-9]{6,}$/.test(rawUserId) || rawUserId === "ash") {
+    return { userId: rawUserId, displayName: SLACK_USER_MAP[rawUserId] ?? rawUserId };
+  }
+  // Email format — resolve via map
+  const lower = rawUserId.toLowerCase();
+  const slackId = EMAIL_TO_USER_ID_MAP[lower];
+  if (slackId) {
+    return { userId: slackId, displayName: SLACK_USER_MAP[slackId] ?? lower.split("@")[0] };
+  }
+  // Unknown email — use as-is (display name = local part before @)
+  const displayName = lower.includes("@") ? lower.split("@")[0] : lower;
+  return { userId: rawUserId, displayName };
+}
+
 // ─── Instruction builders ──────────────────────────────────────────────────
 
-export async function buildBootstrapInstruction(sessionId: string, dbUrl: string): Promise<{ instruction: string; workingDir: string; allowedTools: string[] }> {
+export async function buildBootstrapInstruction(sessionId: string, dbUrl: string): Promise<{ instruction: string; workingDir: string; allowedTools: string[]; model: string }> {
   const PORT = process.env.PORT ?? "9100";
 
   const data = await withDbClient(dbUrl, async (client) => {
@@ -78,8 +113,9 @@ export async function buildBootstrapInstruction(sessionId: string, dbUrl: string
       confluence_root_id: string | null;
       branch: string | null;
       worktree_path: string | null;
+      session_model: string | null;
     }>(
-      `SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.default_container, p.confluence_root_id, s.branch, s.worktree_path
+      `SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.default_container, p.confluence_root_id, s.branch, s.worktree_path, s.session_model
        FROM sessions s LEFT JOIN projects p ON p.project_id = s.project_id
        WHERE s.session_id = $1`,
       [sessionId]
@@ -182,10 +218,11 @@ export async function buildBootstrapInstruction(sessionId: string, dbUrl: string
   // BOOTSTRAP is read-only: explore + plan only. Blocks Edit/Write/MultiEdit.
   const allowedTools = ["Read", "Glob", "Grep", "Bash", "WebFetch", "WebSearch"];
 
-  return { instruction, workingDir, allowedTools };
+  const model = data.session?.session_model || DEFAULT_MODEL;
+  return { instruction, workingDir, allowedTools, model };
 }
 
-export async function buildExecutionInstruction(sessionId: string, dbUrl: string): Promise<{ instruction: string; workingDir: string; resumeClaudeSessionId?: string }> {
+export async function buildExecutionInstruction(sessionId: string, dbUrl: string): Promise<{ instruction: string; workingDir: string; resumeClaudeSessionId?: string; model: string }> {
   const PORT = process.env.PORT ?? "9100";
 
   const data = await withDbClient(dbUrl, async (client) => {
@@ -198,8 +235,9 @@ export async function buildExecutionInstruction(sessionId: string, dbUrl: string
       claude_session_id: string | null;
       branch: string | null;
       worktree_path: string | null;
+      session_model: string | null;
     }>(
-      `SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.default_container, s.claude_session_id, s.branch, s.worktree_path
+      `SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.default_container, s.claude_session_id, s.branch, s.worktree_path, s.session_model
        FROM sessions s LEFT JOIN projects p ON p.project_id = s.project_id
        WHERE s.session_id = $1`,
       [sessionId]
@@ -304,7 +342,8 @@ export async function buildExecutionInstruction(sessionId: string, dbUrl: string
     `7. Exit after posting the checkpoint.`,
   ].filter(Boolean).join("\n");
 
-  return { instruction, workingDir, resumeClaudeSessionId };
+  const model = data.session?.session_model || DEFAULT_MODEL;
+  return { instruction, workingDir, resumeClaudeSessionId, model };
 }
 
 export async function buildCloseoutMessage(sessionId: string, checkpointContent: string, dbUrl: string): Promise<string> {
@@ -433,6 +472,7 @@ export async function bootstrapSession(params: {
   display_name?: string;
   description?: string;
   slack_thread_url?: string;
+  model?: string;
 }): Promise<{
   ok: boolean;
   session_id?: string;
@@ -441,9 +481,9 @@ export async function bootstrapSession(params: {
   needs_project?: boolean;
   available_projects?: Array<{ project_id: string; display_name: string | null; description: string | null }>;
 }> {
-  const { user_request, user_id, project_id, project_hint, display_name, description, slack_thread_url } = params;
-  const triggeredByName = SLACK_USER_MAP[user_id] ?? user_id;
-  const triggeredBySlackUserId = user_id;
+  const { user_request, user_id, project_id, project_hint, display_name, description, slack_thread_url, model } = params;
+  const { userId: user_id_resolved, displayName: triggeredByName } = resolveUserId(user_id);
+  const triggeredBySlackUserId = user_id_resolved;
   const dbUrl = process.env.OPS_DB_URL;
   if (!dbUrl) return { ok: false, error: "OPS_DB_URL not set" };
 
@@ -484,11 +524,23 @@ export async function bootstrapSession(params: {
     const existing = await withDbClient(dbUrl, async (client) => {
       const r = await client.query<{ session_id: string }>(
         `SELECT session_id FROM sessions WHERE user_id = $1 AND project_id = $2 AND status = 'active' AND created_at > now() - interval '4 hours' ORDER BY created_at DESC LIMIT 1`,
-        [user_id, projectId]
+        [user_id_resolved, projectId]
       );
       return r.rows[0] ?? null;
     });
     if (existing) {
+      if (model) {
+        const requestedModel = model.trim();
+        if (!isValidModel(requestedModel)) {
+          return { ok: false, error: `Invalid model: ${requestedModel}. Allowed models: ${listModelIds().join(', ')}` };
+        }
+        await withDbClient(dbUrl, async (client) => {
+          await client.query(
+            `UPDATE sessions SET session_model = $1, updated_at = now() WHERE session_id = $2`,
+            [requestedModel, existing.session_id]
+          );
+        });
+      }
       const sessionUrl = `https://dev-sessions.ash.zennya.app/sessions/${existing.session_id}`;
       console.log(`[bootstrapSession] returning existing session ${existing.session_id}`);
       return { ok: true, session_id: existing.session_id, session_url: sessionUrl };
@@ -537,6 +589,13 @@ export async function bootstrapSession(params: {
     if (jiraIssueKey) console.log(`[bootstrapSession] Jira issue: ${jiraIssueKey}`);
   }
 
+  if (model) {
+    const requestedModel = model.trim();
+    if (!isValidModel(requestedModel)) {
+      return { ok: false, error: `Invalid model: ${requestedModel}. Allowed models: ${listModelIds().join(', ')}` };
+    }
+  }
+
   // Step 7: Compose task brief
   const taskBrief = [
     `Project: ${projConfig.display_name ?? projectId} (${projectId})`,
@@ -573,12 +632,12 @@ export async function bootstrapSession(params: {
         ? `${triggeredByName} ANTHROPIC_API_KEY (container env)`
         : null;
       await client.query(
-        `INSERT INTO sessions (session_id, project_id, container, repo, status, session_type, title, prompt_preview, jira_issue_keys, user_id, triggered_by_name, triggered_by_slack_user_id, slack_thread_url, branch, worktree_path, auth_hint, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'pending', 'dev', $5, $6, $7::text[], $8, $9, $10, $11, $12, $13, $14, now(), now())`,
+        `INSERT INTO sessions (session_id, project_id, container, repo, status, session_type, title, prompt_preview, jira_issue_keys, user_id, triggered_by_name, triggered_by_slack_user_id, slack_thread_url, branch, worktree_path, auth_hint, session_model, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'pending', 'dev', $5, $6, $7::text[], $8, $9, $10, $11, $12, $13, $14, $15, now(), now())`,
         [sessionId, projectId, projConfig!.default_container ?? "dev-david", projectId,
-          user_request.slice(0, 100), taskBrief.slice(0, 500), jiraKeysArr, user_id,
+          user_request.slice(0, 100), taskBrief.slice(0, 500), jiraKeysArr, user_id_resolved,
           triggeredByName, triggeredBySlackUserId, slack_thread_url ?? null,
-          sessionBranch, sessionWorktreePath, authHint]
+          sessionBranch, sessionWorktreePath, authHint, model?.trim() ?? null]
       );
       const msgId = `msg-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
       await client.query(
@@ -593,8 +652,8 @@ export async function bootstrapSession(params: {
 
   // Step 4b: Spawn BOOTSTRAP coding agent immediately (not via listen-chain backfill)
   try {
-    const { instruction, workingDir, allowedTools } = await buildBootstrapInstruction(sessionId, dbUrl);
-    spawnCodeTask({ instruction, workingDir, sessionId, dbUrl, allowedTools });
+    const { instruction, workingDir, allowedTools, model } = await buildBootstrapInstruction(sessionId, dbUrl);
+    spawnCodeTask({ instruction, workingDir, sessionId, dbUrl, allowedTools, model });
     console.log(`[bootstrapSession] BOOTSTRAP coding agent spawned for ${sessionId}`);
   } catch (e: any) {
     console.error(`[bootstrapSession] BOOTSTRAP spawn error (non-fatal): ${e.message}`);
@@ -720,6 +779,6 @@ export async function bootstrapSession(params: {
     }
   }
 
-  console.log(`[bootstrapSession] created session ${sessionId} for user ${user_id} / project ${projectId}`);
+  console.log(`[bootstrapSession] created session ${sessionId} for user ${user_id_resolved} / project ${projectId}`);
   return { ok: true, session_id: sessionId, session_url: sessionUrl };
 }

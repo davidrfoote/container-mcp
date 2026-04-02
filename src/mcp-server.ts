@@ -15,8 +15,9 @@ import { populateCacheForProject, writeCacheEntry } from "./jira-confluence.js";
 import { bootstrapSession } from "./bootstrap.js";
 import { deployProject } from "./tools/deploy-project.js";
 import { transitionSession, nextAllowedActions, SESSION_TRANSITIONS, type SessionStatus } from "./state-machine.js";
+import { MODEL_REGISTRY, DEFAULT_MODEL, isValidModel, listModelIds } from "./model-registry.js";
 
-const DEFAULT_MODEL = process.env.DEFAULT_MODEL ?? "claude-sonnet-4-6";
+// DEFAULT_MODEL imported from model-registry
 
 function modelCostPerMillion(model?: string): { input: number; output: number } {
   if (!model) return { input: 3, output: 15 };
@@ -466,7 +467,7 @@ export function createMcpServer() {
             },
             user_id: {
               type: "string",
-              description: "User identifier (e.g. Slack user ID or email)",
+              description: "User identifier: Slack user ID (e.g. U097Q46UX) or email address (e.g. david@zennya.com). Emails are auto-resolved to Slack IDs. Webchat callers should pass their authenticated email so bootstrap_session resolves the correct user without manual lookup.",
             },
             project_id: {
               type: "string",
@@ -488,9 +489,33 @@ export function createMcpServer() {
               type: "string",
               description: "Slack thread URL to associate with the session (optional)",
             },
+            model: {
+              type: "string",
+              description: `Optional model ID for the session BOOTSTRAP/EXECUTION passes. Registered models: ${listModelIds().join(', ')}`,
+            },
           },
           required: ["user_request", "user_id"],
         },
+      },
+      {
+        name: "set_session_model",
+        description: "Set the Claude CLI model for a session. Persists in ops-db and is honoured by BOOTSTRAP and EXECUTION code tasks.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: { type: "string", description: "Session ID to update" },
+            model: {
+              type: "string",
+              description: `Model ID to use. Registered models: ${listModelIds().join(', ')}`,
+            },
+          },
+          required: ["session_id", "model"],
+        },
+      },
+      {
+        name: "list_models",
+        description: "List all registered Claude CLI models with their provider, tier, and notes.",
+        inputSchema: { type: "object", properties: {} },
       },
       {
         name: "transition_session",
@@ -568,7 +593,22 @@ export function createMcpServer() {
           const log = (line: string) => taskLogs.get(taskId)!.push(line);
           const debugLogPath = `/tmp/task-${taskId}-debug.log`;
 
-          postToFeed(session_id, dbUrl, `🤖 Model: ${model || "default (account)"} | driver: ${driver} | effort: ${effort || "medium"} | task_id: ${taskId}`);
+          // Look up session's saved model if no explicit model override was given
+          let resolvedModel = model || DEFAULT_MODEL;
+          if (!model && session_id && dbUrl) {
+            try {
+              const row = await withDbClient(dbUrl, async (client) => {
+                const r = await client.query<{ session_model: string | null }>(
+                  "SELECT session_model FROM sessions WHERE session_id = $1",
+                  [session_id]
+                );
+                return r.rows[0] ?? null;
+              });
+              if (row?.session_model) resolvedModel = row.session_model;
+            } catch (_) { /* ignore — keep resolvedModel */ }
+          }
+
+          postToFeed(session_id, dbUrl, `🤖 Model: ${resolvedModel} | driver: ${driver} | effort: ${effort || "medium"} | task_id: ${taskId}`);
 
           // Compose rules
           let rules = "";
@@ -1205,11 +1245,26 @@ export function createMcpServer() {
             }
           }
 
+          // Resolve model: use session's saved model if available, else DEFAULT_MODEL
+          let chatModel = DEFAULT_MODEL;
+          if (chatSessionId && dbUrl) {
+            try {
+              const row = await withDbClient(dbUrl, async (client) => {
+                const r = await client.query<{ session_model: string | null }>(
+                  "SELECT session_model FROM sessions WHERE session_id = $1",
+                  [chatSessionId]
+                );
+                return r.rows[0] ?? null;
+              });
+              if (row?.session_model) chatModel = row.session_model;
+            } catch (_) { /* ignore — keep DEFAULT_MODEL */ }
+          }
+
           const claudeArgs = [
             "-p", message,
             "--output-format", "stream-json",
             "--verbose",
-            "--model", DEFAULT_MODEL,
+            "--model", chatModel,
           ];
 
           if (existingClaudeSessionId) {
@@ -1701,7 +1756,7 @@ export function createMcpServer() {
         }
 
         case "bootstrap_session": {
-          const { user_request, user_id, project_id: bsProjectId, project_hint, display_name: bsDisplayName, description: bsDescription, slack_thread_url: bsSlackThreadUrl } = args as {
+          const { user_request, user_id, project_id: bsProjectId, project_hint, display_name: bsDisplayName, description: bsDescription, slack_thread_url: bsSlackThreadUrl, model: bsModel } = args as {
             user_request: string;
             user_id: string;
             project_id?: string;
@@ -1709,8 +1764,9 @@ export function createMcpServer() {
             display_name?: string;
             description?: string;
             slack_thread_url?: string;
+            model?: string;
           };
-          const result = await bootstrapSession({ user_request, user_id, project_id: bsProjectId, project_hint, display_name: bsDisplayName, description: bsDescription, slack_thread_url: bsSlackThreadUrl });
+          const result = await bootstrapSession({ user_request, user_id, project_id: bsProjectId, project_hint, display_name: bsDisplayName, description: bsDescription, slack_thread_url: bsSlackThreadUrl, model: bsModel });
           return { content: [{ type: "text", text: JSON.stringify(result) }] };
         }
 
@@ -1832,6 +1888,36 @@ export function createMcpServer() {
             worktrees,
             health: { db: db_health, gateway: gateway_health },
           }) }] };
+        }
+
+        case "set_session_model": {
+          const { session_id: setModelSessionId, model: requestedModel } = args as { session_id: string; model: string };
+          if (!setModelSessionId) throw new Error("session_id is required");
+          if (!requestedModel) throw new Error("model is required");
+          if (!isValidModel(requestedModel)) {
+            throw new Error(`Unknown model "${requestedModel}". Valid models: ${listModelIds().join(", ")}`);
+          }
+          const dbUrl = process.env.OPS_DB_URL;
+          if (!dbUrl) throw new Error("OPS_DB_URL not set");
+          await withDbClient(dbUrl, async (client) => {
+            await client.query(
+              `UPDATE sessions SET session_model = $1, updated_at = now() WHERE session_id = $2`,
+              [requestedModel, setModelSessionId]
+            );
+          });
+          // Post a console message to the session feed so the UI reflects the change
+          await withDbClient(dbUrl, async (client) => {
+            await client.query(
+              `INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
+               VALUES (gen_random_uuid(), $1, 'system', $2, 'console', now())`,
+              [setModelSessionId, `🔄 Model changed to: ${requestedModel}`]
+            );
+          });
+          return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: setModelSessionId, model: requestedModel }) }] };
+        }
+
+        case "list_models": {
+          return { content: [{ type: "text", text: JSON.stringify({ models: MODEL_REGISTRY, default: DEFAULT_MODEL }) }] };
         }
 
         default:

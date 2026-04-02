@@ -6,7 +6,7 @@ import { withDbClient } from "./db.js";
 import { postToFeed } from "./feed.js";
 import { taskLogs } from "./task-logs.js";
 
-const DEFAULT_MODEL = process.env.DEFAULT_MODEL ?? "claude-sonnet-4-6";
+import { DEFAULT_MODEL } from "./model-registry.js";
 
 export function spawnCodeTask(params: {
   instruction: string;

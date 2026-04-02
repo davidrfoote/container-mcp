@@ -4,6 +4,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.bootstrapSession = void 0;
+// e2e-pipeline-test
 const express_1 = __importDefault(require("express"));
 const sse_js_1 = require("@modelcontextprotocol/sdk/server/sse.js");
 const db_js_1 = require("./db.js");

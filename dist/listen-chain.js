@@ -37,8 +37,8 @@ async function runBackfill2(dbUrl) {
             logger_js_1.logger.log(`[listen-chain] backfill2: ${res.rows.length} session(s) with unprocessed approval_response — spawning EXECUTION`);
             for (const row of res.rows) {
                 try {
-                    const { instruction, workingDir, resumeClaudeSessionId } = await (0, bootstrap_js_1.buildExecutionInstruction)(row.session_id, dbUrl);
-                    (0, code_task_js_1.spawnCodeTask)({ instruction, workingDir, sessionId: row.session_id, dbUrl, resumeClaudeSessionId });
+                    const { instruction, workingDir, resumeClaudeSessionId, model } = await (0, bootstrap_js_1.buildExecutionInstruction)(row.session_id, dbUrl);
+                    (0, code_task_js_1.spawnCodeTask)({ instruction, workingDir, sessionId: row.session_id, dbUrl, resumeClaudeSessionId, model });
                     logger_js_1.logger.log(`[listen-chain] backfill2 EXECUTION spawned for ${row.session_id}`);
                     // Surface recovery in the session feed so it's visible in the UI
                     void (0, db_js_1.withDbClient)(dbUrl, async (c) => {
@@ -187,8 +187,8 @@ async function startListenChain() {
                     if (isApprovalResponse) {
                         logger_js_1.logger.log(`[listen-chain] approval_response for ${sessionId} — spawning EXECUTION code task`);
                         try {
-                            const { instruction, workingDir, resumeClaudeSessionId } = await (0, bootstrap_js_1.buildExecutionInstruction)(sessionId, dbUrl);
-                            (0, code_task_js_1.spawnCodeTask)({ instruction, workingDir, sessionId, dbUrl, resumeClaudeSessionId });
+                            const { instruction, workingDir, resumeClaudeSessionId, model } = await (0, bootstrap_js_1.buildExecutionInstruction)(sessionId, dbUrl);
+                            (0, code_task_js_1.spawnCodeTask)({ instruction, workingDir, sessionId, dbUrl, resumeClaudeSessionId, model });
                             logger_js_1.logger.log(`[listen-chain] EXECUTION code task spawned for ${sessionId}`);
                         }
                         catch (e) {

@@ -51,6 +51,8 @@ async function ensureMigrations(dbUrl) {
         await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS cli_model VARCHAR(100)`);
         await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS auth_hint VARCHAR(200)`);
         await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS interactive BOOLEAN DEFAULT false`);
+        // Session-level Claude model selection
+        await client.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_model VARCHAR(100)`);
     });
 }
 async function buildSpawnMessage(sessionId, dbUrl, ashSessionKey) {

@@ -38,8 +38,8 @@ async function runBackfill2(dbUrl: string): Promise<void> {
       logger.log(`[listen-chain] backfill2: ${res.rows.length} session(s) with unprocessed approval_response — spawning EXECUTION`);
       for (const row of res.rows) {
         try {
-          const { instruction, workingDir, resumeClaudeSessionId } = await buildExecutionInstruction(row.session_id, dbUrl);
-          spawnCodeTask({ instruction, workingDir, sessionId: row.session_id, dbUrl, resumeClaudeSessionId });
+          const { instruction, workingDir, resumeClaudeSessionId, model } = await buildExecutionInstruction(row.session_id, dbUrl);
+          spawnCodeTask({ instruction, workingDir, sessionId: row.session_id, dbUrl, resumeClaudeSessionId, model });
           logger.log(`[listen-chain] backfill2 EXECUTION spawned for ${row.session_id}`);
           // Surface recovery in the session feed so it's visible in the UI
           void withDbClient(dbUrl, async (c) => {
@@ -216,8 +216,8 @@ export async function startListenChain(): Promise<void> {
           if (isApprovalResponse) {
             logger.log(`[listen-chain] approval_response for ${sessionId} — spawning EXECUTION code task`);
             try {
-              const { instruction, workingDir, resumeClaudeSessionId } = await buildExecutionInstruction(sessionId, dbUrl);
-              spawnCodeTask({ instruction, workingDir, sessionId, dbUrl, resumeClaudeSessionId });
+              const { instruction, workingDir, resumeClaudeSessionId, model } = await buildExecutionInstruction(sessionId, dbUrl);
+              spawnCodeTask({ instruction, workingDir, sessionId, dbUrl, resumeClaudeSessionId, model });
               logger.log(`[listen-chain] EXECUTION code task spawned for ${sessionId}`);
             } catch (e: any) {
               logger.error(`[listen-chain] EXECUTION spawn error for ${sessionId}:`, e.message);

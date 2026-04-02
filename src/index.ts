@@ -1,3 +1,4 @@
+// e2e-pipeline-test
 import express from "express";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { withDbClient, notifySessionMessage, ensureMigrations } from "./db.js";

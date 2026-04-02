@@ -1,6 +1,12 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.logger = void 0;
+/**
+ * Logger utility for container-mcp.
+ * Provides structured logging (INFO/WARN/ERROR) with ISO timestamps.
+ * Logs are written to stdout and appended to a rotating log file
+ * (max 10 MB per file, single backup rotation).
+ */
 const fs_1 = require("fs");
 const LOG_FILE = process.env.LOG_FILE ?? "/home/david/container-mcp.log";
 const MAX_SIZE = 10 * 1024 * 1024; // 10 MB
