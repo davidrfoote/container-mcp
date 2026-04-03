@@ -2,6 +2,7 @@
 export PORT=9100
 export OPS_DB_URL="postgresql://ops:Pi5cSfj9ASfNoBBklkGUR65uBazG6iNn@172.17.0.1:5434/ops"
 export OPENCLAW_GATEWAY_TOKEN="fae882977af961aa47dda858b4f39317c73ae1e1bb59"
+export OPENCLAW_HOOKS_TOKEN="${OPENCLAW_HOOKS_TOKEN:-$OPENCLAW_GATEWAY_TOKEN}"
 MDIR=/home/david/container-mcp
 cd "$MDIR"
 
