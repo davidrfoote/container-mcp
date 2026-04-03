@@ -74,6 +74,9 @@ export async function startListenChain(): Promise<void> {
   }
 
   const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
+  // /tools/invoke is authenticated with the gateway token
+  const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
+  // /hooks/agent is authenticated with the hooks token (falls back to gateway token)
   const hooksToken = process.env.OPENCLAW_HOOKS_TOKEN ?? process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
 
   const listenClient = new Client({ connectionString: dbUrl });
@@ -264,7 +267,7 @@ export async function startListenChain(): Promise<void> {
                 logger.log(`[listen-chain] sessions_send to existing dev-lead session ${existingKey} for ${sessionId}`);
                 const sendResp = await fetch(`${gatewayUrl}/tools/invoke`, {
                   method: "POST",
-                  headers: { "Content-Type": "application/json", "Authorization": `Bearer ${hooksToken}` },
+                  headers: { "Content-Type": "application/json", "Authorization": `Bearer ${gatewayToken}` },
                   body: JSON.stringify({
                     tool: "sessions_send",
                     args: { sessionKey: existingKey, message: task, timeoutSeconds: 0 },
