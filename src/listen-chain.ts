@@ -39,7 +39,12 @@ async function runBackfill2(dbUrl: string): Promise<void> {
       for (const row of res.rows) {
         try {
           const { instruction, workingDir, resumeClaudeSessionId } = await buildExecutionInstruction(row.session_id, dbUrl);
-          spawnCodeTask({ instruction, workingDir, sessionId: row.session_id, dbUrl, resumeClaudeSessionId });
+          const { getSessionModel: getModel2 } = await import("./db.js");
+          const { resolveModel: resolve2 } = await import("./models.js");
+          const bf2ModelId = await getModel2(row.session_id, dbUrl);
+          const bf2ModelDef = resolve2(bf2ModelId);
+          const bf2Model = bf2ModelDef.cliId;
+          spawnCodeTask({ instruction, workingDir, sessionId: row.session_id, dbUrl, resumeClaudeSessionId, model: bf2Model });
           logger.log(`[listen-chain] backfill2 EXECUTION spawned for ${row.session_id}`);
           // Surface recovery in the session feed so it's visible in the UI
           void withDbClient(dbUrl, async (c) => {
@@ -69,7 +74,10 @@ export async function startListenChain(): Promise<void> {
   }
 
   const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
+  // /tools/invoke is authenticated with the gateway token
   const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
+  // /hooks/agent is authenticated with the hooks token (falls back to gateway token)
+  const hooksToken = process.env.OPENCLAW_HOOKS_TOKEN ?? process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
 
   const listenClient = new Client({ connectionString: dbUrl });
   try {
@@ -217,7 +225,12 @@ export async function startListenChain(): Promise<void> {
             logger.log(`[listen-chain] approval_response for ${sessionId} — spawning EXECUTION code task`);
             try {
               const { instruction, workingDir, resumeClaudeSessionId } = await buildExecutionInstruction(sessionId, dbUrl);
-              spawnCodeTask({ instruction, workingDir, sessionId, dbUrl, resumeClaudeSessionId });
+              const { getSessionModel } = await import("./db.js");
+              const { resolveModel } = await import("./models.js");
+              const execModelId = await getSessionModel(sessionId, dbUrl);
+              const execModelDef = resolveModel(execModelId);
+              const execModel = execModelDef.cliId;
+              spawnCodeTask({ instruction, workingDir, sessionId, dbUrl, resumeClaudeSessionId, model: execModel });
               logger.log(`[listen-chain] EXECUTION code task spawned for ${sessionId}`);
             } catch (e: any) {
               logger.error(`[listen-chain] EXECUTION spawn error for ${sessionId}:`, e.message);
@@ -269,27 +282,25 @@ export async function startListenChain(): Promise<void> {
               }
 
               // No existing session (or sessions_send failed) — spawn a fresh dev-lead close-out
+              const devLeadSessionKey = `agent:dev-lead:dev-session:${sessionId}`;
               const spawnResp = await fetch(`${gatewayUrl}/hooks/agent`, {
                 method: "POST",
-                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${gatewayToken}` },
+                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${hooksToken}` },
                 body: JSON.stringify({
                   agentId: "dev-lead",
                   message: task,
                   cwd: "/home/openclaw/agents/dev-lead",
+                  sessionKey: devLeadSessionKey,
                 }),
               });
               if (spawnResp.ok) {
-                const parsed = await spawnResp.json().catch(() => ({})) as any;
-                const childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
-                logger.log(`[listen-chain] dev-lead close-out spawned for ${sessionId}, key=${childSessionKey ?? "n/a"}`);
-                if (childSessionKey) {
-                  void withDbClient(dbUrl, async (client) => {
-                    await client.query(
-                      `UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`,
-                      [childSessionKey, sessionId]
-                    );
-                  }).catch((e: Error) => logger.warn(`[listen-chain] store openclaw_session_key failed: ${e.message}`));
-                }
+                logger.log(`[listen-chain] dev-lead close-out spawned for ${sessionId}, key=${devLeadSessionKey}`);
+                void withDbClient(dbUrl, async (client) => {
+                  await client.query(
+                    `UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`,
+                    [devLeadSessionKey, sessionId]
+                  );
+                }).catch((e: Error) => logger.warn(`[listen-chain] store openclaw_session_key failed: ${e.message}`));
               } else {
                 const text = await spawnResp.text().catch(() => "");
                 logger.warn(`[listen-chain] dev-lead spawn failed for ${sessionId}: ${spawnResp.status} ${text.slice(0, 200)}`);
@@ -313,27 +324,25 @@ export async function startListenChain(): Promise<void> {
                 return r.rows[0] ?? null;
               }).catch(() => null);
               const ashKey = parentKeyRow?.gateway_parent_key ?? undefined;
+              const devLeadSessionKey = `agent:dev-lead:dev-session:${sessionId}`;
               const resp = await fetch(`${gatewayUrl}/hooks/agent`, {
                 method: "POST",
-                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${gatewayToken}` },
+                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${hooksToken}` },
                 body: JSON.stringify({
                   agentId: "dev-lead",
                   message: await buildSpawnMessage(sessionId, dbUrl, ashKey),
                   cwd: "/home/openclaw/agents/dev-lead",
+                  sessionKey: devLeadSessionKey,
                 }),
               });
               if (resp.ok) {
-                const parsed = await resp.json().catch(() => ({})) as any;
-                const childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
-                logger.log(`[listen-chain] dev-lead spawned for chat ${sessionId}, key=${childSessionKey ?? "n/a"}`);
-                if (childSessionKey) {
-                  void withDbClient(dbUrl, async (client) => {
-                    await client.query(
-                      `UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`,
-                      [childSessionKey, sessionId]
-                    );
-                  }).catch((e: Error) => logger.warn(`[listen-chain] store openclaw_session_key failed: ${e.message}`));
-                }
+                logger.log(`[listen-chain] dev-lead spawned for chat ${sessionId}, key=${devLeadSessionKey}`);
+                void withDbClient(dbUrl, async (client) => {
+                  await client.query(
+                    `UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`,
+                    [devLeadSessionKey, sessionId]
+                  );
+                }).catch((e: Error) => logger.warn(`[listen-chain] store openclaw_session_key failed: ${e.message}`));
               } else {
                 const text = await resp.text().catch(() => "");
                 logger.warn(`[listen-chain] dev-lead chat spawn failed for ${sessionId}: ${resp.status} ${text.slice(0, 200)}`);

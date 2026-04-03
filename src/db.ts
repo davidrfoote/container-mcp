@@ -102,3 +102,22 @@ export async function buildSpawnMessage(sessionId: string, dbUrl: string, ashSes
     return fallback;
   }
 }
+
+export async function getSessionModel(sessionId: string, dbUrl: string): Promise<string | null> {
+  return withDbClient(dbUrl, async (client) => {
+    const res = await client.query<{ model: string | null }>(
+      "SELECT model FROM sessions WHERE session_id = $1",
+      [sessionId]
+    );
+    return res.rows[0]?.model ?? null;
+  });
+}
+
+export async function setSessionModel(sessionId: string, model: string, dbUrl: string): Promise<void> {
+  await withDbClient(dbUrl, async (client) => {
+    await client.query(
+      "UPDATE sessions SET model = $1 WHERE session_id = $2",
+      [model, sessionId]
+    );
+  });
+}
