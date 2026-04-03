@@ -528,6 +528,22 @@ export function createMcpServer() {
           required: [],
         },
       },
+      {
+        name: "set_session_model",
+        description: "Set the AI model for a dev session",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: { type: "string", description: "Session ID" },
+            model: {
+              type: "string",
+              enum: ["sonnet-4-6", "glm51", "glm5", "minimax"],
+              description: "Model ID to use for this session"
+            },
+          },
+          required: ["session_id", "model"],
+        },
+      },
     ],
   }));
 
@@ -1388,14 +1404,14 @@ export function createMcpServer() {
         case "spawn_dev_lead": {
           const { session_id: sessionId } = args as any;
           const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
-          const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
+          const hooksToken = process.env.OPENCLAW_HOOKS_TOKEN ?? process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
 
           try {
             const resp = await fetch(`${gatewayUrl}/hooks/agent`, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
-                "Authorization": `Bearer ${gatewayToken}`,
+                "Authorization": `Bearer ${hooksToken}`,
               },
               body: JSON.stringify({
                 agentId: "dev-lead",
@@ -1491,7 +1507,7 @@ export function createMcpServer() {
             }
 
             const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
-            const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
+            const hooksToken = process.env.OPENCLAW_HOOKS_TOKEN ?? process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
             let spawnOk = false;
             let spawnError = "";
             let childSessionKey: string | null = null;
@@ -1500,7 +1516,7 @@ export function createMcpServer() {
                 method: "POST",
                 headers: {
                   "Content-Type": "application/json",
-                  "Authorization": `Bearer ${gatewayToken}`,
+                  "Authorization": `Bearer ${hooksToken}`,
                 },
                 body: JSON.stringify({
                   agentId: "dev-lead",
@@ -1832,6 +1848,19 @@ export function createMcpServer() {
             worktrees,
             health: { db: db_health, gateway: gateway_health },
           }) }] };
+        }
+
+        case "set_session_model": {
+          const { session_id: sessionId, model: modelId } = args as any;
+          const { resolveModel } = await import("./models.js");
+          const { setSessionModel } = await import("./db.js");
+          const resolved = resolveModel(modelId);
+          if (!resolved) {
+            return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: `Unknown model: ${modelId}` }) }] };
+          }
+          const dbUrl = process.env.OPS_DB_URL ?? "";
+          await setSessionModel(sessionId, modelId, dbUrl);
+          return { content: [{ type: "text", text: JSON.stringify({ ok: true, model: resolved }) }] };
         }
 
         default:

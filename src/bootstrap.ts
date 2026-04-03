@@ -4,10 +4,11 @@ import * as fs from "fs";
 import * as path from "path";
 import * as http from "http";
 import * as https from "https";
-import { withDbClient, buildSpawnMessage } from "./db.js";
+import { withDbClient, buildSpawnMessage, getSessionModel } from "./db.js";
 import { spawnCodeTask } from "./code-task.js";
 import { postToFeed } from "./feed.js";
 import { populateCacheForProject, searchJiraForIssue, createJiraTaskIssue } from "./jira-confluence.js";
+import { resolveModel } from "./models.js";
 
 function httpGetWithTimeout(url: string, timeoutMs: number): Promise<Record<string, unknown> | null> {
   return new Promise((resolve) => {
@@ -594,7 +595,10 @@ export async function bootstrapSession(params: {
   // Step 4b: Spawn BOOTSTRAP coding agent immediately (not via listen-chain backfill)
   try {
     const { instruction, workingDir, allowedTools } = await buildBootstrapInstruction(sessionId, dbUrl);
-    spawnCodeTask({ instruction, workingDir, sessionId, dbUrl, allowedTools });
+    const sessionModelId = await getSessionModel(sessionId, dbUrl);
+    const modelDef = resolveModel(sessionModelId);
+    const model = modelDef.cliId;
+    spawnCodeTask({ instruction, workingDir, sessionId, dbUrl, allowedTools, model });
     console.log(`[bootstrapSession] BOOTSTRAP coding agent spawned for ${sessionId}`);
   } catch (e: any) {
     console.error(`[bootstrapSession] BOOTSTRAP spawn error (non-fatal): ${e.message}`);
@@ -648,7 +652,7 @@ export async function bootstrapSession(params: {
   // Spawn dev-lead via OpenClaw gateway /hooks/agent
   {
     const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
-    const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
+    const hooksToken = process.env.OPENCLAW_HOOKS_TOKEN ?? process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
     const ashSessionKey = process.env.OPENCLAW_SESSION_KEY;
     let spawnOk = false;
     let spawnError = "";
@@ -659,7 +663,7 @@ export async function bootstrapSession(params: {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${gatewayToken}`,
+          "Authorization": `Bearer ${hooksToken}`,
         },
         body: JSON.stringify({
           agentId: "dev-lead",
@@ -710,7 +714,7 @@ export async function bootstrapSession(params: {
             body: JSON.stringify({
               sessionId,
               childSessionKey,
-              parentSessionKey: gatewayToken,
+              parentSessionKey: process.env.OPENCLAW_GATEWAY_TOKEN ?? "",
             }),
           });
         } catch (linkErr: any) {
