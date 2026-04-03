@@ -656,7 +656,7 @@ export async function bootstrapSession(params: {
     const ashSessionKey = process.env.OPENCLAW_SESSION_KEY;
     let spawnOk = false;
     let spawnError = "";
-    let childSessionKey: string | null = null;
+    const devLeadSessionKey = `agent:dev-lead:dev-session:${sessionId}`;
     try {
       const spawnMessage = await buildSpawnMessage(sessionId, dbUrl, ashSessionKey);
       const resp = await fetch(`${gatewayUrl}/hooks/agent`, {
@@ -669,14 +669,13 @@ export async function bootstrapSession(params: {
           agentId: "dev-lead",
           message: spawnMessage,
           cwd: "/home/openclaw/agents/dev-lead",
+          sessionKey: devLeadSessionKey,
         }),
       });
       if (!resp.ok) {
         const text = await resp.text();
         spawnError = `Gateway ${resp.status}: ${text}`;
       } else {
-        const parsed = await resp.json().catch(() => ({})) as any;
-        childSessionKey = parsed?.result?.details?.childSessionKey ?? parsed?.details?.childSessionKey ?? parsed?.childSessionKey ?? parsed?.session_key ?? null;
         spawnOk = true;
       }
     } catch (fetchErr: any) {
@@ -694,11 +693,11 @@ export async function bootstrapSession(params: {
       }).catch(() => {});
     } else {
       console.log(`[bootstrapSession] dev-lead spawned via gateway for session ${sessionId}`);
-      // Store openclaw_session_key, then transition to active via state machine
+      // Store openclaw_session_key immediately (key is known before the fetch response)
       await withDbClient(dbUrl, async (client) => {
         await client.query(
           `UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`,
-          [childSessionKey, sessionId]
+          [devLeadSessionKey, sessionId]
         );
       }).catch((e: any) => console.warn('[bootstrapSession] failed to store openclaw_session_key: ' + e.message));
       const { transitionSession } = await import("./state-machine.js");
@@ -706,20 +705,18 @@ export async function bootstrapSession(params: {
       if (!tr.ok) console.warn(`[bootstrapSession] transition to active failed: ${tr.error}`);
 
       // Register parent-child subscription for A2A callbacks (non-fatal)
-      if (childSessionKey) {
-        try {
-          await fetch("https://dev-sessions.ash.zennya.app/api/sessions/link", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              sessionId,
-              childSessionKey,
-              parentSessionKey: process.env.OPENCLAW_GATEWAY_TOKEN ?? "",
-            }),
-          });
-        } catch (linkErr: any) {
-          console.warn(`[bootstrapSession] sessions/link failed (non-fatal): ${linkErr.message}`);
-        }
+      try {
+        await fetch("https://dev-sessions.ash.zennya.app/api/sessions/link", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sessionId,
+            childSessionKey: devLeadSessionKey,
+            parentSessionKey: process.env.OPENCLAW_GATEWAY_TOKEN ?? "",
+          }),
+        });
+      } catch (linkErr: any) {
+        console.warn(`[bootstrapSession] sessions/link failed (non-fatal): ${linkErr.message}`);
       }
     }
   }

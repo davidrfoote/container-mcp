@@ -1407,6 +1407,7 @@ export function createMcpServer() {
           const hooksToken = process.env.OPENCLAW_HOOKS_TOKEN ?? process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
 
           try {
+            const devLeadSessionKey = `agent:dev-lead:dev-session:${sessionId}`;
             const resp = await fetch(`${gatewayUrl}/hooks/agent`, {
               method: "POST",
               headers: {
@@ -1417,6 +1418,7 @@ export function createMcpServer() {
                 agentId: "dev-lead",
                 message: await buildSpawnMessage(sessionId, process.env.OPS_DB_URL ?? ''),
                 cwd: "/home/openclaw/agents/dev-lead",
+                sessionKey: devLeadSessionKey,
               }),
             });
 
@@ -1425,20 +1427,16 @@ export function createMcpServer() {
               return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: `Gateway ${resp.status}: ${text}` }) }] };
             }
 
-            const parsed = await resp.json().catch(() => ({})) as any;
-            const childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
-            if (childSessionKey) {
-              const dbUrl = process.env.OPS_DB_URL;
-              if (dbUrl) {
-                void withDbClient(dbUrl, async (client) => {
-                  await client.query(
-                    `UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`,
-                    [childSessionKey, sessionId]
-                  );
-                }).catch((e: Error) => console.warn(`[spawn_dev_lead] store openclaw_session_key failed: ${e.message}`));
-              }
+            const dbUrl = process.env.OPS_DB_URL;
+            if (dbUrl) {
+              void withDbClient(dbUrl, async (client) => {
+                await client.query(
+                  `UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`,
+                  [devLeadSessionKey, sessionId]
+                );
+              }).catch((e: Error) => console.warn(`[spawn_dev_lead] store openclaw_session_key failed: ${e.message}`));
             }
-            return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: sessionId, childSessionKey }) }] };
+            return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: sessionId, devLeadSessionKey }) }] };
           } catch (fetchErr: any) {
             return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: fetchErr.message }) }] };
           }
@@ -1510,7 +1508,7 @@ export function createMcpServer() {
             const hooksToken = process.env.OPENCLAW_HOOKS_TOKEN ?? process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
             let spawnOk = false;
             let spawnError = "";
-            let childSessionKey: string | null = null;
+            const devLeadSessionKey = `agent:dev-lead:dev-session:${sessionId}`;
             try {
               const resp = await fetch(`${gatewayUrl}/hooks/agent`, {
                 method: "POST",
@@ -1522,14 +1520,13 @@ export function createMcpServer() {
                   agentId: "dev-lead",
                   message: await buildSpawnMessage(sessionId, dbUrl, ash_session_key),
                   cwd: "/home/openclaw/agents/dev-lead",
+                  sessionKey: devLeadSessionKey,
                 }),
               });
               if (!resp.ok) {
                 const text = await resp.text();
                 spawnError = `Gateway ${resp.status}: ${text}`;
               } else {
-                const parsed = await resp.json().catch(() => ({})) as any;
-                childSessionKey = parsed?.result?.details?.childSessionKey ?? parsed?.details?.childSessionKey ?? parsed?.childSessionKey ?? parsed?.session_key ?? null;
                 spawnOk = true;
               }
             } catch (fetchErr: any) {
@@ -1547,17 +1544,15 @@ export function createMcpServer() {
               return { content: [{ type: "text", text: JSON.stringify({ ok: false, session_id: sessionId, session_url: sessionUrl, error: `spawn failed: ${spawnError}` }) }] };
             }
 
-            // Persist the OpenClaw session key so we can query dev-lead status later
-            if (childSessionKey) {
-              await withDbClient(dbUrl, async (client) => {
-                await client.query(
-                  `UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`,
-                  [childSessionKey, sessionId]
-                );
-              }).catch((e: Error) => console.warn(`[create_session] store openclaw_session_key failed: ${e.message}`));
-            }
+            // Persist the OpenClaw session key immediately (key is known before the fetch response)
+            await withDbClient(dbUrl, async (client) => {
+              await client.query(
+                `UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`,
+                [devLeadSessionKey, sessionId]
+              );
+            }).catch((e: Error) => console.warn(`[create_session] store openclaw_session_key failed: ${e.message}`));
 
-            return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: sessionId, session_url: sessionUrl, childSessionKey }) }] };
+            return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: sessionId, session_url: sessionUrl, devLeadSessionKey }) }] };
           } catch (err: any) {
             return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: (err as Error).message }) }], isError: true };
           }
