@@ -143,7 +143,7 @@ function resolveUserId(rawUserId) {
 async function buildBootstrapInstruction(sessionId, dbUrl) {
     const PORT = process.env.PORT ?? "9100";
     const data = await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-        const sessionRes = await client.query(`SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.default_container, p.confluence_root_id, s.branch, s.worktree_path, s.session_model
+        const sessionRes = await client.query(`SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.default_container, p.confluence_root_id, s.branch, s.worktree_path, s.model
        FROM sessions s LEFT JOIN projects p ON p.project_id = s.project_id
        WHERE s.session_id = $1`, [sessionId]);
         const briefRes = await client.query(`SELECT content FROM session_messages WHERE session_id=$1 AND message_type='task_brief' ORDER BY created_at LIMIT 1`, [sessionId]);
@@ -232,13 +232,13 @@ async function buildBootstrapInstruction(sessionId, dbUrl) {
     ].filter(Boolean).join("\n");
     // BOOTSTRAP is read-only: explore + plan only. Blocks Edit/Write/MultiEdit.
     const allowedTools = ["Read", "Glob", "Grep", "Bash", "WebFetch", "WebSearch"];
-    const model = data.session?.session_model || model_registry_js_1.DEFAULT_MODEL;
+    const model = data.session?.model || model_registry_js_1.DEFAULT_MODEL;
     return { instruction, workingDir, allowedTools, model };
 }
 async function buildExecutionInstruction(sessionId, dbUrl) {
     const PORT = process.env.PORT ?? "9100";
     const data = await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-        const sessionRes = await client.query(`SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.default_container, s.claude_session_id, s.branch, s.worktree_path, s.session_model
+        const sessionRes = await client.query(`SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.default_container, s.claude_session_id, s.branch, s.worktree_path, s.model
        FROM sessions s LEFT JOIN projects p ON p.project_id = s.project_id
        WHERE s.session_id = $1`, [sessionId]);
         const planRes = await client.query(`SELECT content FROM session_messages WHERE session_id=$1 AND message_type='approval_request' AND role='coding_agent' ORDER BY created_at DESC LIMIT 1`, [sessionId]);
@@ -328,7 +328,7 @@ async function buildExecutionInstruction(sessionId, dbUrl) {
         ``,
         `7. Exit after posting the checkpoint.`,
     ].filter(Boolean).join("\n");
-    const model = data.session?.session_model || model_registry_js_1.DEFAULT_MODEL;
+    const model = data.session?.model || model_registry_js_1.DEFAULT_MODEL;
     return { instruction, workingDir, resumeClaudeSessionId, model };
 }
 async function buildCloseoutMessage(sessionId, checkpointContent, dbUrl) {
@@ -465,7 +465,7 @@ async function bootstrapSession(params) {
                     return { ok: false, error: `Invalid model: ${requestedModel}. Allowed models: ${(0, model_registry_js_1.listModelIds)().join(', ')}` };
                 }
                 await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-                    await client.query(`UPDATE sessions SET session_model = $1, updated_at = now() WHERE session_id = $2`, [requestedModel, existing.session_id]);
+                    await client.query(`UPDATE sessions SET model = $1, updated_at = now() WHERE session_id = $2`, [requestedModel, existing.session_id]);
                 });
             }
             const sessionUrl = `https://dev-sessions.ash.zennya.app/sessions/${existing.session_id}`;
@@ -540,7 +540,7 @@ async function bootstrapSession(params) {
             const authHint = process.env.ANTHROPIC_API_KEY
                 ? `${triggeredByName} ANTHROPIC_API_KEY (container env)`
                 : null;
-            await client.query(`INSERT INTO sessions (session_id, project_id, container, repo, status, session_type, title, prompt_preview, jira_issue_keys, user_id, triggered_by_name, triggered_by_slack_user_id, slack_thread_url, branch, worktree_path, auth_hint, session_model, created_at, updated_at)
+            await client.query(`INSERT INTO sessions (session_id, project_id, container, repo, status, session_type, title, prompt_preview, jira_issue_keys, user_id, triggered_by_name, triggered_by_slack_user_id, slack_thread_url, branch, worktree_path, auth_hint, model, created_at, updated_at)
          VALUES ($1, $2, $3, $4, 'pending', 'dev', $5, $6, $7::text[], $8, $9, $10, $11, $12, $13, $14, $15, now(), now())`, [sessionId, projectId, projConfig.default_container ?? "dev-david", projectId,
                 user_request.slice(0, 100), taskBrief.slice(0, 500), jiraKeysArr, user_id_resolved,
                 triggeredByName, triggeredBySlackUserId, slack_thread_url ?? null,

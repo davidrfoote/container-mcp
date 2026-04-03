@@ -67,6 +67,7 @@ async function startListenChain() {
     }
     const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
     const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
+    const hooksToken = process.env.OPENCLAW_HOOKS_TOKEN ?? process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
     const listenClient = new pg_1.Client({ connectionString: dbUrl });
     try {
         await listenClient.connect();
@@ -229,24 +230,22 @@ async function startListenChain() {
                                 logger_js_1.logger.warn(`[listen-chain] sessions_send failed (${sendResp.status} ${text.slice(0, 200)}) — falling back to sessions_spawn for ${sessionId}`);
                             }
                             // No existing session (or sessions_send failed) — spawn a fresh dev-lead close-out
+                            const targetSessionKey = existingKey || `agent:dev-lead:dev-session:${sessionId}`;
                             const spawnResp = await fetch(`${gatewayUrl}/hooks/agent`, {
                                 method: "POST",
-                                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${gatewayToken}` },
+                                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${hooksToken}` },
                                 body: JSON.stringify({
                                     agentId: "dev-lead",
                                     message: task,
                                     cwd: "/home/openclaw/agents/dev-lead",
+                                    sessionKey: targetSessionKey,
                                 }),
                             });
                             if (spawnResp.ok) {
-                                const parsed = await spawnResp.json().catch(() => ({}));
-                                const childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
-                                logger_js_1.logger.log(`[listen-chain] dev-lead close-out spawned for ${sessionId}, key=${childSessionKey ?? "n/a"}`);
-                                if (childSessionKey) {
-                                    void (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-                                        await client.query(`UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`, [childSessionKey, sessionId]);
-                                    }).catch((e) => logger_js_1.logger.warn(`[listen-chain] store openclaw_session_key failed: ${e.message}`));
-                                }
+                                logger_js_1.logger.log(`[listen-chain] dev-lead close-out spawned for ${sessionId}, key=${targetSessionKey}`);
+                                void (0, db_js_1.withDbClient)(dbUrl, async (client) => {
+                                    await client.query(`UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`, [targetSessionKey, sessionId]);
+                                }).catch((e) => logger_js_1.logger.warn(`[listen-chain] store openclaw_session_key failed: ${e.message}`));
                             }
                             else {
                                 const text = await spawnResp.text().catch(() => "");
@@ -268,24 +267,22 @@ async function startListenChain() {
                                 return r.rows[0] ?? null;
                             }).catch(() => null);
                             const ashKey = parentKeyRow?.gateway_parent_key ?? undefined;
+                            const targetSessionKey = `agent:dev-lead:dev-session:${sessionId}`;
                             const resp = await fetch(`${gatewayUrl}/hooks/agent`, {
                                 method: "POST",
-                                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${gatewayToken}` },
+                                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${hooksToken}` },
                                 body: JSON.stringify({
                                     agentId: "dev-lead",
                                     message: await (0, db_js_1.buildSpawnMessage)(sessionId, dbUrl, ashKey),
                                     cwd: "/home/openclaw/agents/dev-lead",
+                                    sessionKey: targetSessionKey,
                                 }),
                             });
                             if (resp.ok) {
-                                const parsed = await resp.json().catch(() => ({}));
-                                const childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
-                                logger_js_1.logger.log(`[listen-chain] dev-lead spawned for chat ${sessionId}, key=${childSessionKey ?? "n/a"}`);
-                                if (childSessionKey) {
-                                    void (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-                                        await client.query(`UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`, [childSessionKey, sessionId]);
-                                    }).catch((e) => logger_js_1.logger.warn(`[listen-chain] store openclaw_session_key failed: ${e.message}`));
-                                }
+                                logger_js_1.logger.log(`[listen-chain] dev-lead spawned for chat ${sessionId}, key=${targetSessionKey}`);
+                                void (0, db_js_1.withDbClient)(dbUrl, async (client) => {
+                                    await client.query(`UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`, [targetSessionKey, sessionId]);
+                                }).catch((e) => logger_js_1.logger.warn(`[listen-chain] store openclaw_session_key failed: ${e.message}`));
                             }
                             else {
                                 const text = await resp.text().catch(() => "");

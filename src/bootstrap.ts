@@ -113,9 +113,9 @@ export async function buildBootstrapInstruction(sessionId: string, dbUrl: string
       confluence_root_id: string | null;
       branch: string | null;
       worktree_path: string | null;
-      session_model: string | null;
+      model: string | null;
     }>(
-      `SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.default_container, p.confluence_root_id, s.branch, s.worktree_path, s.session_model
+      `SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.default_container, p.confluence_root_id, s.branch, s.worktree_path, s.model
        FROM sessions s LEFT JOIN projects p ON p.project_id = s.project_id
        WHERE s.session_id = $1`,
       [sessionId]
@@ -218,7 +218,7 @@ export async function buildBootstrapInstruction(sessionId: string, dbUrl: string
   // BOOTSTRAP is read-only: explore + plan only. Blocks Edit/Write/MultiEdit.
   const allowedTools = ["Read", "Glob", "Grep", "Bash", "WebFetch", "WebSearch"];
 
-  const model = data.session?.session_model || DEFAULT_MODEL;
+  const model = data.session?.model || DEFAULT_MODEL;
   return { instruction, workingDir, allowedTools, model };
 }
 
@@ -235,9 +235,9 @@ export async function buildExecutionInstruction(sessionId: string, dbUrl: string
       claude_session_id: string | null;
       branch: string | null;
       worktree_path: string | null;
-      session_model: string | null;
+      model: string | null;
     }>(
-      `SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.default_container, s.claude_session_id, s.branch, s.worktree_path, s.session_model
+      `SELECT s.project_id, s.jira_issue_keys, p.build_cmd, p.deploy_cmd, p.default_container, s.claude_session_id, s.branch, s.worktree_path, s.model
        FROM sessions s LEFT JOIN projects p ON p.project_id = s.project_id
        WHERE s.session_id = $1`,
       [sessionId]
@@ -342,7 +342,7 @@ export async function buildExecutionInstruction(sessionId: string, dbUrl: string
     `7. Exit after posting the checkpoint.`,
   ].filter(Boolean).join("\n");
 
-  const model = data.session?.session_model || DEFAULT_MODEL;
+  const model = data.session?.model || DEFAULT_MODEL;
   return { instruction, workingDir, resumeClaudeSessionId, model };
 }
 
@@ -536,7 +536,7 @@ export async function bootstrapSession(params: {
         }
         await withDbClient(dbUrl, async (client) => {
           await client.query(
-            `UPDATE sessions SET session_model = $1, updated_at = now() WHERE session_id = $2`,
+            `UPDATE sessions SET model = $1, updated_at = now() WHERE session_id = $2`,
             [requestedModel, existing.session_id]
           );
         });
@@ -632,7 +632,7 @@ export async function bootstrapSession(params: {
         ? `${triggeredByName} ANTHROPIC_API_KEY (container env)`
         : null;
       await client.query(
-        `INSERT INTO sessions (session_id, project_id, container, repo, status, session_type, title, prompt_preview, jira_issue_keys, user_id, triggered_by_name, triggered_by_slack_user_id, slack_thread_url, branch, worktree_path, auth_hint, session_model, created_at, updated_at)
+        `INSERT INTO sessions (session_id, project_id, container, repo, status, session_type, title, prompt_preview, jira_issue_keys, user_id, triggered_by_name, triggered_by_slack_user_id, slack_thread_url, branch, worktree_path, auth_hint, model, created_at, updated_at)
          VALUES ($1, $2, $3, $4, 'pending', 'dev', $5, $6, $7::text[], $8, $9, $10, $11, $12, $13, $14, $15, now(), now())`,
         [sessionId, projectId, projConfig!.default_container ?? "dev-david", projectId,
           user_request.slice(0, 100), taskBrief.slice(0, 500), jiraKeysArr, user_id_resolved,

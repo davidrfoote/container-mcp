@@ -138,7 +138,7 @@ function spawnCodeTask(params) {
             if (resumeClaudeSessionId)
                 claudeArgs.push("--resume", resumeClaudeSessionId);
             const proc = (0, child_process_1.spawn)("claude", claudeArgs, {
-                cwd: workingDir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined }, stdio: ["ignore", "pipe", "pipe"],
+                cwd: workingDir, env: { ...process.env, PATH: `/home/openclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined }, stdio: ["ignore", "pipe", "pipe"],
             });
             const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeoutSeconds * 1000);
             proc.on("error", (err) => {

@@ -45,7 +45,6 @@ const db_js_1 = require("./db.js");
 const feed_js_1 = require("./feed.js");
 const task_logs_js_1 = require("./task-logs.js");
 const jira_confluence_js_1 = require("./jira-confluence.js");
-const bootstrap_js_1 = require("./bootstrap.js");
 const deploy_project_js_1 = require("./tools/deploy-project.js");
 const state_machine_js_1 = require("./state-machine.js");
 const model_registry_js_1 = require("./model-registry.js");
@@ -338,34 +337,6 @@ function createMcpServer() {
                 },
             },
             {
-                name: "spawn_dev_lead",
-                description: "Spawn a dev-lead agent session via the OpenClaw gateway for a given ops-db session ID",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        session_id: { type: "string", description: "The ops-db session ID to spawn a dev-lead for" },
-                    },
-                    required: ["session_id"],
-                },
-            },
-            {
-                name: "create_session",
-                description: "Atomically create a dev session: INSERT into sessions table, INSERT task_brief into session_messages, and spawn dev-lead. Returns { ok, session_id, session_url }.",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        title: { type: "string", description: "Short title for the session" },
-                        repo: { type: "string", description: "Repository name (must match projects table project_id)" },
-                        container: { type: "string", description: "Dev container name (default: dev-david)" },
-                        task_brief: { type: "string", description: "Full task brief content to post as task_brief message" },
-                        slack_thread_url: { type: "string", description: "Slack thread URL for notifications (optional)" },
-                        jira_keys: { type: "string", description: "Comma-separated Jira issue keys (optional, e.g. ZI-18820)" },
-                        ash_session_key: { type: "string", description: "OpenClaw session key of the spawning Ash session (e.g. agent:main:openai:xxxx) for callback. Defaults to OPENCLAW_SESSION_KEY env var if not provided." },
-                    },
-                    required: ["title", "repo", "task_brief"],
-                },
-            },
-            {
                 name: "warm_cache_for_repos",
                 description: "Pre-populate project_context_cache for one or more repos by fetching their Jira issues and Confluence root page from the projects table",
                 inputSchema: {
@@ -483,68 +454,6 @@ function createMcpServer() {
                 },
             },
             {
-                name: "bootstrap_session",
-                description: "Orchestrate a new dev session end-to-end. Resolves the project (exact match on project_id or project_hint), checks for existing active session, warms Jira/Confluence cache, creates/finds Jira issue, composes task brief, creates session record, and launches BOOTSTRAP planning pass via Claude Code CLI. If no project matches and no project_id is provided, returns needs_project=true with available_projects — the caller should then pick or create a project_id and call again.",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        user_request: {
-                            type: "string",
-                            description: "Natural-language description of what the user wants to do",
-                        },
-                        user_id: {
-                            type: "string",
-                            description: "User identifier: Slack user ID (e.g. U097Q46UX) or email address (e.g. david@zennya.com). Emails are auto-resolved to Slack IDs. Webchat callers should pass their authenticated email so bootstrap_session resolves the correct user without manual lookup.",
-                        },
-                        project_id: {
-                            type: "string",
-                            description: "Explicit project_id. If it matches an existing project, that project is used. If it doesn't exist, a new project is auto-created with the given display_name/description. If omitted, the server tries to match from project_hint.",
-                        },
-                        project_hint: {
-                            type: "string",
-                            description: "Optional project_id or display_name to match against existing projects (exact, case-insensitive). Ignored if project_id is provided.",
-                        },
-                        display_name: {
-                            type: "string",
-                            description: "Display name for auto-created projects (e.g. 'Ash Dashboard'). Only used when project_id is new.",
-                        },
-                        description: {
-                            type: "string",
-                            description: "Description for auto-created projects. Only used when project_id is new.",
-                        },
-                        slack_thread_url: {
-                            type: "string",
-                            description: "Slack thread URL to associate with the session (optional)",
-                        },
-                        model: {
-                            type: "string",
-                            description: `Optional model ID for the session BOOTSTRAP/EXECUTION passes. Registered models: ${(0, model_registry_js_1.listModelIds)().join(', ')}`,
-                        },
-                    },
-                    required: ["user_request", "user_id"],
-                },
-            },
-            {
-                name: "set_session_model",
-                description: "Set the Claude CLI model for a session. Persists in ops-db and is honoured by BOOTSTRAP and EXECUTION code tasks.",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        session_id: { type: "string", description: "Session ID to update" },
-                        model: {
-                            type: "string",
-                            description: `Model ID to use. Registered models: ${(0, model_registry_js_1.listModelIds)().join(', ')}`,
-                        },
-                    },
-                    required: ["session_id", "model"],
-                },
-            },
-            {
-                name: "list_models",
-                description: "List all registered Claude CLI models with their provider, tier, and notes.",
-                inputSchema: { type: "object", properties: {} },
-            },
-            {
                 name: "transition_session",
                 description: "Atomically transition a session's status with graph validation. Rejects invalid transitions (e.g. completed → executing). Uses optimistic concurrency to prevent races.",
                 inputSchema: {
@@ -601,11 +510,11 @@ function createMcpServer() {
                     if (!model && session_id && dbUrl) {
                         try {
                             const row = await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-                                const r = await client.query("SELECT session_model FROM sessions WHERE session_id = $1", [session_id]);
+                                const r = await client.query("SELECT model FROM sessions WHERE session_id = $1", [session_id]);
                                 return r.rows[0] ?? null;
                             });
-                            if (row?.session_model)
-                                resolvedModel = row.session_model;
+                            if (row?.model)
+                                resolvedModel = row.model;
                         }
                         catch (_) { /* ignore — keep resolvedModel */ }
                     }
@@ -1203,11 +1112,11 @@ function createMcpServer() {
                     if (chatSessionId && dbUrl) {
                         try {
                             const row = await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-                                const r = await client.query("SELECT session_model FROM sessions WHERE session_id = $1", [chatSessionId]);
+                                const r = await client.query("SELECT model FROM sessions WHERE session_id = $1", [chatSessionId]);
                                 return r.rows[0] ?? null;
                             });
-                            if (row?.session_model)
-                                chatModel = row.session_model;
+                            if (row?.model)
+                                chatModel = row.model;
                         }
                         catch (_) { /* ignore — keep DEFAULT_MODEL */ }
                     }
@@ -1376,132 +1285,6 @@ function createMcpServer() {
                         content: [{ type: "text", text: JSON.stringify(chatResult) }],
                     };
                 }
-                case "spawn_dev_lead": {
-                    const { session_id: sessionId } = args;
-                    const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
-                    const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
-                    try {
-                        const resp = await fetch(`${gatewayUrl}/hooks/agent`, {
-                            method: "POST",
-                            headers: {
-                                "Content-Type": "application/json",
-                                "Authorization": `Bearer ${gatewayToken}`,
-                            },
-                            body: JSON.stringify({
-                                agentId: "dev-lead",
-                                message: await (0, db_js_1.buildSpawnMessage)(sessionId, process.env.OPS_DB_URL ?? ''),
-                                cwd: "/home/openclaw/agents/dev-lead",
-                            }),
-                        });
-                        if (!resp.ok) {
-                            const text = await resp.text();
-                            return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: `Gateway ${resp.status}: ${text}` }) }] };
-                        }
-                        const parsed = await resp.json().catch(() => ({}));
-                        const childSessionKey = parsed?.childSessionKey ?? parsed?.session_key ?? null;
-                        if (childSessionKey) {
-                            const dbUrl = process.env.OPS_DB_URL;
-                            if (dbUrl) {
-                                void (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-                                    await client.query(`UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`, [childSessionKey, sessionId]);
-                                }).catch((e) => console.warn(`[spawn_dev_lead] store openclaw_session_key failed: ${e.message}`));
-                            }
-                        }
-                        return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: sessionId, childSessionKey }) }] };
-                    }
-                    catch (fetchErr) {
-                        return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: fetchErr.message }) }] };
-                    }
-                }
-                case "create_session": {
-                    const { title, repo, container: sessionContainer = "dev-david", task_brief, slack_thread_url, jira_keys, ash_session_key, } = args;
-                    const dbUrl = process.env.OPS_DB_URL;
-                    if (!dbUrl) {
-                        return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "OPS_DB_URL not set" }) }] };
-                    }
-                    const firstKey = jira_keys?.split(",")[0]?.trim().toLowerCase().replace(/-/g, "") ?? "";
-                    const ts = Date.now();
-                    const sessionId = firstKey
-                        ? `sess-${firstKey}-${ts}`
-                        : `sess-${(0, crypto_1.randomUUID)().slice(0, 8)}-${ts}`;
-                    const sessionUrl = `https://dev-sessions.ash.zennya.app/sessions/${sessionId}`;
-                    const jiraKeysArr = jira_keys
-                        ? `{${jira_keys.split(",").map((k) => k.trim()).join(",")}}`
-                        : null;
-                    try {
-                        const resolvedAshKey = ash_session_key || process.env.OPENCLAW_SESSION_KEY || null;
-                        await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-                            await client.query(`INSERT INTO sessions (session_id, project_id, container, repo, status, session_type, title, prompt_preview, jira_issue_keys, slack_thread_url, gateway_parent_key, created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, 'active', 'dev', $5, $6, $7::text[], $8, $9, now(), now())`, [sessionId, repo, sessionContainer, repo, title, task_brief.slice(0, 500), jiraKeysArr, slack_thread_url || null, resolvedAshKey]);
-                            const msgId = `msg-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-                            await client.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
-                 VALUES ($1, $2, 'user', $3, 'task_brief', now())`, [msgId, sessionId, task_brief]);
-                        });
-                        try {
-                            const parsedJiraKeys = jira_keys
-                                ? jira_keys.split(",").map((k) => k.trim()).filter(Boolean)
-                                : [];
-                            const projRow = await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-                                const r = await client.query(`SELECT confluence_root_id FROM projects WHERE project_id = $1`, [repo]);
-                                return r.rows[0] ?? null;
-                            });
-                            const confluenceRootId = projRow?.confluence_root_id ?? null;
-                            await (0, jira_confluence_js_1.populateCacheForProject)(dbUrl, parsedJiraKeys, confluenceRootId);
-                            console.log(`[create_session] cache warmed: jira=${parsedJiraKeys.join(",") || "none"} confluence=${confluenceRootId ?? "none"}`);
-                        }
-                        catch (cacheErr) {
-                            console.warn(`[create_session] cache warm failed (non-fatal): ${cacheErr.message}`);
-                        }
-                        const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL ?? "http://172.17.0.1:18789";
-                        const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
-                        let spawnOk = false;
-                        let spawnError = "";
-                        let childSessionKey = null;
-                        try {
-                            const resp = await fetch(`${gatewayUrl}/hooks/agent`, {
-                                method: "POST",
-                                headers: {
-                                    "Content-Type": "application/json",
-                                    "Authorization": `Bearer ${gatewayToken}`,
-                                },
-                                body: JSON.stringify({
-                                    agentId: "dev-lead",
-                                    message: await (0, db_js_1.buildSpawnMessage)(sessionId, dbUrl, ash_session_key),
-                                    cwd: "/home/openclaw/agents/dev-lead",
-                                }),
-                            });
-                            if (!resp.ok) {
-                                const text = await resp.text();
-                                spawnError = `Gateway ${resp.status}: ${text}`;
-                            }
-                            else {
-                                const parsed = await resp.json().catch(() => ({}));
-                                childSessionKey = parsed?.result?.details?.childSessionKey ?? parsed?.details?.childSessionKey ?? parsed?.childSessionKey ?? parsed?.session_key ?? null;
-                                spawnOk = true;
-                            }
-                        }
-                        catch (fetchErr) {
-                            spawnError = fetchErr.message;
-                        }
-                        if (!spawnOk) {
-                            await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-                                await client.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
-                   VALUES (gen_random_uuid(), $1, 'dev_lead', $2, 'console', now())`, [sessionId, `⚠️ Session created but spawn_dev_lead failed: ${spawnError}`]);
-                            }).catch(() => { });
-                            return { content: [{ type: "text", text: JSON.stringify({ ok: false, session_id: sessionId, session_url: sessionUrl, error: `spawn failed: ${spawnError}` }) }] };
-                        }
-                        // Persist the OpenClaw session key so we can query dev-lead status later
-                        if (childSessionKey) {
-                            await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-                                await client.query(`UPDATE sessions SET openclaw_session_key = $1, updated_at = now() WHERE session_id = $2`, [childSessionKey, sessionId]);
-                            }).catch((e) => console.warn(`[create_session] store openclaw_session_key failed: ${e.message}`));
-                        }
-                        return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: sessionId, session_url: sessionUrl, childSessionKey }) }] };
-                    }
-                    catch (err) {
-                        return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: err.message }) }], isError: true };
-                    }
-                }
                 case "warm_cache_for_repos": {
                     const { repos: targetRepos } = args;
                     const repoList = Array.isArray(targetRepos) && targetRepos.length > 0
@@ -1627,11 +1410,6 @@ function createMcpServer() {
                         return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: err.message }) }], isError: true };
                     }
                 }
-                case "bootstrap_session": {
-                    const { user_request, user_id, project_id: bsProjectId, project_hint, display_name: bsDisplayName, description: bsDescription, slack_thread_url: bsSlackThreadUrl, model: bsModel } = args;
-                    const result = await (0, bootstrap_js_1.bootstrapSession)({ user_request, user_id, project_id: bsProjectId, project_hint, display_name: bsDisplayName, description: bsDescription, slack_thread_url: bsSlackThreadUrl, model: bsModel });
-                    return { content: [{ type: "text", text: JSON.stringify(result) }] };
-                }
                 case "transition_session": {
                     const { session_id: tsSessionId, to_status } = args;
                     const dbUrl = process.env.OPS_DB_URL;
@@ -1677,7 +1455,7 @@ function createMcpServer() {
                         "code_task", "get_task_log", "run_tests", "run_build",
                         "git_status", "git_checkout", "git_add", "git_commit", "git_push", "git_merge", "git_pull",
                         "create_git_worktree", "delete_git_worktree", "list_git_worktrees", "get_diff", "get_repo_state",
-                        "create_session", "bootstrap_session", "spawn_dev_lead", "chat_session", "listen_for_approval", "post_message",
+                        "chat_session", "listen_for_approval", "post_message",
                         "create_project", "deploy_project", "warm_cache_for_repos",
                         "cache_read", "cache_write",
                         "transition_session", "get_session_provenance", "get_container_inventory",
@@ -1722,31 +1500,6 @@ function createMcpServer() {
                                     worktrees,
                                     health: { db: db_health, gateway: gateway_health },
                                 }) }] };
-                }
-                case "set_session_model": {
-                    const { session_id: setModelSessionId, model: requestedModel } = args;
-                    if (!setModelSessionId)
-                        throw new Error("session_id is required");
-                    if (!requestedModel)
-                        throw new Error("model is required");
-                    if (!(0, model_registry_js_1.isValidModel)(requestedModel)) {
-                        throw new Error(`Unknown model "${requestedModel}". Valid models: ${(0, model_registry_js_1.listModelIds)().join(", ")}`);
-                    }
-                    const dbUrl = process.env.OPS_DB_URL;
-                    if (!dbUrl)
-                        throw new Error("OPS_DB_URL not set");
-                    await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-                        await client.query(`UPDATE sessions SET session_model = $1, updated_at = now() WHERE session_id = $2`, [requestedModel, setModelSessionId]);
-                    });
-                    // Post a console message to the session feed so the UI reflects the change
-                    await (0, db_js_1.withDbClient)(dbUrl, async (client) => {
-                        await client.query(`INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
-               VALUES (gen_random_uuid(), $1, 'system', $2, 'console', now())`, [setModelSessionId, `🔄 Model changed to: ${requestedModel}`]);
-                    });
-                    return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: setModelSessionId, model: requestedModel }) }] };
-                }
-                case "list_models": {
-                    return { content: [{ type: "text", text: JSON.stringify({ models: model_registry_js_1.MODEL_REGISTRY, default: model_registry_js_1.DEFAULT_MODEL }) }] };
                 }
                 default:
                     throw new Error(`Unknown tool: ${name}`);
