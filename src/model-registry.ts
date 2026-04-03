@@ -14,15 +14,15 @@
 export interface ModelEntry {
   id: string;
   label: string;
-  provider: "claude" | "google" | "openai" | "other";
+  provider: "claude" | "google" | "openai" | "zai" | "minimax" | "other";
   tier: "primary" | "fallback";
   notes?: string;
 }
 
 export const MODEL_REGISTRY: ModelEntry[] = [
   {
-    id: "sonnet-4-6",
-    label: "Claude Sonnet 4.6",
+    id: "claude-sonnet-4-5",
+    label: "Claude Sonnet 4.5",
     provider: "claude",
     tier: "primary",
     notes: "Default. Best balance of speed and capability for most tasks.",
@@ -35,29 +35,57 @@ export const MODEL_REGISTRY: ModelEntry[] = [
     notes: "Fast, low cost. Good for simple/repetitive tasks.",
   },
   {
-    id: "glm-5-api",
-    label: "GLM-5 (API)",
-    provider: "google",
+    id: "glm-5.1",
+    label: "GLM-5.1 (Coding)",
+    provider: "zai",
     tier: "fallback",
-    notes: "Google GLM-5 via API. Requires Zhipu AI API key in environment.",
+    notes: "GLM-5.1 via ZAI coding endpoint (api/coding/paas/v4). Primary GLM model.",
   },
   {
-    id: "glm-5-flash",
-    label: "GLM-5 Flash (API)",
-    provider: "google",
+    id: "glm-5",
+    label: "GLM-5",
+    provider: "zai",
     tier: "fallback",
-    notes: "Fast GLM-5 variant. Low latency, lower cost.",
+    notes: "GLM-5 via ZAI coding endpoint. Fallback for glm-5.1.",
   },
   {
-    id: "minimax",
-    label: "MiniMax",
-    provider: "other",
+    id: "glm-5-turbo",
+    label: "GLM-5-Turbo (Coding)",
+    provider: "zai",
     tier: "fallback",
-    notes: "MiniMax MoE model. Requires MiniMax API key in environment.",
+    notes: "GLM-5-Turbo via ZAI coding endpoint. Fast variant.",
+  },
+  {
+    id: "glm-5.1-coding",
+    label: "GLM-5.1 (Coding Plan)",
+    provider: "zai",
+    tier: "fallback",
+    notes: "GLM-5.1 via ZAI coding plan endpoint (api/coding/paas/v4). Separate quota pool — use when standard API is exhausted.",
+  },
+  {
+    id: "MiniMax-M2.7",
+    label: "MiniMax M2.7",
+    provider: "minimax",
+    tier: "primary",
+    notes: "MiniMax M2.7 via Anthropic-compatible endpoint. Fast and capable.",
+  },
+  {
+    id: "MiniMax-M2.7-highspeed",
+    label: "MiniMax M2.7 Highspeed",
+    provider: "minimax",
+    tier: "fallback",
+    notes: "MiniMax M2.7 high-speed variant.",
+  },
+  {
+    id: "MiniMax-M2.5",
+    label: "MiniMax M2.5",
+    provider: "minimax",
+    tier: "fallback",
+    notes: "MiniMax M2.5 via Anthropic-compatible endpoint.",
   },
 ];
 
-export const DEFAULT_MODEL = "sonnet-4-6";
+export const DEFAULT_MODEL = "glm-5";
 
 /** Returns the ModelEntry for a given id, or undefined. */
 export function getModel(id: string): ModelEntry | undefined {

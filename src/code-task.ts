@@ -6,6 +6,25 @@ import { withDbClient } from "./db.js";
 import { postToFeed } from "./feed.js";
 import { taskLogs } from "./task-logs.js";
 
+function resolveClaudeBin(): string {
+  const candidates = [
+    process.env.CLAUDE_BIN,
+    "/home/david/.npm-local/bin/claude",
+    "/home/openclaw/.npm-global/bin/claude",
+    "/usr/local/bin/claude",
+    "/usr/bin/claude",
+    "claude",
+  ].filter(Boolean) as string[];
+  for (const c of candidates) {
+    try {
+      if (c === "claude") return c;
+      require("fs").accessSync(c);
+      return c;
+    } catch {}
+  }
+  return "claude";
+}
+
 import { DEFAULT_MODEL } from "./model-registry.js";
 
 export function spawnCodeTask(params: {
@@ -110,8 +129,37 @@ export function spawnCodeTask(params: {
       if (allowedTools && allowedTools.length > 0) claudeArgs.push("--allowed-tools", allowedTools.join(","));
       if (resumeClaudeSessionId) claudeArgs.push("--resume", resumeClaudeSessionId);
 
-      const proc = spawn("claude", claudeArgs, {
-        cwd: workingDir, env: { ...process.env, PATH: `/home/openclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined }, stdio: ["ignore", "pipe", "pipe"] as const,
+      // Build child env — model-specific overrides applied after base env
+      const childEnv: Record<string, string | undefined> = {
+        ...process.env,
+        PATH: `/home/openclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`,
+        CLAUDECODE: undefined,
+        CLAUDE_CODE_ENTRYPOINT: undefined,
+        // GLM via local Anthropic↔ZAI bridge (standard API, port 4001)
+        ...(resolvedModel.startsWith("glm") && !resolvedModel.endsWith("-coding") ? {
+          ANTHROPIC_BASE_URL: "http://localhost:4001",
+          ANTHROPIC_AUTH_TOKEN: "zai-bridge",
+        } : {}),
+        // GLM via coding endpoint bridge (port 4002, separate quota pool)
+        ...(resolvedModel.endsWith("-coding") ? {
+          ANTHROPIC_BASE_URL: "http://localhost:4002",
+          ANTHROPIC_AUTH_TOKEN: "zai-bridge",
+        } : {}),
+        // MiniMax via Anthropic-compatible endpoint (api.minimax.io)
+        ...(resolvedModel.startsWith("MiniMax") ? {
+          ANTHROPIC_BASE_URL: "https://api.minimax.io/anthropic",
+          ANTHROPIC_AUTH_TOKEN: process.env.MINIMAX_API_KEY,
+          ANTHROPIC_MODEL: resolvedModel,
+          ANTHROPIC_SMALL_FAST_MODEL: resolvedModel,
+          ANTHROPIC_DEFAULT_SONNET_MODEL: resolvedModel,
+        } : {}),
+      };
+      // Must delete (not just set undefined) so the CLI doesn't route to Anthropic
+      if (resolvedModel.startsWith("MiniMax")) delete childEnv.ANTHROPIC_API_KEY;
+
+      const proc = spawn(resolveClaudeBin(), claudeArgs, {
+        cwd: workingDir, env: childEnv as NodeJS.ProcessEnv,
+        stdio: ["ignore", "pipe", "pipe"] as const,
       });
 
       const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeoutSeconds * 1000);

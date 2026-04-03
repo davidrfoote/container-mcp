@@ -15,6 +15,25 @@ import { populateCacheForProject, writeCacheEntry } from "./jira-confluence.js";
 import { deployProject } from "./tools/deploy-project.js";
 import { transitionSession, nextAllowedActions, SESSION_TRANSITIONS, type SessionStatus } from "./state-machine.js";
 import { DEFAULT_MODEL } from "./model-registry.js";
+import { spawnCodeTask } from "./code-task.js";
+
+function resolveClaudeBin(): string {
+  const candidates = [
+    process.env.CLAUDE_BIN,
+    "/home/openclaw/.npm-global/bin/claude",
+    "/usr/local/bin/claude",
+    "/usr/bin/claude",
+    "claude",
+  ].filter(Boolean) as string[];
+  for (const c of candidates) {
+    try {
+      if (c === "claude") return c;
+      require("fs").accessSync(c);
+      return c;
+    } catch {}
+  }
+  return "claude";
+}
 
 // DEFAULT_MODEL imported from model-registry
 
@@ -454,6 +473,17 @@ export function createMcpServer() {
         },
       },
       {
+        name: "run_bootstrap_planning",
+        description: "Trigger the CLI planning pass for a session. Dev-lead calls this after bootstrapping. The CLI reads the codebase, produces an implementation plan, and posts it as an approval_request. This is the ONLY way to start the planning pass — do not post approval_request directly.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: { type: "string", description: "The ops-db session ID to run planning for" },
+          },
+          required: ["session_id"],
+        },
+      },
+      {
         name: "get_container_inventory",
         description: "Get a full inventory of this container: version, active sessions, worktrees, tool registry, and health checks.",
         inputSchema: {
@@ -558,8 +588,32 @@ export function createMcpServer() {
                   for (const dir of add_dirs) claudeArgs.push("--add-dir", dir);
                 }
 
-                const proc = spawn("claude", claudeArgs, {
-                  cwd: working_dir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined }, stdio: ['ignore', 'pipe', 'pipe'] as const,
+                // Build env with model-specific overrides
+                const childEnv: Record<string, string | undefined> = {
+                  ...process.env,
+                  PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`,
+                  CLAUDECODE: undefined,
+                  CLAUDE_CODE_ENTRYPOINT: undefined,
+                  ...(( model || DEFAULT_MODEL).startsWith("glm") && !(model || DEFAULT_MODEL).endsWith("-coding") ? {
+                    ANTHROPIC_BASE_URL: "http://localhost:4001",
+                    ANTHROPIC_AUTH_TOKEN: "zai-bridge",
+                  } : {}),
+                  ...((model || DEFAULT_MODEL).endsWith("-coding") ? {
+                    ANTHROPIC_BASE_URL: "http://localhost:4002",
+                    ANTHROPIC_AUTH_TOKEN: "zai-bridge",
+                  } : {}),
+                  ...((model || DEFAULT_MODEL).startsWith("MiniMax") ? {
+                    ANTHROPIC_BASE_URL: "https://api.minimax.io/anthropic",
+                    ANTHROPIC_AUTH_TOKEN: process.env.MINIMAX_API_KEY,
+                    ANTHROPIC_MODEL: model || "MiniMax-M2.7",
+                    ANTHROPIC_SMALL_FAST_MODEL: model || "MiniMax-M2.7",
+                    ANTHROPIC_DEFAULT_SONNET_MODEL: model || "MiniMax-M2.7",
+                  } : {}),
+                };
+                if ((model || DEFAULT_MODEL).startsWith("MiniMax")) delete childEnv.ANTHROPIC_API_KEY;
+
+                const proc = spawn(resolveClaudeBin(), claudeArgs, {
+                  cwd: working_dir, env: childEnv as NodeJS.ProcessEnv, stdio: ['ignore', 'pipe', 'pipe'] as const,
                 });
 
                 if (session_id && dbUrl) {
@@ -1189,7 +1243,7 @@ export function createMcpServer() {
             response: string;
             tokens_used: number;
           }>((resolve) => {
-            const proc = spawn("claude", claudeArgs, {
+            const proc = spawn(resolveClaudeBin(), claudeArgs, {
               cwd: chatWorkingDir,
               env: process.env,
               stdio: ["ignore", "pipe", "pipe"] as const,
@@ -1416,6 +1470,17 @@ export function createMcpServer() {
             }
             return inserted;
           });
+          // Auto-transition session status based on message type
+          if (pmSessionId && dbUrl) {
+            try {
+              if (pmMsgType === "approval_request") {
+                await transitionSession(dbUrl, pmSessionId, "awaiting_approval");
+              } else if (pmMsgType === "checkpoint" && pmRole === "coding_agent") {
+                // coding_agent checkpoint = execution done, back to active for dev-lead close-out
+                await transitionSession(dbUrl, pmSessionId, "active");
+              }
+            } catch (_) { /* non-fatal */ }
+          }
           return { content: [{ type: "text", text: JSON.stringify({ ok: true, message_id: row?.message_id }) }] };
         }
 
@@ -1510,6 +1575,48 @@ export function createMcpServer() {
           return { content: [{ type: "text", text: JSON.stringify(result) }], isError: !result.ok };
         }
 
+        case "run_bootstrap_planning": {
+          // Dev-lead calls this to trigger the CLI planning pass.
+          // Builds the bootstrap instruction and spawns a code_task in planning mode.
+          const { session_id: bpSessionId } = args as { session_id: string };
+          const dbUrl = process.env.OPS_DB_URL;
+          if (!dbUrl) return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "OPS_DB_URL not set" }) }], isError: true };
+          if (!bpSessionId) return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "session_id required" }) }], isError: true };
+
+          // Guard: don't double-spawn if planning is already active
+          const alreadyPlanning = await withDbClient(dbUrl, async (c) => {
+            const r = await c.query<{ count: string }>(
+              `SELECT count(*) FROM session_messages WHERE session_id = $1 AND message_type = 'approval_request' AND role = 'coding_agent'`,
+              [bpSessionId]
+            );
+            return parseInt(r.rows[0]?.count ?? "0", 10) > 0;
+          }).catch(() => false);
+          if (alreadyPlanning) {
+            return { content: [{ type: "text", text: JSON.stringify({ ok: true, skipped: true, reason: "approval_request already exists — planning already ran" }) }] };
+          }
+
+          const activeTask = await withDbClient(dbUrl, async (c) => {
+            const r = await c.query<{ active_task_id: string | null }>(
+              `SELECT active_task_id FROM sessions WHERE session_id = $1`,
+              [bpSessionId]
+            );
+            return r.rows[0]?.active_task_id ?? null;
+          }).catch(() => null);
+          if (activeTask) {
+            return { content: [{ type: "text", text: JSON.stringify({ ok: true, skipped: true, reason: `planning task already running: ${activeTask}` }) }] };
+          }
+
+          try {
+            const { buildBootstrapInstruction } = await import("./bootstrap.js");
+            const { instruction, workingDir, allowedTools, model } = await buildBootstrapInstruction(bpSessionId, dbUrl);
+            spawnCodeTask({ instruction, workingDir, sessionId: bpSessionId, dbUrl, allowedTools, model });
+            postToFeed(bpSessionId, dbUrl, "🧠 CLI planning pass started — exploring codebase and generating implementation plan...");
+            return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: bpSessionId, status: "planning_pass_spawned" }) }] };
+          } catch (e: any) {
+            return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: e.message }) }], isError: true };
+          }
+        }
+
         case "get_session_provenance": {
           const { session_id: provSessionId } = args as { session_id: string };
           const dbUrl = process.env.OPS_DB_URL;
@@ -1567,7 +1674,7 @@ export function createMcpServer() {
             "chat_session", "listen_for_approval", "post_message",
             "create_project", "deploy_project", "warm_cache_for_repos",
             "cache_read", "cache_write",
-            "transition_session", "get_session_provenance", "get_container_inventory",
+            "run_bootstrap_planning", "transition_session", "get_session_provenance", "get_container_inventory",
           ];
 
           let active_sessions: unknown[] = [];
