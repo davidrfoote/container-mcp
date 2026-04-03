@@ -610,7 +610,12 @@ export function createMcpServer() {
                     ANTHROPIC_DEFAULT_SONNET_MODEL: model || "MiniMax-M2.7",
                   } : {}),
                 };
-                if ((model || DEFAULT_MODEL).startsWith("MiniMax")) delete childEnv.ANTHROPIC_API_KEY;
+                if ((model || DEFAULT_MODEL).startsWith("MiniMax")) {
+                    delete childEnv.ANTHROPIC_API_KEY;
+                    delete childEnv.ANTHROPIC_DEFAULT_SONNET_MODEL;
+                    delete childEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL;
+                    delete childEnv.ANTHROPIC_DEFAULT_OPUS_MODEL;
+                }
 
                 const proc = spawn(resolveClaudeBin(), claudeArgs, {
                   cwd: working_dir, env: childEnv as NodeJS.ProcessEnv, stdio: ['ignore', 'pipe', 'pipe'] as const,

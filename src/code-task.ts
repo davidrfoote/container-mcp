@@ -155,7 +155,13 @@ export function spawnCodeTask(params: {
         } : {}),
       };
       // Must delete (not just set undefined) so the CLI doesn't route to Anthropic
-      if (resolvedModel.startsWith("MiniMax")) delete childEnv.ANTHROPIC_API_KEY;
+      // These may come from settings.json or parent process env
+      if (resolvedModel.startsWith("MiniMax")) {
+        delete childEnv.ANTHROPIC_API_KEY;
+        delete childEnv.ANTHROPIC_DEFAULT_SONNET_MODEL;
+        delete childEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL;
+        delete childEnv.ANTHROPIC_DEFAULT_OPUS_MODEL;
+      }
 
       const proc = spawn(resolveClaudeBin(), claudeArgs, {
         cwd: workingDir, env: childEnv as NodeJS.ProcessEnv,
