@@ -41,6 +41,26 @@ const path = __importStar(require("path"));
 const db_js_1 = require("./db.js");
 const feed_js_1 = require("./feed.js");
 const task_logs_js_1 = require("./task-logs.js");
+function resolveClaudeBin() {
+    const candidates = [
+        process.env.CLAUDE_BIN,
+        "/home/david/.npm-local/bin/claude",
+        "/home/openclaw/.npm-global/bin/claude",
+        "/usr/local/bin/claude",
+        "/usr/bin/claude",
+        "claude",
+    ].filter(Boolean);
+    for (const c of candidates) {
+        try {
+            if (c === "claude")
+                return c;
+            require("fs").accessSync(c);
+            return c;
+        }
+        catch { }
+    }
+    return "claude";
+}
 const model_registry_js_1 = require("./model-registry.js");
 function spawnCodeTask(params) {
     const { instruction, workingDir, sessionId, dbUrl, maxTurns = 40, budgetUsd = 8.0, timeoutSeconds = 1200, model, effort, agents, allowedTools, resumeClaudeSessionId, taskRules, } = params;
@@ -137,8 +157,29 @@ function spawnCodeTask(params) {
                 claudeArgs.push("--allowed-tools", allowedTools.join(","));
             if (resumeClaudeSessionId)
                 claudeArgs.push("--resume", resumeClaudeSessionId);
-            const proc = (0, child_process_1.spawn)("claude", claudeArgs, {
-                cwd: workingDir, env: { ...process.env, PATH: `/home/openclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined }, stdio: ["ignore", "pipe", "pipe"],
+            const proc = (0, child_process_1.spawn)(resolveClaudeBin(), claudeArgs, {
+                cwd: workingDir, env: {
+                    ...process.env,
+                    PATH: `/home/openclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`,
+                    CLAUDECODE: undefined,
+                    CLAUDE_CODE_ENTRYPOINT: undefined,
+                    // GLM via local Anthropic↔ZAI bridge (standard API, port 4001)
+                    // Bridge translates Anthropic /v1/messages → ZAI OpenAI /chat/completions
+                    ...(resolvedModel.startsWith("glm") && !resolvedModel.endsWith("-coding") ? {
+                        ANTHROPIC_BASE_URL: "http://localhost:4001",
+                        ANTHROPIC_AUTH_TOKEN: "zai-bridge",
+                    } : {}),
+                    // GLM via coding endpoint bridge (port 4002, separate quota pool)
+                    ...(resolvedModel.endsWith("-coding") ? {
+                        ANTHROPIC_BASE_URL: "http://localhost:4002",
+                        ANTHROPIC_AUTH_TOKEN: "zai-bridge",
+                    } : {}),
+                    // MiniMax via Anthropic-compatible endpoint (api.minimax.io)
+                    ...(resolvedModel.startsWith("MiniMax") ? {
+                        ANTHROPIC_BASE_URL: "https://api.minimax.io/anthropic",
+                        ANTHROPIC_AUTH_TOKEN: process.env.MINIMAX_API_KEY,
+                    } : {}),
+                }, stdio: ["ignore", "pipe", "pipe"],
             });
             const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeoutSeconds * 1000);
             proc.on("error", (err) => {

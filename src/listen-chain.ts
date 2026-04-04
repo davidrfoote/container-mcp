@@ -25,12 +25,20 @@ async function runBackfill2(dbUrl: string): Promise<void> {
          AND sm_ar.message_type = 'approval_response'
        WHERE s.status IN ('active', 'pending')
          AND s.session_type != 'interactive'
+         AND s.active_task_id IS NULL
          AND NOT EXISTS (
            SELECT 1 FROM session_messages sm2
            WHERE sm2.session_id = s.session_id
              AND sm2.message_type IN ('execution_update', 'checkpoint')
              AND sm2.role = 'coding_agent'
              AND sm2.created_at > sm_ar.created_at
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM session_messages sm3
+           WHERE sm3.session_id = s.session_id
+             AND sm3.message_type = 'execution_update'
+             AND sm3.content LIKE '%spawn error%'
+             AND sm3.created_at > now() - interval '10 minutes'
          )
        ORDER BY s.session_id`
     );
@@ -147,6 +155,16 @@ export async function startListenChain(): Promise<void> {
                   try {
                     const autoClient = new Client({ connectionString: dbUrl });
                     await autoClient.connect();
+                    // Advisory lock prevents duplicate auto-approvals when notification fires multiple times
+                    const lockRes = await autoClient.query<{ locked: boolean }>(
+                      `SELECT pg_try_advisory_lock(hashtext($1)) AS locked`,
+                      [`auto-approve:${sessionId}:${approvalMsgId}`]
+                    );
+                    if (!lockRes.rows[0]?.locked) {
+                      await autoClient.end().catch(() => {});
+                      logger.log(`[listen-chain] auto-approve duplicate suppressed for ${sessionId} (lock busy)`);
+                      return;
+                    }
                     const existingRes = await autoClient.query(
                       `SELECT 1 FROM session_messages
                        WHERE session_id = $1 AND message_type = 'approval_response'
@@ -155,6 +173,7 @@ export async function startListenChain(): Promise<void> {
                       [sessionId, approvalMsgId]
                     );
                     if (existingRes.rows.length > 0) {
+                      await autoClient.query(`SELECT pg_advisory_unlock(hashtext($1))`, [`auto-approve:${sessionId}:${approvalMsgId}`]);
                       await autoClient.end().catch(() => {});
                       logger.log(`[listen-chain] auto-approve skipped for ${sessionId} — already approved`);
                       return;
@@ -216,12 +235,41 @@ export async function startListenChain(): Promise<void> {
           // ── approval_response → EXECUTION code_task ───────────────────
           if (isApprovalResponse) {
             logger.log(`[listen-chain] approval_response for ${sessionId} — spawning EXECUTION code task`);
+            const lockClient = new Client({ connectionString: dbUrl });
             try {
+              await lockClient.connect();
+              const lockRes = await lockClient.query<{ locked: boolean }>(
+                `SELECT pg_try_advisory_lock(hashtext($1)) AS locked`,
+                [`exec:${sessionId}`]
+              );
+              if (!lockRes.rows[0]?.locked) {
+                logger.log(`[listen-chain] approval_response duplicate suppressed for ${sessionId} (execution lock busy)`);
+                await lockClient.end().catch(() => {});
+                return;
+              }
               const { instruction, workingDir, resumeClaudeSessionId, model } = await buildExecutionInstruction(sessionId, dbUrl);
+              // Claim active_task_id in DB BEFORE spawning so backfill2 won't duplicate
+              const execTaskId = require("crypto").randomUUID();
+              const claimed = await lockClient.query(
+                `UPDATE sessions SET active_task_id = $1, status = 'executing', updated_at = now()
+                 WHERE session_id = $2 AND active_task_id IS NULL
+                 RETURNING session_id`,
+                [execTaskId, sessionId]
+              );
+              if (claimed.rowCount === 0) {
+                logger.log(`[listen-chain] EXECUTION already claimed for ${sessionId} — skipping`);
+                await lockClient.end().catch(() => {});
+                return;
+              }
               spawnCodeTask({ instruction, workingDir, sessionId, dbUrl, resumeClaudeSessionId, model });
-              logger.log(`[listen-chain] EXECUTION code task spawned for ${sessionId}`);
+              logger.log(`[listen-chain] EXECUTION code task spawned for ${sessionId} (task_id=${execTaskId})`);
             } catch (e: any) {
               logger.error(`[listen-chain] EXECUTION spawn error for ${sessionId}:`, e.message);
+            } finally {
+              try {
+                await lockClient.query(`SELECT pg_advisory_unlock(hashtext($1))`, [`exec:${sessionId}`]);
+              } catch {}
+              await lockClient.end().catch(() => {});
             }
             return;
           }
@@ -230,6 +278,23 @@ export async function startListenChain(): Promise<void> {
           if (isCheckpoint) {
             logger.log(`[listen-chain] checkpoint from coding_agent for ${sessionId} — triggering dev-lead close-out`);
             const checkpointContent = (payload as any).content ?? "(no checkpoint content)";
+            // Dedup: advisory lock so only one listener triggers close-out
+            const cpLockClient = new Client({ connectionString: dbUrl });
+            try {
+              await cpLockClient.connect();
+              const cpLock = await cpLockClient.query<{ locked: boolean }>(
+                `SELECT pg_try_advisory_lock(hashtext($1)) AS locked`,
+                [`closeout:${sessionId}`]
+              );
+              if (!cpLock.rows[0]?.locked) {
+                logger.log(`[listen-chain] checkpoint close-out duplicate suppressed for ${sessionId}`);
+                await cpLockClient.end().catch(() => {});
+                return;
+              }
+              await cpLockClient.end().catch(() => {});
+            } catch (e: any) {
+              logger.warn(`[listen-chain] checkpoint lock error for ${sessionId}: ${e.message}`);
+            }
             try {
               const task = await buildCloseoutMessage(sessionId, checkpointContent, dbUrl);
 
@@ -244,13 +309,25 @@ export async function startListenChain(): Promise<void> {
               }).catch(() => null);
 
               if (existingKey) {
-                // Post ash_callback message to session feed before sending
+                // Post ash_callback message to session feed before sending (deduped)
                 const callbackPreview = checkpointContent.slice(0, 200);
-                void postToFeed(
-                  sessionId, dbUrl,
-                  `code_task completed. Result: ${callbackPreview}`,
-                  "system", "ash_callback"
-                );
+                const callbackContent = `code_task completed. Result: ${callbackPreview}`;
+                void withDbClient(dbUrl, async (c) => {
+                  const existing = await c.query<{ message_id: string }>(
+                    `SELECT message_id FROM session_messages
+                     WHERE session_id = $1 AND role = 'system' AND message_type = 'ash_callback'
+                       AND content = $2 AND created_at > now() - interval '30 seconds'
+                     LIMIT 1`,
+                    [sessionId, callbackContent]
+                  );
+                  if (existing.rows.length === 0) {
+                    await c.query(
+                      `INSERT INTO session_messages (message_id, session_id, role, content, message_type, created_at)
+                       VALUES (gen_random_uuid(), $1, 'system', $2, 'ash_callback', now())`,
+                      [sessionId, callbackContent]
+                    );
+                  }
+                }).catch((e: Error) => logger.warn(`[listen-chain] ash_callback dedupe write failed: ${e.message}`));
 
                 logger.log(`[listen-chain] sessions_send to existing dev-lead session ${existingKey} for ${sessionId}`);
                 const sendResp = await fetch(`${gatewayUrl}/tools/invoke`, {

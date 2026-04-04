@@ -48,6 +48,26 @@ const jira_confluence_js_1 = require("./jira-confluence.js");
 const deploy_project_js_1 = require("./tools/deploy-project.js");
 const state_machine_js_1 = require("./state-machine.js");
 const model_registry_js_1 = require("./model-registry.js");
+const code_task_js_1 = require("./code-task.js");
+function resolveClaudeBin() {
+    const candidates = [
+        process.env.CLAUDE_BIN,
+        "/home/openclaw/.npm-global/bin/claude",
+        "/usr/local/bin/claude",
+        "/usr/bin/claude",
+        "claude",
+    ].filter(Boolean);
+    for (const c of candidates) {
+        try {
+            if (c === "claude")
+                return c;
+            require("fs").accessSync(c);
+            return c;
+        }
+        catch { }
+    }
+    return "claude";
+}
 // DEFAULT_MODEL imported from model-registry
 function modelCostPerMillion(model) {
     if (!model)
@@ -481,6 +501,17 @@ function createMcpServer() {
                 },
             },
             {
+                name: "run_bootstrap_planning",
+                description: "Trigger the CLI planning pass for a session. Dev-lead calls this after bootstrapping. The CLI reads the codebase, produces an implementation plan, and posts it as an approval_request. This is the ONLY way to start the planning pass — do not post approval_request directly.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        session_id: { type: "string", description: "The ops-db session ID to run planning for" },
+                    },
+                    required: ["session_id"],
+                },
+            },
+            {
                 name: "get_container_inventory",
                 description: "Get a full inventory of this container: version, active sessions, worktrees, tool registry, and health checks.",
                 inputSchema: {
@@ -564,7 +595,7 @@ function createMcpServer() {
                                     for (const dir of add_dirs)
                                         claudeArgs.push("--add-dir", dir);
                                 }
-                                const proc = (0, child_process_1.spawn)("claude", claudeArgs, {
+                                const proc = (0, child_process_1.spawn)(resolveClaudeBin(), claudeArgs, {
                                     cwd: working_dir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined }, stdio: ['ignore', 'pipe', 'pipe'],
                                 });
                                 if (session_id && dbUrl) {
@@ -1133,7 +1164,7 @@ function createMcpServer() {
                         claudeArgs.push("--append-system-prompt-file", systemContextFile);
                     }
                     const chatResult = await new Promise((resolve) => {
-                        const proc = (0, child_process_1.spawn)("claude", claudeArgs, {
+                        const proc = (0, child_process_1.spawn)(resolveClaudeBin(), claudeArgs, {
                             cwd: chatWorkingDir,
                             env: process.env,
                             stdio: ["ignore", "pipe", "pipe"],
@@ -1344,6 +1375,19 @@ function createMcpServer() {
                         }
                         return inserted;
                     });
+                    // Auto-transition session status based on message type
+                    if (pmSessionId && dbUrl) {
+                        try {
+                            if (pmMsgType === "approval_request") {
+                                await (0, state_machine_js_1.transitionSession)(dbUrl, pmSessionId, "awaiting_approval");
+                            }
+                            else if (pmMsgType === "checkpoint" && pmRole === "coding_agent") {
+                                // coding_agent checkpoint = execution done, back to active for dev-lead close-out
+                                await (0, state_machine_js_1.transitionSession)(dbUrl, pmSessionId, "active");
+                            }
+                        }
+                        catch (_) { /* non-fatal */ }
+                    }
                     return { content: [{ type: "text", text: JSON.stringify({ ok: true, message_id: row?.message_id }) }] };
                 }
                 case "create_project": {
@@ -1418,6 +1462,41 @@ function createMcpServer() {
                     const result = await (0, state_machine_js_1.transitionSession)(dbUrl, tsSessionId, to_status);
                     return { content: [{ type: "text", text: JSON.stringify(result) }], isError: !result.ok };
                 }
+                case "run_bootstrap_planning": {
+                    // Dev-lead calls this to trigger the CLI planning pass.
+                    // Builds the bootstrap instruction and spawns a code_task in planning mode.
+                    const { session_id: bpSessionId } = args;
+                    const dbUrl = process.env.OPS_DB_URL;
+                    if (!dbUrl)
+                        return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "OPS_DB_URL not set" }) }], isError: true };
+                    if (!bpSessionId)
+                        return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "session_id required" }) }], isError: true };
+                    // Guard: don't double-spawn if planning is already active
+                    const alreadyPlanning = await (0, db_js_1.withDbClient)(dbUrl, async (c) => {
+                        const r = await c.query(`SELECT count(*) FROM session_messages WHERE session_id = $1 AND message_type = 'approval_request' AND role = 'coding_agent'`, [bpSessionId]);
+                        return parseInt(r.rows[0]?.count ?? "0", 10) > 0;
+                    }).catch(() => false);
+                    if (alreadyPlanning) {
+                        return { content: [{ type: "text", text: JSON.stringify({ ok: true, skipped: true, reason: "approval_request already exists — planning already ran" }) }] };
+                    }
+                    const activeTask = await (0, db_js_1.withDbClient)(dbUrl, async (c) => {
+                        const r = await c.query(`SELECT active_task_id FROM sessions WHERE session_id = $1`, [bpSessionId]);
+                        return r.rows[0]?.active_task_id ?? null;
+                    }).catch(() => null);
+                    if (activeTask) {
+                        return { content: [{ type: "text", text: JSON.stringify({ ok: true, skipped: true, reason: `planning task already running: ${activeTask}` }) }] };
+                    }
+                    try {
+                        const { buildBootstrapInstruction } = await Promise.resolve().then(() => __importStar(require("./bootstrap.js")));
+                        const { instruction, workingDir, allowedTools, model } = await buildBootstrapInstruction(bpSessionId, dbUrl);
+                        (0, code_task_js_1.spawnCodeTask)({ instruction, workingDir, sessionId: bpSessionId, dbUrl, allowedTools, model });
+                        (0, feed_js_1.postToFeed)(bpSessionId, dbUrl, "🧠 CLI planning pass started — exploring codebase and generating implementation plan...");
+                        return { content: [{ type: "text", text: JSON.stringify({ ok: true, session_id: bpSessionId, status: "planning_pass_spawned" }) }] };
+                    }
+                    catch (e) {
+                        return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: e.message }) }], isError: true };
+                    }
+                }
                 case "get_session_provenance": {
                     const { session_id: provSessionId } = args;
                     const dbUrl = process.env.OPS_DB_URL;
@@ -1458,7 +1537,7 @@ function createMcpServer() {
                         "chat_session", "listen_for_approval", "post_message",
                         "create_project", "deploy_project", "warm_cache_for_repos",
                         "cache_read", "cache_write",
-                        "transition_session", "get_session_provenance", "get_container_inventory",
+                        "run_bootstrap_planning", "transition_session", "get_session_provenance", "get_container_inventory",
                     ];
                     let active_sessions = [];
                     let worktrees = [];
