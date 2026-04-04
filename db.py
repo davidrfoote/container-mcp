@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from typing import Any
 
 import asyncpg
 
@@ -26,7 +25,6 @@ async def log_step(
     session_id: str,
     message: str,
     msg_type: str = "execution_log",
-    role: str = "container",
 ) -> None:
     """Insert a message row into session_messages."""
     pool = await get_pool()
@@ -40,46 +38,8 @@ async def log_step(
         """,
         message_id,
         session_id,
-        role,
+        "container",
         message,
         msg_type,
         now,
     )
-
-
-async def get_session(session_id: str) -> dict[str, Any] | None:
-    """Fetch a session row by ID. Returns dict or None."""
-    pool = await get_pool()
-    row = await pool.fetchrow(
-        "SELECT * FROM sessions WHERE session_id = $1", session_id
-    )
-    if row is None:
-        return None
-    return dict(row)
-
-
-async def update_session(session_id: str, **fields: Any) -> None:
-    """UPDATE sessions SET field=value, ... WHERE session_id = $N."""
-    if not fields:
-        return
-    pool = await get_pool()
-    set_clauses = ", ".join(
-        f"{key} = ${i + 1}" for i, key in enumerate(fields)
-    )
-    values = list(fields.values())
-    values.append(session_id)
-    await pool.execute(
-        f"UPDATE sessions SET {set_clauses} WHERE session_id = ${len(values)}",
-        *values,
-    )
-
-
-async def get_project(project_id: str) -> dict[str, Any] | None:
-    """Fetch a project row by ID. Returns dict or None."""
-    pool = await get_pool()
-    row = await pool.fetchrow(
-        "SELECT * FROM projects WHERE project_id = $1", project_id
-    )
-    if row is None:
-        return None
-    return dict(row)
