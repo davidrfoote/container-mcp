@@ -19,7 +19,6 @@ from asyncio.subprocess import PIPE
 from typing import Any
 from uuid import uuid4
 
-from db import update_session
 from feed import post_json_to_feed, post_to_feed
 from model_registry import ResolvedModel, report_model_failure, report_model_success, resolve_model
 
@@ -125,9 +124,8 @@ async def _run_task(
     timeout_seconds: int,
     task_rules_file: str | None,
 ) -> None:
-    """Background task: run Claude CLI process, stream output, update DB."""
+    """Background task: run Claude CLI process and stream output."""
     stderr_lines: list[str] = []
-    captured: dict[str, Any] = {}
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -156,8 +154,7 @@ async def _run_task(
                         event = json.loads(line)
                     except json.JSONDecodeError:
                         continue  # skip malformed lines
-                    meta = await _handle_event(event, session_id)
-                    captured.update({k: v for k, v in meta.items() if v is not None})
+                    await _handle_event(event, session_id)
         except TimeoutError:
             proc.kill()
             if session_id:
@@ -180,20 +177,6 @@ async def _run_task(
                     f"[task_id={task_id}] process exited rc={proc.returncode}\n{stderr_text[:500]}",
                     msg_type="execution_log",
                 )
-
-        # Persist cost/tokens to session
-        if session_id and captured:
-            update_fields: dict[str, Any] = {}
-            if "cost_usd" in captured:
-                update_fields["last_cost_usd"] = captured["cost_usd"]
-            if "total_input_tokens" in captured:
-                update_fields["last_input_tokens"] = captured["total_input_tokens"]
-            if "total_output_tokens" in captured:
-                update_fields["last_output_tokens"] = captured["total_output_tokens"]
-            if "claude_session_id" in captured:
-                update_fields["claude_session_id"] = captured["claude_session_id"]
-            if update_fields:
-                await update_session(session_id, **update_fields)
 
     finally:
         if task_rules_file and os.path.exists(task_rules_file):
