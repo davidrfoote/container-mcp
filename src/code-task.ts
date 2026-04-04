@@ -5,6 +5,7 @@ import * as path from "path";
 import { withDbClient } from "./db.js";
 import { postToFeed } from "./feed.js";
 import { taskLogs } from "./task-logs.js";
+import { resolveModel, reportModelFailure, reportModelSuccess } from "./model-registry.js";
 
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL ?? "claude-sonnet-4-6";
 
@@ -34,8 +35,8 @@ export function spawnCodeTask(params: {
   const log = (line: string) => taskLogs.get(taskId)!.push(line);
   const debugLogPath = `/tmp/task-${taskId}-debug.log`;
 
-  const resolvedModel = model || DEFAULT_MODEL;
-  postToFeed(sessionId!, dbUrl!, `🚀 Starting code task (${taskId}) [${resolvedModel}]${resumeClaudeSessionId ? " [resumed]" : ""}\n\n${instruction.slice(0, 400)}`);
+  const resolved = resolveModel(model);
+  postToFeed(sessionId!, dbUrl!, `🚀 Starting code task (${taskId}) [${resolved.id}${resolved.wasFailover ? ` (failover from ${resolved.failoverFrom})` : ""}]${resumeClaudeSessionId ? " [resumed]" : ""}\n\n${instruction.slice(0, 400)}`);
 
   // Emit structured cli_context so the session view can show full agent visibility
   if (sessionId && dbUrl) {
@@ -48,7 +49,9 @@ export function spawnCodeTask(params: {
     void postToFeed(sessionId, dbUrl, JSON.stringify({
       kind: "task_start",
       taskId,
-      model: model || DEFAULT_MODEL,
+      model: resolved.id,
+      modelAlias: model ?? null,
+      modelWasFailover: resolved.wasFailover,
       effort: effort ?? null,
       allowedTools: allowedTools ?? [],
       agents: agents ? (() => { try { return JSON.parse(agents); } catch { return agents; } })() : null,
@@ -104,14 +107,23 @@ export function spawnCodeTask(params: {
       ];
 
       if (hasMcpConfig) claudeArgs.push("--mcp-config", mcpConfigPath);
-      claudeArgs.push("--model", model || DEFAULT_MODEL);
+      claudeArgs.push("--model", resolved.id);
+      // Apply auth env overrides (e.g. strip API key for OAuth-preferred models)
+      const childEnv: Record<string, string | undefined> = { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined };
+      for (const [k, v] of Object.entries(resolved.envOverrides)) {
+        if (v === undefined) {
+          delete childEnv[k];
+        } else {
+          childEnv[k] = v;
+        }
+      }
       if (effort) claudeArgs.push("--effort", effort);
       if (agents) claudeArgs.push("--agents", agents);
       if (allowedTools && allowedTools.length > 0) claudeArgs.push("--allowed-tools", allowedTools.join(","));
       if (resumeClaudeSessionId) claudeArgs.push("--resume", resumeClaudeSessionId);
 
       const proc = spawn("claude", claudeArgs, {
-        cwd: workingDir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined }, stdio: ["ignore", "pipe", "pipe"] as const,
+        cwd: workingDir, env: childEnv as NodeJS.ProcessEnv, stdio: ["ignore", "pipe", "pipe"] as const,
       });
 
       const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeoutSeconds * 1000);
@@ -349,9 +361,11 @@ export function spawnCodeTask(params: {
         }
       });
       let stderrBuf = "";
+      const fullStderr: string[] = [];
       proc.stderr.on("data", (chunk: Buffer) => {
         const text = chunk.toString();
         stderrBuf += text;
+        fullStderr.push(text);
         log("[stderr] " + text);
         // Surface all stderr to the session feed — not just errors.
         // Warnings, deprecations, and diagnostics are all useful for debugging.
@@ -369,6 +383,15 @@ export function spawnCodeTask(params: {
         if (hasMcpConfig) try { fs.unlinkSync(mcpConfigPath); } catch {}
         postToFeed(sessionId!, dbUrl!, `✅ Process ${taskId} exited with code ${code}. Debug log: ${debugLogPath}`);
         console.log(`[spawnCodeTask] task ${taskId} done (code ${code}), debug log at ${debugLogPath}`);
+        // Report success/failure to registry for health tracking
+        if (code === 0) {
+          reportModelSuccess(resolved.id);
+        } else {
+          const combinedErr = fullStderr.join("");
+          if (combinedErr.includes("rate") || combinedErr.includes("limit") || combinedErr.includes("auth") || combinedErr.includes("401") || combinedErr.includes("429")) {
+            reportModelFailure(resolved.id, `exit ${code}: ${combinedErr.slice(0, 200)}`);
+          }
+        }
         // Clear the in-flight task marker
         if (sessionId && dbUrl) {
           void withDbClient(dbUrl, async (client) => {
