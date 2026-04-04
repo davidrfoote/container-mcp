@@ -155,4 +155,4 @@ async def health() -> dict:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    uvicorn.run(mcp.get_app(), host="0.0.0.0", port=config.PORT)
+    uvicorn.run(mcp.http_app(transport="sse"), host="0.0.0.0", port=config.PORT)
