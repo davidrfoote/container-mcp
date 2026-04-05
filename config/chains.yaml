@@ -1,0 +1,142 @@
+# container-mcp model failover chains
+# Env var substitution: ${ENV_VAR_NAME} → os.environ["ENV_VAR_NAME"]
+#
+# Provider tiers:
+#   oauth   — Claude via OAuth (uses ANTHROPIC_AUTH_TOKEN)
+#   api     — Claude via API key (uses ANTHROPIC_API_KEY)
+#   zai     — GLM via ZAI API (api.z.ai, uses ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN)
+#   minimax — MiniMax via Anthropic-compatible endpoint (api.minimax.io)
+
+defaults:
+  max_turns: 40
+  budget_usd: 8.0
+  timeout_seconds: 1200
+
+accounts:
+  - id: zai-coding-1
+    provider: zai
+    tier: coding
+    api_key: ${ZAI_KEY_1}
+    base_url: https://api.z.ai/api/coding/paas/v4
+    daily_budget_usd: 20.0
+    priority: 10
+
+  - id: zai-coding-2
+    provider: zai
+    tier: coding
+    api_key: ${ZAI_KEY_2}
+    base_url: https://api.z.ai/api/coding/paas/v4
+    daily_budget_usd: 20.0
+    priority: 11
+
+  - id: zai-coding-3
+    provider: zai
+    tier: coding
+    api_key: ${ZAI_KEY_3}
+    base_url: https://api.z.ai/api/coding/paas/v4
+    daily_budget_usd: 20.0
+    priority: 12
+
+  - id: zai-api-1
+    provider: zai
+    tier: api
+    api_key: ${ZAI_KEY_1}
+    base_url: https://api.z.ai/api/paas/v4
+    daily_budget_usd: 10.0
+    priority: 20
+
+  - id: zai-api-2
+    provider: zai
+    tier: api
+    api_key: ${ZAI_KEY_2}
+    base_url: https://api.z.ai/api/paas/v4
+    daily_budget_usd: 10.0
+    priority: 21
+
+  - id: claude-sub
+    provider: anthropic
+    tier: oauth
+    auth_token: ${ANTHROPIC_AUTH_TOKEN}
+    daily_budget_usd: 50.0
+    priority: 30
+
+  - id: claude-api-1
+    provider: anthropic
+    tier: api
+    api_key: ${ANTHROPIC_API_KEY}
+    daily_budget_usd: 30.0
+    priority: 40
+
+  - id: minimax-1
+    provider: minimax
+    tier: api
+    api_key: ${MINIMAX_API_KEY}
+    base_url: https://api.minimax.io/anthropic
+    model_id: MiniMax-M2.7
+    daily_budget_usd: 15.0
+    priority: 50
+
+  - id: minimax-2
+    provider: minimax
+    tier: api
+    api_key: ${MINIMAX_API_KEY_2}
+    base_url: https://api.minimax.io/anthropic
+    model_id: MiniMax-M2.7-highspeed
+    daily_budget_usd: 15.0
+    priority: 51
+
+chains:
+  sonnet:
+    - claude-sub
+    - zai-coding-1
+    - zai-coding-2
+    - zai-coding-3
+    - zai-api-1
+    - zai-api-2
+    - minimax-1
+    - minimax-2
+
+  glm:
+    - zai-coding-1
+    - zai-coding-2
+    - zai-coding-3
+    - zai-api-1
+    - zai-api-2
+    - claude-sub
+    - minimax-1
+
+  haiku:
+    - claude-sub
+    - zai-coding-1
+    - minimax-1
+
+  minimax:
+    - minimax-1
+    - minimax-2
+    - claude-sub
+
+  opus:
+    - claude-sub
+    - claude-api-1
+
+model_chain_map:
+  sonnet:             sonnet
+  claude-sonnet:      sonnet
+  claude-sonnet-4-6:  sonnet
+  balanced:           sonnet
+  coding:             sonnet
+  standard:           sonnet
+  glm:                glm
+  glm-5:              glm
+  glm-5.1:            glm
+  glm-5-turbo:        glm
+  zai:                glm
+  zai-51:             glm
+  haiku:              haiku
+  fast:               haiku
+  quick:              haiku
+  minimax:            minimax
+  minimax-m27:        minimax
+  MiniMax-M2.7:      minimax
+  opus:               opus
+  smart:              opus

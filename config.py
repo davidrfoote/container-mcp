@@ -1,6 +1,6 @@
 import os
 
-OPS_DB_URL: str = os.getenv("OPS_DB_URL", "postgresql://ops:password@172.17.0.1:5434/ops")
+OPS_DB_URL: str = os.getenv("OPS_DB_URL", "postgresql://ops:Pi5cSfj9ASfNoBBklkGUR65uBazG6iNn@172.17.0.1:5434/ops")
 PORT: int = int(os.getenv("PORT", "9000"))
 DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "claude-sonnet-4-6")
 OPENCLAW_GATEWAY_URL: str = os.getenv("OPENCLAW_GATEWAY_URL", "http://172.17.0.1:18789")

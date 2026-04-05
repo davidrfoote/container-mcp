@@ -434,12 +434,17 @@ export async function startListenChain(): Promise<void> {
         clearInterval(_backfill2Interval);
         _backfill2Interval = null;
       }
+      // Must end the old client before reconnecting — otherwise the old connection
+      // stays open in Postgres (holding its LISTEN slot) and leaks on every reconnect.
+      listenClient.end().catch(() => {});
       const delay = _reconnectMs;
       _reconnectMs = Math.min(_reconnectMs * 2, 60_000);
       setTimeout(() => { void startListenChain(); }, delay);
     });
   } catch (err: any) {
     logger.error("[listen-chain] failed to start LISTEN:", err.message);
+    // End the client if it was created before the error to avoid leaking the connection.
+    listenClient.end().catch(() => {});
     const delay = _reconnectMs;
     _reconnectMs = Math.min(_reconnectMs * 2, 60_000);
     setTimeout(() => { void startListenChain(); }, delay);
