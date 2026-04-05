@@ -1,0 +1,153 @@
+# container-mcp — Model Failover Chains
+#
+# Each chain defines an ordered list of account slots.
+# On failure (rate limit, auth, quota), the same task is retried with the next slot.
+# Env vars in ${VAR} format are resolved at load time.
+
+providers:
+  anthropic:
+    accounts:
+      - id: claude-oauth-1
+        tier: sub
+        model: claude-sonnet-4-6
+        env_overrides:
+          ANTHROPIC_API_KEY: null
+        daily_budget_usd: 40
+
+  zai:
+    accounts:
+      - id: zai-coding-1
+        tier: sub
+        model: glm-5.1
+        base_url: https://api.z.ai/api/coding/paas/v4
+        env_overrides:
+          ANTHROPIC_API_KEY: ${ZAI_CODING_KEY_1}
+        daily_budget_usd: 20
+
+      - id: zai-coding-2
+        tier: sub
+        model: glm-5.1
+        base_url: https://api.z.ai/api/coding/paas/v4
+        env_overrides:
+          ANTHROPIC_API_KEY: ${ZAI_CODING_KEY_2}
+        daily_budget_usd: 20
+
+      - id: zai-standard-1
+        tier: sub
+        model: glm-5.1
+        base_url: https://api.z.ai/api/paas/v4
+        env_overrides:
+          ANTHROPIC_API_KEY: ${ZAI_STANDARD_KEY_1}
+        daily_budget_usd: 15
+
+      - id: zai-api-1
+        tier: api
+        model: glm-5
+        base_url: https://api.z.ai/api/paas/v4
+        env_overrides:
+          ANTHROPIC_API_KEY: ${ZAI_API_KEY}
+        daily_budget_usd: 50
+
+  minimax:
+    accounts:
+      - id: minimax-sub-1
+        tier: sub
+        model: MiniMax-M2.7
+        base_url: https://api.minimax.io/anthropic
+        env_overrides:
+          ANTHROPIC_AUTH_TOKEN: ${MINIMAX_SUB_KEY_1}
+          ANTHROPIC_API_KEY: null
+          ANTHROPIC_DEFAULT_SONNET_MODEL: null
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: null
+          ANTHROPIC_DEFAULT_OPUS_MODEL: null
+        daily_budget_usd: 30
+
+      - id: minimax-sub-fast
+        tier: sub
+        model: MiniMax-M2.7-highspeed
+        base_url: https://api.minimax.io/anthropic
+        env_overrides:
+          ANTHROPIC_AUTH_TOKEN: ${MINIMAX_SUB_KEY_1}
+          ANTHROPIC_API_KEY: null
+          ANTHROPIC_DEFAULT_SONNET_MODEL: null
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: null
+          ANTHROPIC_DEFAULT_OPUS_MODEL: null
+        daily_budget_usd: 30
+
+      - id: minimax-api-1
+        tier: api
+        model: MiniMax-M2.7
+        base_url: https://api.minimax.io/anthropic
+        env_overrides:
+          ANTHROPIC_AUTH_TOKEN: ${MINIMAX_API_KEY}
+          ANTHROPIC_API_KEY: null
+        daily_budget_usd: 50
+
+  deepseek:
+    accounts:
+      - id: deepseek-api-1
+        tier: api
+        model: deepseek-chat
+        base_url: https://api.deepseek.com
+        env_overrides:
+          ANTHROPIC_API_KEY: ${DEEPSEEK_API_KEY}
+        daily_budget_usd: 20
+
+chains:
+  sonnet:
+    - claude-oauth-1
+    - zai-coding-1
+    - zai-coding-2
+    - zai-standard-1
+    - zai-api-1
+    - minimax-sub-1
+    - minimax-api-1
+
+  glm:
+    - zai-coding-1
+    - zai-coding-2
+    - zai-standard-1
+    - zai-api-1
+    - claude-oauth-1
+    - minimax-sub-1
+    - minimax-api-1
+
+  minimax:
+    - minimax-sub-1
+    - minimax-sub-fast
+    - minimax-api-1
+    - zai-coding-1
+    - claude-oauth-1
+
+  fast:
+    - minimax-sub-fast
+    - zai-coding-1
+    - claude-oauth-1
+
+aliases:
+  sonnet: sonnet
+  sonnet-4-6: sonnet
+  claude: sonnet
+  default: sonnet
+  balanced: sonnet
+  coding: sonnet
+  haiku: sonnet
+  fast: fast
+  quick: fast
+  light: fast
+  opus: sonnet
+  smart: sonnet
+  powerful: sonnet
+  deep: sonnet
+  glm: glm
+  glm5: glm
+  glm51: glm
+  glm-5: glm
+  glm-5.1: glm
+  zai: glm
+  minimax: minimax
+  minimax-m27: minimax
+  minimax-m27-fast: minimax
+  m27: minimax
+  highspeed: minimax
+  deepseek: sonnet

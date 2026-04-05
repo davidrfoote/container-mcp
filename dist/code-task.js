@@ -157,29 +157,42 @@ function spawnCodeTask(params) {
                 claudeArgs.push("--allowed-tools", allowedTools.join(","));
             if (resumeClaudeSessionId)
                 claudeArgs.push("--resume", resumeClaudeSessionId);
+            // Build child env — model-specific overrides applied after base env
+            const childEnv = {
+                ...process.env,
+                PATH: `/home/openclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`,
+                CLAUDECODE: undefined,
+                CLAUDE_CODE_ENTRYPOINT: undefined,
+                // GLM via local Anthropic↔ZAI bridge (standard API, port 4001)
+                ...(resolvedModel.startsWith("glm") && !resolvedModel.endsWith("-coding") ? {
+                    ANTHROPIC_BASE_URL: "http://localhost:4001",
+                    ANTHROPIC_AUTH_TOKEN: "zai-bridge",
+                } : {}),
+                // GLM via coding endpoint bridge (port 4002, separate quota pool)
+                ...(resolvedModel.endsWith("-coding") ? {
+                    ANTHROPIC_BASE_URL: "http://localhost:4002",
+                    ANTHROPIC_AUTH_TOKEN: "zai-bridge",
+                } : {}),
+                // MiniMax via Anthropic-compatible endpoint (api.minimax.io)
+                ...(resolvedModel.startsWith("MiniMax") ? {
+                    ANTHROPIC_BASE_URL: "https://api.minimax.io/anthropic",
+                    ANTHROPIC_AUTH_TOKEN: process.env.MINIMAX_API_KEY,
+                    ANTHROPIC_MODEL: resolvedModel,
+                    ANTHROPIC_SMALL_FAST_MODEL: resolvedModel,
+                    ANTHROPIC_DEFAULT_SONNET_MODEL: resolvedModel,
+                } : {}),
+            };
+            // Must delete (not just set undefined) so the CLI doesn't route to Anthropic
+            // These may come from settings.json or parent process env
+            if (resolvedModel.startsWith("MiniMax")) {
+                delete childEnv.ANTHROPIC_API_KEY;
+                delete childEnv.ANTHROPIC_DEFAULT_SONNET_MODEL;
+                delete childEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL;
+                delete childEnv.ANTHROPIC_DEFAULT_OPUS_MODEL;
+            }
             const proc = (0, child_process_1.spawn)(resolveClaudeBin(), claudeArgs, {
-                cwd: workingDir, env: {
-                    ...process.env,
-                    PATH: `/home/openclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`,
-                    CLAUDECODE: undefined,
-                    CLAUDE_CODE_ENTRYPOINT: undefined,
-                    // GLM via local Anthropic↔ZAI bridge (standard API, port 4001)
-                    // Bridge translates Anthropic /v1/messages → ZAI OpenAI /chat/completions
-                    ...(resolvedModel.startsWith("glm") && !resolvedModel.endsWith("-coding") ? {
-                        ANTHROPIC_BASE_URL: "http://localhost:4001",
-                        ANTHROPIC_AUTH_TOKEN: "zai-bridge",
-                    } : {}),
-                    // GLM via coding endpoint bridge (port 4002, separate quota pool)
-                    ...(resolvedModel.endsWith("-coding") ? {
-                        ANTHROPIC_BASE_URL: "http://localhost:4002",
-                        ANTHROPIC_AUTH_TOKEN: "zai-bridge",
-                    } : {}),
-                    // MiniMax via Anthropic-compatible endpoint (api.minimax.io)
-                    ...(resolvedModel.startsWith("MiniMax") ? {
-                        ANTHROPIC_BASE_URL: "https://api.minimax.io/anthropic",
-                        ANTHROPIC_AUTH_TOKEN: process.env.MINIMAX_API_KEY,
-                    } : {}),
-                }, stdio: ["ignore", "pipe", "pipe"],
+                cwd: workingDir, env: childEnv,
+                stdio: ["ignore", "pipe", "pipe"],
             });
             const timer = setTimeout(() => { proc.kill("SIGTERM"); }, timeoutSeconds * 1000);
             proc.on("error", (err) => {

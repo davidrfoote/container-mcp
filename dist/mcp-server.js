@@ -595,8 +595,36 @@ function createMcpServer() {
                                     for (const dir of add_dirs)
                                         claudeArgs.push("--add-dir", dir);
                                 }
+                                // Build env with model-specific overrides
+                                const childEnv = {
+                                    ...process.env,
+                                    PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`,
+                                    CLAUDECODE: undefined,
+                                    CLAUDE_CODE_ENTRYPOINT: undefined,
+                                    ...((model || model_registry_js_1.DEFAULT_MODEL).startsWith("glm") && !(model || model_registry_js_1.DEFAULT_MODEL).endsWith("-coding") ? {
+                                        ANTHROPIC_BASE_URL: "http://localhost:4001",
+                                        ANTHROPIC_AUTH_TOKEN: "zai-bridge",
+                                    } : {}),
+                                    ...((model || model_registry_js_1.DEFAULT_MODEL).endsWith("-coding") ? {
+                                        ANTHROPIC_BASE_URL: "http://localhost:4002",
+                                        ANTHROPIC_AUTH_TOKEN: "zai-bridge",
+                                    } : {}),
+                                    ...((model || model_registry_js_1.DEFAULT_MODEL).startsWith("MiniMax") ? {
+                                        ANTHROPIC_BASE_URL: "https://api.minimax.io/anthropic",
+                                        ANTHROPIC_AUTH_TOKEN: process.env.MINIMAX_API_KEY,
+                                        ANTHROPIC_MODEL: model || "MiniMax-M2.7",
+                                        ANTHROPIC_SMALL_FAST_MODEL: model || "MiniMax-M2.7",
+                                        ANTHROPIC_DEFAULT_SONNET_MODEL: model || "MiniMax-M2.7",
+                                    } : {}),
+                                };
+                                if ((model || model_registry_js_1.DEFAULT_MODEL).startsWith("MiniMax")) {
+                                    delete childEnv.ANTHROPIC_API_KEY;
+                                    delete childEnv.ANTHROPIC_DEFAULT_SONNET_MODEL;
+                                    delete childEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL;
+                                    delete childEnv.ANTHROPIC_DEFAULT_OPUS_MODEL;
+                                }
                                 const proc = (0, child_process_1.spawn)(resolveClaudeBin(), claudeArgs, {
-                                    cwd: working_dir, env: { ...process.env, PATH: `/usr/bin:/usr/local/bin:/home/david/.npm-local/bin:${process.env.PATH ?? ""}`, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined }, stdio: ['ignore', 'pipe', 'pipe'],
+                                    cwd: working_dir, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'],
                                 });
                                 if (session_id && dbUrl) {
                                     const resolvedModel = model || "default";
